@@ -362,10 +362,13 @@ fn platform_feature(board: &str, target: &str) -> Option<&'static str> {
 fn generated_feature(feature: &str) -> Option<String> {
     match feature {
         "std" => Some("std".to_string()),
-        "rmw-cffi" => Some("nros/rmw-cffi".to_string()),
-        "rmw-zenoh" | "rmw-zenoh-cffi" => Some("nros/rmw-zenoh-cffi".to_string()),
-        "rmw-xrce" | "rmw-xrce-cffi" => Some("nros/rmw-xrce-cffi".to_string()),
-        "rmw-dds" | "rmw-dds-cffi" => Some("nros/rmw-dds-cffi".to_string()),
+        // Phase 128.C.3 — per-backend `rmw-*-cffi` features deleted.
+        // Every backend now routes through `rmw-cffi`; the backend
+        // crate dep itself contributes the `RMW_INIT_ENTRIES` entry.
+        "rmw-cffi"
+        | "rmw-zenoh" | "rmw-zenoh-cffi"
+        | "rmw-xrce" | "rmw-xrce-cffi"
+        | "rmw-dds" | "rmw-dds-cffi" => Some("nros/rmw-cffi".to_string()),
         feature if feature.starts_with("nros/") || feature.starts_with("nros-orchestration/") => {
             Some(feature.to_string())
         }
@@ -378,14 +381,13 @@ fn uses_rmw_cffi(rmw: &str) -> bool {
 }
 
 fn rmw_backend_feature(rmw: &str) -> Option<&'static str> {
-    match rmw {
-        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => Some("rmw-zenoh-cffi"),
-        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => Some("rmw-xrce-cffi"),
-        "dds" | "rmw-dds" | "rmw-dds-cffi" => Some("rmw-dds-cffi"),
-        "cffi" | "rmw-cffi" => None,
-        "" | "none" => None,
-        _ => None,
-    }
+    // Phase 128.C.3 — per-backend `rmw-*-cffi` features deleted. The
+    // nros umbrella only carries `rmw-cffi`; selection happens by
+    // pulling the matching `nros-rmw-<name>` crate as a manifest dep.
+    // Returning `None` for every value keeps the orchestration
+    // generator from emitting a feature that no longer exists.
+    let _ = rmw;
+    None
 }
 
 fn dedup(features: Vec<String>) -> Vec<String> {
@@ -586,6 +588,12 @@ fn render_native_component_ffi(out: &mut String, plan: &NrosPlan) {
 }
 
 fn render_backend_register_fn(out: &mut String, plan: &NrosPlan) {
+    // Phase 128.C — explicit `register()` calls retained as the
+    // rlib-pull anchor for stable Rust; without one symbol reference
+    // from user code the backend crate's CGU isn't dragged into the
+    // binary even with `RMW_INIT_ENTRIES`. The call itself is
+    // idempotent — the section walker invokes the same entry on
+    // first `Executor::open`.
     out.push_str("pub fn register_backends() {\n");
     match plan.build.rmw.as_str() {
         "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => {

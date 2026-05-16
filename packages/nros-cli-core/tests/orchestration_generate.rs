@@ -67,8 +67,12 @@ fn generated_package_writes_manifest_build_script_and_main() {
 
     let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
     assert!(cargo_toml.contains("name = \"nros-generated-test\""));
+    // Phase 128.C.3 — per-backend `rmw-*-cffi` features deleted; the
+    // generator now emits just `nros/rmw-cffi` regardless of which
+    // backend the plan picks. Selection happens via the
+    // `nros-rmw-<name>` dep contributing to `RMW_INIT_ENTRIES`.
     assert!(cargo_toml.contains(
-        "default = [\"std\", \"nros/platform-posix\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\", \"nros/rmw-zenoh-cffi\"]"
+        "default = [\"std\", \"nros/platform-posix\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
     assert!(cargo_toml.contains("nros = { path = \"/workspace/packages/core/nros\""));
     assert!(
@@ -144,7 +148,7 @@ fn generated_package_features_follow_rtos_plan() {
     let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
 
     assert!(cargo_toml.contains(
-        "default = [\"nros/platform-zephyr\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\", \"nros/rmw-xrce-cffi\"]"
+        "default = [\"nros/platform-zephyr\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
     assert!(!cargo_toml.contains("\"std\""));
     assert!(!cargo_toml.contains("platform-posix"));
@@ -173,7 +177,7 @@ fn generated_package_wires_freertos_entry() {
 
     let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
     assert!(cargo_toml.contains(
-        "default = [\"nros/platform-freertos\", \"platform-freertos\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\", \"nros/rmw-zenoh-cffi\"]"
+        "default = [\"nros/platform-freertos\", \"platform-freertos\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
     assert!(cargo_toml.contains("nros-board-mps2-an385-freertos"));
     assert!(cargo_toml.contains("panic-semihosting"));
