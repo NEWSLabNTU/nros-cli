@@ -294,9 +294,9 @@ fn backend_features(build: &PlanBuildOptions, backend: &str) -> Vec<String> {
             features.push(platform.to_string());
         }
     }
-    if backend == "zenoh" {
-        features.push("link-tcp".to_string());
-    }
+    // Phase 128.E.1 — `link-tcp` deleted from `nros-rmw-zenoh`
+    // (always-on in the vendor zenoh-pico build). No feature
+    // forward needed any more.
     features
 }
 
