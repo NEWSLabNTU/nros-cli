@@ -35,10 +35,22 @@ Prerequisites:
 
 # Allow callers to override _NANO_ROS_PREFIX (e.g. for in-tree cross-compilation
 # where the codegen cmake lives under packages/ but the prefix is the project root).
-if(NOT DEFINED _NANO_ROS_PREFIX)
+if(NOT DEFINED _NANO_ROS_PREFIX AND NOT DEFINED CACHE{_NANO_ROS_PREFIX})
     get_filename_component(_NANO_ROS_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 endif()
-set(_NANO_ROS_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+# Phase 144 — same scope concern as _NANO_ROS_CMAKE_DIR below.
+if(DEFINED _NANO_ROS_PREFIX AND NOT DEFINED CACHE{_NANO_ROS_PREFIX})
+    set(_NANO_ROS_PREFIX "${_NANO_ROS_PREFIX}" CACHE INTERNAL
+        "Effective nano-ros source/install prefix used by codegen")
+endif()
+# Phase 144 — cache as INTERNAL so `nros_generate_interfaces` reaches
+# the right path when invoked from a sibling subdir scope (e.g. an
+# example tree pulling nano-ros via add_subdirectory(<repo-root>)).
+# Plain `set()` at include time only lands in the including scope; CPP
+# codegen calls configure_file() with this path from the call-site
+# scope and saw the empty value before this cache promotion.
+set(_NANO_ROS_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}" CACHE INTERNAL
+    "Directory containing NanoRosGenerateInterfaces.cmake's template files")
 
 # =========================================================================
 # Locate the nros-codegen tool
@@ -380,7 +392,15 @@ function(nros_generate_interfaces target)
       endif()
       set(_ffi_crate_src "${_ffi_crate_dir}/src")
       set(_ffi_target_dir "${_ffi_crate_dir}/target")
+      # Phase 144 — resolve nros-serdes path against either the install
+      # layout (`<prefix>/share/nano-ros/rust/nros-serdes`) or the
+      # in-tree source layout (`<repo-root>/packages/core/nros-serdes`).
+      # `add_subdirectory(<repo-root>)` consumers see the source path;
+      # installed `find_package(NanoRos)` consumers see the share path.
       set(_serdes_dir "${_NANO_ROS_PREFIX}/share/nano-ros/rust/nros-serdes")
+      if(NOT EXISTS "${_serdes_dir}/Cargo.toml")
+          set(_serdes_dir "${_NANO_ROS_PREFIX}/packages/core/nros-serdes")
+      endif()
 
       # Cross-compilation: when Rust_CARGO_TARGET is set (e.g. by a CMake
       # toolchain file), pass --target to cargo and adjust the output path.
