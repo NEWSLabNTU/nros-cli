@@ -287,7 +287,12 @@ fn backend_features(build: &PlanBuildOptions, backend: &str) -> Vec<String> {
         features.push("std".to_string());
     }
     if let Some(platform) = platform_feature(&build.board, &build.target) {
-        features.push(platform.to_string());
+        // Phase 129.C.1 — `nros-rmw-xrce-cffi` no longer carries
+        // `platform-<rtos>` features; build script auto-detects
+        // from `target_os`. Skip the feature forward for XRCE.
+        if backend != "xrce" && backend != "rmw-xrce" && backend != "rmw-xrce-cffi" {
+            features.push(platform.to_string());
+        }
     }
     if backend == "zenoh" {
         features.push("link-tcp".to_string());
