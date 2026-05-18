@@ -13,16 +13,15 @@ corrosion_import_crate(
     LOCKED
 )
 
-# The [[bin]] name in Cargo.toml is "nros-codegen", so Corrosion creates
-# a target named "nros-codegen".
-install(PROGRAMS "$<TARGET_FILE:nros-codegen>"
-    DESTINATION bin
-)
-
-# ---- CMake codegen module ----
-install(FILES
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/NanoRosGenerateInterfaces.cmake"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cpp_ffi_Cargo.toml.in"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ffi_lib_rs.in"
-    DESTINATION lib/cmake/NanoRos
-)
+# nano-ros Phase 140 — install rules deleted. The superproject
+# consumes this submodule via `add_subdirectory(packages/codegen/
+# packages/nros-codegen-c)` from the root `CMakeLists.txt`; the
+# Corrosion-built `nros-codegen` target is reached by name at
+# codegen-invocation time (`$<TARGET_FILE:nros-codegen>` in
+# `cmake/NanoRosGenerateInterfaces.cmake`), and the
+# `cmake/NanoRosGenerateInterfaces.cmake` module is `include()`d
+# directly from the source tree. There is no `cmake --install`
+# step + no `<prefix>/bin/nros-codegen` + no `<prefix>/lib/cmake/
+# NanoRos/` layout in the nano-ros consumption shape, so the
+# previous `install(PROGRAMS ...) + install(FILES ...)` rules
+# were dead code.
