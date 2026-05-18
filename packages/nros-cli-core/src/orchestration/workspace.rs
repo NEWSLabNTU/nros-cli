@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::config::ComponentConfig;
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
@@ -21,6 +23,10 @@ pub struct Package {
     pub launch_files: Vec<PathBuf>,
     pub manifest_files: Vec<PathBuf>,
     pub metadata_files: Vec<PathBuf>,
+    /// `component_nros.toml` manifests in the package root (Phase
+    /// 126.B.7 — component declaration files that tie a package to a
+    /// `nros::component!` export + its source metadata path).
+    pub component_config_files: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -66,6 +72,64 @@ impl Workspace {
             .find(|pkg| pkg.name == package)
             .and_then(|pkg| pkg.nros_toml.clone())
     }
+
+    /// Iterate every `component_nros.toml` declaration in the
+    /// workspace as `(package_root, manifest_path, parsed_config)`
+    /// tuples. Used by the metadata command to detect packages that
+    /// declared themselves nros components but lack the
+    /// `nros::component!` export (their `[metadata].source_metadata`
+    /// path doesn't exist on disk — see Phase 126.B.7 acceptance
+    /// criterion).
+    pub fn component_declarations(&self) -> Result<Vec<ComponentDeclaration>> {
+        let mut out = Vec::new();
+        for pkg in &self.packages {
+            for manifest_path in &pkg.component_config_files {
+                let raw = fs::read_to_string(manifest_path).with_context(|| {
+                    format!(
+                        "failed to read component manifest {}",
+                        manifest_path.display()
+                    )
+                })?;
+                let config: ComponentConfig = toml::from_str(&raw).with_context(|| {
+                    format!(
+                        "failed to parse component manifest {}",
+                        manifest_path.display()
+                    )
+                })?;
+                out.push(ComponentDeclaration {
+                    package_root: pkg.root.clone(),
+                    manifest_path: manifest_path.clone(),
+                    config,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Parsed component manifest paired with its on-disk location.
+#[derive(Debug, Clone)]
+pub struct ComponentDeclaration {
+    /// Package root the manifest belongs to. `source_metadata` paths
+    /// in the manifest resolve relative to this directory.
+    pub package_root: PathBuf,
+    /// Absolute path to the `component_nros.toml` file.
+    pub manifest_path: PathBuf,
+    pub config: ComponentConfig,
+}
+
+impl ComponentDeclaration {
+    /// Absolute path to the `[metadata].source_metadata` file the
+    /// component is expected to emit. Relative paths resolve against
+    /// `package_root`.
+    pub fn source_metadata_path(&self) -> PathBuf {
+        let raw = Path::new(&self.config.metadata.source_metadata);
+        if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.package_root.join(raw)
+        }
+    }
 }
 
 fn discover_package(root: &Path) -> Result<Package> {
@@ -91,7 +155,32 @@ fn discover_package(root: &Path) -> Result<Package> {
             &["launch.yaml", "launch.yml"],
         )?,
         metadata_files: collect_files(root, &["metadata", "nros", "target/nros"], &["json"])?,
+        component_config_files: discover_component_configs(root)?,
     })
+}
+
+/// Locate component declaration files (`component_nros.toml` at the
+/// package root, plus any `nros/components/*.toml`). Keeps the layout
+/// flexible — single-component packages drop one TOML at the root;
+/// multi-component packages place per-component manifests under
+/// `nros/components/`.
+fn discover_component_configs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let primary = root.join("component_nros.toml");
+    if primary.is_file() {
+        out.push(primary);
+    }
+    let components_dir = root.join("nros").join("components");
+    if components_dir.is_dir() {
+        for entry in fs::read_dir(&components_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn collect_files(root: &Path, dirs: &[&str], suffixes: &[&str]) -> Result<Vec<PathBuf>> {

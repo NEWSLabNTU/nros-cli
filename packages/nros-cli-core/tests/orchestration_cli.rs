@@ -123,6 +123,78 @@ topics:
     .expect("write metadata");
 }
 
+/// Phase 126.B.7 acceptance — a package that declared itself a nros
+/// component via `component_nros.toml` but never produced its
+/// source-metadata JSON (most common cause: missing
+/// `nros::component!` export) is the host-side surface for
+/// `ComponentError::MissingExport`. The `metadata` command must
+/// surface that case with the canonical diagnostic string instead of
+/// silently producing an empty `metadata/` directory.
+#[test]
+fn orchestration_metadata_command_flags_missing_component_export() {
+    let root = temp_workspace("metadata_missing_component_export");
+    fs::create_dir_all(root.join("src/demo_pkg")).expect("create workspace");
+    fs::write(
+        root.join("package.xml"),
+        r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+    )
+    .expect("write system package.xml");
+    fs::write(
+        root.join("src/demo_pkg/package.xml"),
+        r#"<package format="3"><name>demo_pkg</name><version>0.1.0</version><depend>nros</depend></package>"#,
+    )
+    .expect("write component package.xml");
+    // `component_nros.toml` declares the package as a nros component
+    // and points at the source-metadata path the build is expected
+    // to emit. We deliberately don't create that JSON file — the
+    // metadata command should bail with MISSING_COMPONENT_EXPORT_ERROR.
+    fs::write(
+        root.join("src/demo_pkg/component_nros.toml"),
+        r#"version = 1
+package = "demo_pkg"
+component = "talker"
+language = "rust"
+
+[linkage]
+crate_name = "demo_pkg"
+executable = "talker"
+exported_symbol = "nros_component_talker"
+
+[metadata]
+source_metadata = "target/nros/metadata/talker.json"
+generated_by = "cargo nros metadata"
+
+[overrides]
+default_namespace = "/demo"
+parameters = {}
+remaps = []
+"#,
+    )
+    .expect("write component_nros.toml");
+
+    let out_dir = root.join("build/system_pkg/nros");
+    let err = metadata::run(metadata::Args {
+        system_pkg: "system_pkg".to_string(),
+        workspace: Some(root.clone()),
+        out_dir: Some(out_dir),
+        metadata: Vec::new(),
+    })
+    .expect_err("metadata command flags missing component export");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("package has no exported nros component"),
+        "diagnostic should carry MISSING_COMPONENT_EXPORT_ERROR; got: {msg}"
+    );
+    assert!(
+        msg.contains("demo_pkg"),
+        "diagnostic should name the offending package; got: {msg}"
+    );
+    assert!(
+        msg.contains("nros::component!"),
+        "diagnostic should hint at the missing macro; got: {msg}"
+    );
+}
+
 fn temp_workspace(name: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

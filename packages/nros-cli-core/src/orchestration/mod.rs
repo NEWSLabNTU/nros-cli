@@ -19,3 +19,4 @@ pub mod workspace;
 pub use config::{ComponentConfig, SystemConfig};
 pub use plan::NrosPlan;
 pub use source_metadata::SourceMetadata;
+pub use workspace::{ComponentDeclaration, Package, Workspace};
