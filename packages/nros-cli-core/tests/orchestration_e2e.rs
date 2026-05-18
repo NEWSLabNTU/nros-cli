@@ -199,6 +199,58 @@ fn fixture_workspace_builds_and_boots_generated_freertos_package() {
         "generated FreeRTOS binary exists at {}",
         binary.display()
     );
+
+    let cargo_toml =
+        fs::read_to_string(generated_dir.join("Cargo.toml")).expect("read generated Cargo.toml");
+    assert!(
+        !cargo_toml.contains("\"std\""),
+        "FreeRTOS generated default features must not enable `std`:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("serde_json"),
+        "FreeRTOS generated Cargo.toml leaked serde_json: {cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("\ntoml ="),
+        "FreeRTOS generated Cargo.toml leaked a toml dep: {cargo_toml}"
+    );
+
+    let main_rs =
+        fs::read_to_string(generated_dir.join("src/main.rs")).expect("read generated main.rs");
+    assert!(
+        main_rs.contains("#![cfg_attr(feature = \"platform-freertos\", no_std)]"),
+        "FreeRTOS generated main.rs must be no_std: {main_rs}"
+    );
+
+    let build_rs =
+        fs::read_to_string(generated_dir.join("build.rs")).expect("read generated build.rs");
+    assert!(
+        build_rs.contains("read_to_string(PLAN_PATH)"),
+        "generated build.rs must read the plan on the host: {build_rs}"
+    );
+
+    let target_tree_output = Command::new("cargo")
+        .arg("tree")
+        .arg("--manifest-path")
+        .arg(generated_dir.join("Cargo.toml"))
+        .arg("--edges")
+        .arg("normal")
+        .arg("--target")
+        .arg("thumbv7m-none-eabi")
+        .arg("--prefix")
+        .arg("none")
+        .output()
+        .expect("run cargo tree for generated FreeRTOS package");
+    let target_tree = String::from_utf8_lossy(&target_tree_output.stdout);
+    for forbidden in ["serde_json", "serde_yaml", "serde_yaml_ng", "toml v0"] {
+        assert!(
+            !target_tree.contains(forbidden),
+            "FreeRTOS target dependency tree contains forbidden host-only \
+             parser `{forbidden}` (must stay on host, not link into the \
+             RTOS binary):\n{target_tree}"
+        );
+    }
+
     assert_freertos_binary_boots(&binary);
 }
 
@@ -724,6 +776,27 @@ fn assert_freertos_binary_boots(binary: &Path) {
         "generated FreeRTOS binary exited unexpectedly with {:?}\n{}",
         output.status,
         combined
+    );
+    assert!(
+        combined.contains("Network ready."),
+        "generated FreeRTOS binary did not reach board → app handoff \
+         (lwIP setup never completed):\n{combined}"
+    );
+    for forbidden in ["panicked at", "PANIC:", "abort", "Initialization failed"] {
+        assert!(
+            !combined.contains(forbidden),
+            "generated FreeRTOS binary reported `{forbidden}` after \
+             board init handed off to `run_system` — generated runtime \
+             panicked before reaching the executor spin loop:\n{combined}"
+        );
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "generated FreeRTOS binary exited early (status {:?}) instead of \
+         being killed by the QEMU watchdog — `run_system` must keep \
+         spinning until timeout:\n{combined}",
+        output.status
     );
     assert!(
         combined.contains("nros FreeRTOS Platform"),

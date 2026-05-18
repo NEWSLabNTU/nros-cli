@@ -104,10 +104,52 @@ fn render_build_rs(options: &GenerateOptions, plan: &NrosPlan) -> String {
             "{{ native_link_directives }}",
             &render_native_link_directives(options, plan),
         )
+        .replace("{{ cfg_directives }}", &render_cfg_directives(plan))
         .replace(
             "{{ generated_tables_literal }}",
             &format!("{generated_tables:?}"),
         )
+}
+
+fn render_cfg_directives(plan: &NrosPlan) -> String {
+    if plan.build.cfg.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (key, value) in &plan.build.cfg {
+        let value_str = match value {
+            ParameterValue::Bool(b) => b.to_string(),
+            ParameterValue::Integer(n) => n.to_string(),
+            ParameterValue::Float(f) => format!("{f:?}"),
+            ParameterValue::String(s) => s.clone(),
+            _ => continue,
+        };
+        let key = sanitize_cfg_key(key);
+        out.push_str(&format!(
+            "    println!(\"cargo::rustc-cfg={key}=\\\"{}\\\"\");\n",
+            escape_cfg_value(&value_str),
+        ));
+        out.push_str(&format!(
+            "    println!(\"cargo::rustc-check-cfg=cfg({key}, values(any()))\");\n",
+        ));
+    }
+    out
+}
+
+fn sanitize_cfg_key(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn escape_cfg_value(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[derive(Debug, Clone)]

@@ -190,6 +190,43 @@ fn generated_package_wires_freertos_entry() {
 }
 
 #[test]
+fn generated_build_rs_emits_rustc_cfg_directives_from_plan_cfg() {
+    let root = temp_output("generated_package_cfg_directives");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let plan_path = root.join("nros-plan.json");
+    let plan = include_str!("fixtures/orchestration/plan_pub_sub.json").replace(
+        "\"cfg\": {}",
+        "\"cfg\": {\"transport\": \"udp\", \"max-clients\": 8, \"safety-e2e\": true}",
+    );
+    fs::write(&plan_path, plan).expect("write plan with cfg");
+
+    let output_dir = root.join("generated");
+    generate_plan(
+        "generated_package_cfg_directives",
+        plan_path,
+        output_dir.clone(),
+    );
+
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    assert!(
+        build_rs.contains("cargo::rustc-cfg=transport=\\\"udp\\\""),
+        "build.rs missing transport cfg: {build_rs}"
+    );
+    assert!(
+        build_rs.contains("cargo::rustc-cfg=max_clients=\\\"8\\\""),
+        "build.rs missing max-clients cfg: {build_rs}"
+    );
+    assert!(
+        build_rs.contains("cargo::rustc-cfg=safety_e2e=\\\"true\\\""),
+        "build.rs missing safety-e2e cfg: {build_rs}"
+    );
+    assert!(
+        build_rs.contains("cargo::rustc-check-cfg=cfg(transport, values(any()))"),
+        "build.rs missing check-cfg for transport: {build_rs}"
+    );
+}
+
+#[test]
 fn generated_package_registers_service_and_action_callbacks() {
     let output_dir = generate_fixture(
         "generated_package_registers_service_and_action_callbacks",
