@@ -522,46 +522,32 @@ function(nros_generate_interfaces target)
     # C target with .c sources
     set(_lib_target "${target}__nano_ros_c")
 
-    if(_generated_sources)
-      add_library(${_lib_target} STATIC ${_generated_sources})
-      target_include_directories(${_lib_target}
-        PUBLIC
-          $<BUILD_INTERFACE:${_output_dir}>
-          $<BUILD_INTERFACE:${_umbrella_dir}>
-          $<INSTALL_INTERFACE:include/${target}>
-      )
-    else()
-      add_library(${_lib_target} INTERFACE)
-      target_include_directories(${_lib_target}
-        INTERFACE
-          $<BUILD_INTERFACE:${_output_dir}>
-          $<BUILD_INTERFACE:${_umbrella_dir}>
-          $<INSTALL_INTERFACE:include/${target}>
-      )
+    set(_iface FALSE)
+    if(NOT _generated_sources OR (NANO_ROS_PLATFORM MATCHES "^nuttx"))
+      set(_iface TRUE)
     endif()
-
-    # Link to nros-c
-    if(TARGET NanoRos::NanoRos)
+    if(_iface)
+      add_library(${_lib_target} INTERFACE)
+      target_include_directories(${_lib_target} INTERFACE
+          $<BUILD_INTERFACE:${_output_dir}>
+          $<BUILD_INTERFACE:${_umbrella_dir}>
+          $<INSTALL_INTERFACE:include/${target}>)
+      set(_link_type INTERFACE)
+    else()
+      add_library(${_lib_target} STATIC ${_generated_sources})
+      target_include_directories(${_lib_target} PUBLIC
+          $<BUILD_INTERFACE:${_output_dir}>
+          $<BUILD_INTERFACE:${_umbrella_dir}>
+          $<INSTALL_INTERFACE:include/${target}>)
       set(_link_type PUBLIC)
-      if(NOT _generated_sources)
-        set(_link_type INTERFACE)
-      endif()
+    endif()
+    if(TARGET NanoRos::NanoRos)
       target_link_libraries(${_lib_target} ${_link_type} NanoRos::NanoRos)
     elseif(TARGET nros_c::nros_c)
-      set(_link_type PUBLIC)
-      if(NOT _generated_sources)
-        set(_link_type INTERFACE)
-      endif()
       target_link_libraries(${_lib_target} ${_link_type} nros_c::nros_c)
     endif()
-
-    # Link dependency libraries
     foreach(_dep ${_ARG_DEPENDENCIES})
       if(TARGET ${_dep}__nano_ros_c)
-        set(_link_type PUBLIC)
-        if(NOT _generated_sources)
-          set(_link_type INTERFACE)
-        endif()
         target_link_libraries(${_lib_target} ${_link_type} ${_dep}__nano_ros_c)
       endif()
     endforeach()
