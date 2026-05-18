@@ -5,9 +5,11 @@
 //! host-side adapter that will be tightened once that schema lands.
 
 use eyre::{Context, Result};
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use super::{
     ComponentConfig, NrosPlan,
@@ -281,7 +283,7 @@ fn workspace_from_nros_path(nros_path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn backend_features(build: &PlanBuildOptions, backend: &str) -> Vec<String> {
+fn backend_features(build: &PlanBuildOptions, _backend: &str) -> Vec<String> {
     let mut features = Vec::new();
     if uses_std(build) {
         features.push("std".to_string());
@@ -289,9 +291,8 @@ fn backend_features(build: &PlanBuildOptions, backend: &str) -> Vec<String> {
     if let Some(platform) = platform_feature(&build.board, &build.target) {
         features.push(platform.to_string());
     }
-    if backend == "zenoh" {
-        features.push("link-tcp".to_string());
-    }
+    // Phase 128.E.1: `link-tcp` / `link-udp-unicast` deleted (no-op aliases).
+    // Zenoh ships TCP/UDP always-on at the zpico-sys layer.
     features
 }
 
@@ -322,9 +323,11 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
     if uses_rmw_cffi(&build.rmw) {
         features.push("nros/rmw-cffi".to_string());
         features.push("nros-orchestration/rmw-cffi".to_string());
-        if let Some(rmw) = rmw_backend_feature(&build.rmw) {
-            features.push(format!("nros/{rmw}"));
-        }
+        // Phase 128.C.3: per-backend `nros/rmw-<name>-cffi` features were
+        // deleted. Backend selection now flows from depending on the
+        // concrete `nros-rmw-<name>` crate (added via
+        // `render_backend_dependencies`) — the linkme RMW_INIT_ENTRIES
+        // walker discovers it on first `Executor::open`.
     }
     for feature in build
         .features
@@ -363,9 +366,10 @@ fn generated_feature(feature: &str) -> Option<String> {
     match feature {
         "std" => Some("std".to_string()),
         "rmw-cffi" => Some("nros/rmw-cffi".to_string()),
-        "rmw-zenoh" | "rmw-zenoh-cffi" => Some("nros/rmw-zenoh-cffi".to_string()),
-        "rmw-xrce" | "rmw-xrce-cffi" => Some("nros/rmw-xrce-cffi".to_string()),
-        "rmw-dds" | "rmw-dds-cffi" => Some("nros/rmw-dds-cffi".to_string()),
+        // Backend choice is encoded via the concrete `nros-rmw-<name>`
+        // path-dep, not a feature on the nros crate (Phase 128.C.3).
+        "rmw-zenoh" | "rmw-zenoh-cffi" | "rmw-xrce" | "rmw-xrce-cffi" | "rmw-dds"
+        | "rmw-dds-cffi" => None,
         feature if feature.starts_with("nros/") || feature.starts_with("nros-orchestration/") => {
             Some(feature.to_string())
         }
@@ -375,17 +379,6 @@ fn generated_feature(feature: &str) -> Option<String> {
 
 fn uses_rmw_cffi(rmw: &str) -> bool {
     !matches!(rmw, "" | "none")
-}
-
-fn rmw_backend_feature(rmw: &str) -> Option<&'static str> {
-    match rmw {
-        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => Some("rmw-zenoh-cffi"),
-        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => Some("rmw-xrce-cffi"),
-        "dds" | "rmw-dds" | "rmw-dds-cffi" => Some("rmw-dds-cffi"),
-        "cffi" | "rmw-cffi" => None,
-        "" | "none" => None,
-        _ => None,
-    }
 }
 
 fn dedup(features: Vec<String>) -> Vec<String> {

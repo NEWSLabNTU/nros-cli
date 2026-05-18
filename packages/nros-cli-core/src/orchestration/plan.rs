@@ -84,7 +84,7 @@ pub enum PlanEntity {
     Subscriber {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         resolved_name: String,
         interface: InterfaceRef,
@@ -94,7 +94,7 @@ pub enum PlanEntity {
     Timer {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         period_ms: u64,
         trace: EntityTrace,
@@ -102,7 +102,7 @@ pub enum PlanEntity {
     ServiceServer {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         resolved_name: String,
         interface: InterfaceRef,
@@ -120,7 +120,7 @@ pub enum PlanEntity {
     ActionServer {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         resolved_name: String,
         interface: InterfaceRef,

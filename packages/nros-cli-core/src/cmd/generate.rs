@@ -10,8 +10,7 @@ use cargo_nano_ros::{
 };
 use clap::{Args as ClapArgs, ValueEnum};
 use eyre::{Result, eyre};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Lang {

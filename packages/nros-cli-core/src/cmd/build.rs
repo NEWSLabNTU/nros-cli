@@ -12,14 +12,19 @@
 //! cmake path. Heuristic: if `[lib].crate-type` in Cargo.toml contains
 //! `staticlib` AND CMakeLists.txt exists, prefer cmake.
 
-use crate::orchestration;
+use crate::{
+    cmd::{check, metadata, plan},
+    orchestration,
+};
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, eyre};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
-#[derive(Debug, ClapArgs)]
+#[derive(Debug, Default, ClapArgs)]
 pub struct Args {
     /// Path to the project root (default: cwd)
     #[arg(long)]
@@ -29,13 +34,45 @@ pub struct Args {
     #[arg(long)]
     pub system_plan: Option<PathBuf>,
 
-    /// Output dir for the generated package (default: <project>/build/<package>/nros/generated)
+    /// Output dir for the generated package (default: <out_dir>/generated)
     #[arg(long)]
     pub system_output: Option<PathBuf>,
 
-    /// Generated package name for system mode
+    /// Orchestration intermediate output root (default: <project>/build/<system_pkg>/nros)
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
+
+    /// Generated package Cargo crate name (default: nros-<system_pkg>-generated)
     #[arg(long)]
     pub system_package: Option<String>,
+
+    /// Orchestration system package name used for build/<system_pkg>/nros layout
+    #[arg(long)]
+    pub system_pkg: Option<String>,
+
+    /// Launch file driving the full metadata → plan → check → build chain
+    #[arg(long)]
+    pub launch_file: Option<PathBuf>,
+
+    /// Precomputed play_launch record.json (skip launch parse step)
+    #[arg(long)]
+    pub record: Option<PathBuf>,
+
+    /// Pre-existing source metadata JSON (repeatable; default = workspace auto-discover)
+    #[arg(long = "metadata")]
+    pub metadata: Vec<PathBuf>,
+
+    /// ROS launch manifest YAML artifact (repeatable)
+    #[arg(long = "manifest")]
+    pub manifest: Vec<PathBuf>,
+
+    /// nano-ros deployment overlay TOML (repeatable)
+    #[arg(long = "nros-toml")]
+    pub nros_toml: Vec<PathBuf>,
+
+    /// Launch arguments forwarded as name:=value or name=value (repeatable)
+    #[arg(long = "launch-arg")]
+    pub launch_arg: Vec<String>,
 
     /// nano-ros workspace root for generated path dependencies
     #[arg(long)]
@@ -59,6 +96,65 @@ pub fn run(args: Args) -> Result<()> {
         Some(p) => p,
         None => std::env::current_dir()?,
     };
+    if args.launch_file.is_some() && args.system_plan.is_some() {
+        return Err(eyre!(
+            "`--launch-file` and `--system-plan` are mutually exclusive"
+        ));
+    }
+    if let Some(launch_file) = args.launch_file {
+        let system_pkg = args
+            .system_pkg
+            .clone()
+            .or_else(|| args.system_package.clone())
+            .unwrap_or_else(|| infer_system_pkg(&root));
+        let package_name = args
+            .system_package
+            .clone()
+            .unwrap_or_else(|| default_generated_crate_name(&system_pkg));
+        let out_dir = args
+            .out_dir
+            .clone()
+            .unwrap_or_else(|| root.join("build").join(&system_pkg).join("nros"));
+        let generated_dir = args
+            .system_output
+            .clone()
+            .unwrap_or_else(|| out_dir.join("generated"));
+        fs::create_dir_all(&out_dir)
+            .wrap_err_with(|| format!("failed to create out dir {}", out_dir.display()))?;
+        metadata::run(metadata::Args {
+            system_pkg: system_pkg.clone(),
+            workspace: Some(root.clone()),
+            out_dir: Some(out_dir.clone()),
+            metadata: args.metadata.clone(),
+        })?;
+        plan::run(plan::Args {
+            system_pkg: system_pkg.clone(),
+            launch_file,
+            record: args.record,
+            workspace: Some(root.clone()),
+            out_dir: Some(out_dir.clone()),
+            metadata: Vec::new(),
+            manifests: args.manifest,
+            nros_toml: args.nros_toml,
+            launch_args: args.launch_arg,
+        })?;
+        let plan_path = out_dir.join("nros-plan.json");
+        check::run(check::Args {
+            plan: plan_path.clone(),
+        })?;
+        let workspace_root = args.nano_ros_workspace.unwrap_or_else(|| root.clone());
+        orchestration::build::build_generated_package(&orchestration::build::BuildOptions {
+            package_name,
+            output_dir: generated_dir,
+            plan_path,
+            workspace_root,
+            component_workspace: Some(root.clone()),
+            release: args.release,
+            target: args.target,
+            cargo_args: args.passthrough,
+        })?;
+        return Ok(());
+    }
     if let Some(plan_path) = args.system_plan {
         let package_name = args
             .system_package
@@ -139,6 +235,33 @@ fn infer_package_name(root: &Path) -> String {
         .map(sanitize_package_name)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "nros-system".to_string())
+}
+
+fn infer_system_pkg(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .map(|raw| {
+            raw.chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "nros_system".to_string())
+}
+
+fn default_generated_crate_name(system_pkg: &str) -> String {
+    let sanitized = sanitize_package_name(system_pkg);
+    if sanitized.starts_with("nros-") || sanitized.starts_with("nros_") {
+        sanitized
+    } else {
+        format!("nros-{sanitized}-generated")
+    }
 }
 
 fn sanitize_package_name(raw: &str) -> String {

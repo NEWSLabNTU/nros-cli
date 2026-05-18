@@ -4,14 +4,15 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use nros_cli_core::cmd::{build, check, metadata, plan};
-use nros_cli_core::orchestration::{
-    plan::{NrosPlan, PlanComponent, PlanEntity},
-    schema::ParameterValue,
+use nros_cli_core::{
+    cmd::{build, check, metadata, plan},
+    orchestration::{
+        plan::{NrosPlan, PlanComponent, PlanEntity},
+        schema::ParameterValue,
+    },
 };
 use serde_json::Value;
 
@@ -79,6 +80,7 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        ..Default::default()
     })
     .expect("build command compiles generated package");
 
@@ -139,6 +141,7 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        ..Default::default()
     })
     .expect("build command compiles generated multi-instance package");
     assert!(
@@ -182,6 +185,7 @@ fn fixture_workspace_builds_and_boots_generated_freertos_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        ..Default::default()
     })
     .expect("build command compiles generated FreeRTOS package");
 
@@ -294,6 +298,7 @@ fn fixture_workspace_links_mixed_c_component_archive() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        ..Default::default()
     })
     .expect("build command links generated package with C component archive");
 
@@ -346,6 +351,7 @@ fn fixture_workspace_builds_generated_service_action_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        ..Default::default()
     })
     .expect("build command compiles generated service/action package");
 
@@ -369,6 +375,57 @@ fn fixture_workspace_builds_generated_service_action_package() {
         "generated service/action binary exists at {}",
         binary.display()
     );
+}
+
+#[test]
+fn build_command_runs_full_metadata_plan_check_build_pipeline() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_one_shot");
+    let out_dir = output.join("nros");
+    let generated_dir = out_dir.join("generated");
+    let demo_pkg = fixture.join("src/demo_pkg");
+
+    build::run(build::Args {
+        project: Some(fixture.clone()),
+        system_output: Some(generated_dir.clone()),
+        out_dir: Some(out_dir.clone()),
+        system_package: Some("nros-e2e-generated-one-shot".to_string()),
+        system_pkg: Some("e2e_system".to_string()),
+        launch_file: Some(demo_pkg.join("launch/system.launch.xml")),
+        metadata: vec![fixture.join("artifacts/talker.metadata.json")],
+        manifest: vec![demo_pkg.join("manifest/system.launch.yaml")],
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        ..Default::default()
+    })
+    .expect("nros build --launch-file runs full pipeline");
+
+    let plan_path = out_dir.join("nros-plan.json");
+    assert!(
+        plan_path.is_file(),
+        "plan written at {}",
+        plan_path.display()
+    );
+    assert!(out_dir.join("record.json").is_file());
+    assert!(out_dir.join("metadata").is_dir());
+    assert!(generated_dir.join("src/main.rs").is_file());
+
+    let plan: NrosPlan =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read generated plan"))
+            .expect("generated plan has canonical schema");
+    let binary = out_dir
+        .join("target")
+        .join(&plan.build.target)
+        .join("debug")
+        .join("nros-e2e-generated-one-shot");
+    assert!(
+        binary.is_file(),
+        "generated binary exists at {}",
+        binary.display()
+    );
+
+    let port = free_local_port();
+    let _zenohd = start_zenohd(port);
+    assert_generated_binary_spins(&binary, port);
 }
 
 fn fixture_workspace() -> PathBuf {
@@ -669,7 +726,7 @@ fn assert_freertos_binary_boots(binary: &Path) {
         combined
     );
     assert!(
-        combined.contains("nros QEMU FreeRTOS Platform"),
+        combined.contains("nros FreeRTOS Platform"),
         "generated FreeRTOS binary did not print platform banner\n{}",
         combined
     );

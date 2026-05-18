@@ -2,9 +2,11 @@
 
 use cargo_nano_ros::package_xml::PackageXml;
 use eyre::{Context, Result};
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct Workspace {

@@ -1,12 +1,17 @@
 //! Build orchestration for generated system packages.
 
-use super::generate::{GenerateOptions, GeneratedPackage, generate_package};
-use super::{NrosPlan, plan::PlanBuildOptions};
+use super::{
+    NrosPlan,
+    generate::{GenerateOptions, GeneratedPackage, generate_package},
+    plan::PlanBuildOptions,
+};
 use eyre::{Context, Result, eyre};
 use serde::Serialize;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {

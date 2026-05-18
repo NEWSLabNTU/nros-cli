@@ -9,8 +9,10 @@
 
 use clap::{Args as ClapArgs, Subcommand};
 use eyre::{Result, WrapErr, eyre};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Subcommand)]
 pub enum Args {
@@ -80,7 +82,12 @@ fn list(args: ListArgs) -> Result<()> {
         .unwrap_or(4)
         .max(4);
     println!("{:<name_w$}  description", "name", name_w = name_w);
-    println!("{:<name_w$}  {}", "-".repeat(name_w), "-".repeat(60), name_w = name_w);
+    println!(
+        "{:<name_w$}  {}",
+        "-".repeat(name_w),
+        "-".repeat(60),
+        name_w = name_w
+    );
     for b in entries {
         println!("{:<name_w$}  {}", b.name, b.description, name_w = name_w);
     }

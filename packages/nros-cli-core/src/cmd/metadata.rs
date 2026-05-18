@@ -4,8 +4,7 @@ use crate::orchestration::workspace::Workspace;
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, eyre};
 use serde_json::Value;
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {

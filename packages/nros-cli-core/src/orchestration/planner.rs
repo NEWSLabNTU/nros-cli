@@ -1,16 +1,20 @@
 //! Draft host planner for Phase 126.C.
 
-use super::manifest::{ManifestArtifact, endpoint_requirements, load_manifest};
-use super::names;
-use super::params::{ParameterInputs, effective_parameters, load_toml_values};
-use super::plan::{NrosPlan, PlanEntity};
-use super::schema::InterfaceRef;
-use super::workspace::{Workspace, unique_paths};
+use super::{
+    manifest::{ManifestArtifact, endpoint_requirements, load_manifest},
+    names,
+    params::{ParameterInputs, effective_parameters, load_toml_values},
+    plan::{NrosPlan, PlanEntity},
+    schema::InterfaceRef,
+    workspace::{Workspace, unique_paths},
+};
 use eyre::{Context, Result, eyre};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
@@ -955,6 +959,33 @@ fn build_node_instance(
             None,
             record_path,
         ));
+    }
+    if let Some(artifact) = source_metadata {
+        let language = artifact
+            .value
+            .get("language")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let exported = artifact
+            .value
+            .get("exported_symbol")
+            .and_then(Value::as_str)
+            .filter(|symbol| !symbol.is_empty());
+        if language == "rust" && exported.is_none() {
+            diagnostics.push(diagnostic(
+                "error",
+                "missing-component-export",
+                format!(
+                    "rust component {package}/{executable} declares no exported_symbol — \
+                     add `nros::component_export!` (or `#[nros::component]`) so the planner \
+                     can wire it into the generated runtime"
+                ),
+                Some(package),
+                Some(&instance_id),
+                None,
+                &artifact.path,
+            ));
+        }
     }
 
     let package_nros = workspace
@@ -2405,7 +2436,7 @@ topics:
   "component": "talker",
   "language": "rust",
   "executable": "talker",
-  "exported_symbol": null,
+  "exported_symbol": "nros_component_talker",
   "nodes": [
     {
       "id": "node_talker",
@@ -2472,6 +2503,40 @@ topics:
         assert_eq!(nodes[1]["resolved_name"], "/aux");
         assert_eq!(nodes[1]["entities"][0]["role"], "service_server");
         assert_eq!(nodes[1]["entities"][1]["role"], "action_server");
+    }
+
+    #[test]
+    fn plan_system_rejects_rust_component_missing_exported_symbol() {
+        let root = temp_workspace("nros-plan-missing-export");
+        let err = plan_with_metadata(
+            &root,
+            r#"{
+  "version": 1,
+  "package": "demo_pkg",
+  "component": "talker",
+  "language": "rust",
+  "executable": "talker",
+  "exported_symbol": null,
+  "nodes": [{
+    "id": "node_talker",
+    "unresolved_name": {"value": "talker", "kind": "relative"},
+    "namespace": null,
+    "publishers": [],
+    "subscribers": [],
+    "timers": [],
+    "services": [],
+    "actions": []
+  }],
+  "callbacks": [],
+  "parameters": [],
+  "trace": {"generator": "nros-metadata-rust", "package_manifest": "package.xml", "source_artifacts": ["src/talker.rs"]}
+}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("missing-component-export"), "{err}");
+        assert!(err.contains("component_export"), "{err}");
     }
 
     fn plan_with_metadata(root: &Path, metadata_json: &str) -> Result<PlanningOutput> {

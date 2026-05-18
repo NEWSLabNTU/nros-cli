@@ -4,8 +4,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use nros_cli_core::cmd::{check, metadata, plan};
-use nros_cli_core::orchestration::plan::NrosPlan;
+use nros_cli_core::{
+    cmd::{check, metadata, plan},
+    orchestration::plan::NrosPlan,
+};
 
 #[test]
 fn orchestration_metadata_plan_check_commands_share_artifacts() {
