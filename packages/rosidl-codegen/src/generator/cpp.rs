@@ -135,14 +135,20 @@ fn extract_intra_package_includes(
     let c_pkg = to_c_package_name(package_name);
     let mut includes = Vec::new();
     for field in fields {
-        collect_field_type_intra_pkg_includes(&field.field_type, &c_pkg, &mut includes);
+        collect_field_type_intra_pkg_includes(&field.field_type, package_name, &c_pkg, &mut includes);
     }
     includes.sort();
     includes
 }
 
-fn collect_field_type_intra_pkg_includes(ft: &FieldType, c_pkg: &str, includes: &mut Vec<String>) {
+fn collect_field_type_intra_pkg_includes(
+    ft: &FieldType,
+    package_name: &str,
+    c_pkg: &str,
+    includes: &mut Vec<String>,
+) {
     match ft {
+        // Unqualified type (`Foo[]`) — always same-pkg.
         FieldType::NamespacedType {
             package: None,
             name,
@@ -152,10 +158,24 @@ fn collect_field_type_intra_pkg_includes(ft: &FieldType, c_pkg: &str, includes: 
                 includes.push(path);
             }
         }
+        // Explicitly-qualified type (`autoware_planning_msgs/Foo[]`) where
+        // the package matches our own. ROS `.msg` files often spell intra-
+        // package refs with the full package prefix (e.g. Path.msg uses
+        // `autoware_planning_msgs/PathPoint[]`), so they need the same
+        // include-injection treatment as unqualified types.
+        FieldType::NamespacedType {
+            package: Some(pkg),
+            name,
+        } if pkg == package_name => {
+            let path = format!("msg/{}_msg_{}.hpp", c_pkg, to_snake_case(name));
+            if !includes.contains(&path) {
+                includes.push(path);
+            }
+        }
         FieldType::Array { element_type, .. }
         | FieldType::Sequence { element_type }
         | FieldType::BoundedSequence { element_type, .. } => {
-            collect_field_type_intra_pkg_includes(element_type, c_pkg, includes);
+            collect_field_type_intra_pkg_includes(element_type, package_name, c_pkg, includes);
         }
         _ => {}
     }
