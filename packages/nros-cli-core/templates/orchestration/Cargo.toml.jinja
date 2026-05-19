@@ -8,6 +8,7 @@ publish = false
 default = {{ default_features }}
 std = ["nros/std", "nros-orchestration/std"]
 platform-freertos = ["nros/platform-freertos"]
+platform-nuttx = ["nros/platform-nuttx"]
 
 [dependencies]
 nros = { path = "{{ nros_path }}", default-features = false }
@@ -15,3 +16,4 @@ nros-orchestration = { path = "{{ nros_orchestration_path }}", default-features 
 {{ component_dependencies }}
 
 [build-dependencies]
+

@@ -216,6 +216,75 @@ fn fixture_workspace_builds_and_boots_generated_freertos_package() {
     assert_freertos_binary_boots(&binary);
 }
 
+/// Phase 126.M5.nuttx — drives the orchestration generator against
+/// the NuttX QEMU ARM (Cortex-A7) board. Skipped when `NUTTX_DIR`
+/// isn't set (the board crate's build.rs panics without it). When
+/// the workspace is set up, asserts the generated package compiles
+/// to an `armv7a-nuttx-eabihf` ELF.
+///
+/// QEMU boot smoke deferred — NuttX boots via its own bootloader
+/// stage that integrates the generated ELF as a child app, not a
+/// kernel image; the test asserts on the build artifact only.
+#[test]
+fn fixture_workspace_builds_generated_nuttx_package() {
+    if std::env::var_os("NUTTX_DIR").is_none() {
+        eprintln!(
+            "[SKIPPED] NUTTX_DIR not set — run `just nuttx setup` and \
+             re-export `NUTTX_DIR=third-party/nuttx/nuttx` to enable"
+        );
+        return;
+    }
+
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_nuttx");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-nuttx");
+    let plan_path = out_dir.join("nros-plan-nuttx.json");
+    fs::create_dir_all(&out_dir).expect("create NuttX output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_nuttx(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize NuttX plan"),
+    )
+    .expect("write NuttX plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated NuttX plan");
+    build::run(build::Args {
+        project: Some(fixture),
+        system_plan: Some(plan_path),
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-nuttx".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: true,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated NuttX package");
+
+    let binary = out_dir
+        .join("target")
+        .join("armv7a-nuttx-eabihf")
+        .join("release")
+        .join("nros-e2e-generated-nuttx");
+    assert!(
+        binary.is_file(),
+        "generated NuttX binary exists at {}",
+        binary.display()
+    );
+}
+
 #[test]
 fn fixture_workspace_links_mixed_c_component_archive() {
     let fixture = fixture_workspace();
@@ -493,6 +562,13 @@ fn retarget_plan_to_fixture_component(plan: &mut NrosPlan) {
 fn retarget_plan_to_freertos(plan: &mut NrosPlan) {
     plan.build.target = "thumbv7m-none-eabi".to_string();
     plan.build.board = "freertos".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_nuttx(plan: &mut NrosPlan) {
+    plan.build.target = "armv7a-nuttx-eabihf".to_string();
+    plan.build.board = "nuttx".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }
