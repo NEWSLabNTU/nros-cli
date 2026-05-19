@@ -289,9 +289,12 @@ fn backend_features(build: &PlanBuildOptions, backend: &str) -> Vec<String> {
     if let Some(platform) = platform_feature(&build.board, &build.target) {
         features.push(platform.to_string());
     }
-    if backend == "zenoh" {
-        features.push("link-tcp".to_string());
-    }
+    // Phase 126.M4 — `link-tcp` / `link-udp-unicast` feature gates were
+    // deleted from zpico-sys (CLAUDE.md "Key Patterns": "vendor always
+    // compiles those transports; locator picks at runtime"). nros-rmw-zenoh
+    // now only exposes `link-tls` + `link-custom`. Plain TCP/UDP is
+    // unconditional — no per-backend feature needed.
+    let _ = backend;
     features
 }
 
@@ -360,12 +363,22 @@ fn platform_feature(board: &str, target: &str) -> Option<&'static str> {
 }
 
 fn generated_feature(feature: &str) -> Option<String> {
+    // Phase 126.M4 — `nros/rmw-{zenoh,xrce,dds}-cffi` feature names were
+    // dropped in Phase 128.C ("RMW-blind init + drop rmw-*-cffi features").
+    // Backend selection now happens at link time via the linker-section
+    // walker inside `Executor::open`, driven by the per-backend `path`
+    // dep in the generated Cargo.toml. The generator collapses the old
+    // per-RMW `cffi` feature aliases to plain `nros/rmw-cffi` (the only
+    // C-FFI feature `nros` still exposes).
     match feature {
         "std" => Some("std".to_string()),
-        "rmw-cffi" => Some("nros/rmw-cffi".to_string()),
-        "rmw-zenoh" | "rmw-zenoh-cffi" => Some("nros/rmw-zenoh-cffi".to_string()),
-        "rmw-xrce" | "rmw-xrce-cffi" => Some("nros/rmw-xrce-cffi".to_string()),
-        "rmw-dds" | "rmw-dds-cffi" => Some("nros/rmw-dds-cffi".to_string()),
+        "rmw-cffi"
+        | "rmw-zenoh"
+        | "rmw-zenoh-cffi"
+        | "rmw-xrce"
+        | "rmw-xrce-cffi"
+        | "rmw-dds"
+        | "rmw-dds-cffi" => Some("nros/rmw-cffi".to_string()),
         feature if feature.starts_with("nros/") || feature.starts_with("nros-orchestration/") => {
             Some(feature.to_string())
         }
@@ -378,10 +391,13 @@ fn uses_rmw_cffi(rmw: &str) -> bool {
 }
 
 fn rmw_backend_feature(rmw: &str) -> Option<&'static str> {
+    // Phase 126.M4 — see `generated_feature`. Per-RMW `cffi` features
+    // collapsed to the single `rmw-cffi` umbrella; backend dispatch is
+    // section-walker based.
     match rmw {
-        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => Some("rmw-zenoh-cffi"),
-        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => Some("rmw-xrce-cffi"),
-        "dds" | "rmw-dds" | "rmw-dds-cffi" => Some("rmw-dds-cffi"),
+        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => Some("rmw-cffi"),
+        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => Some("rmw-cffi"),
+        "dds" | "rmw-dds" | "rmw-dds-cffi" => Some("rmw-cffi"),
         "cffi" | "rmw-cffi" => None,
         "" | "none" => None,
         _ => None,

@@ -79,6 +79,12 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
     })
     .expect("build command compiles generated package");
 
@@ -139,6 +145,12 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
     })
     .expect("build command compiles generated multi-instance package");
     assert!(
@@ -182,6 +194,12 @@ fn fixture_workspace_builds_and_boots_generated_freertos_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
     })
     .expect("build command compiles generated FreeRTOS package");
 
@@ -294,6 +312,12 @@ fn fixture_workspace_links_mixed_c_component_archive() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
     })
     .expect("build command links generated package with C component archive");
 
@@ -346,6 +370,12 @@ fn fixture_workspace_builds_generated_service_action_package() {
         release: false,
         target: None,
         passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
     })
     .expect("build command compiles generated service/action package");
 
@@ -369,6 +399,51 @@ fn fixture_workspace_builds_generated_service_action_package() {
         "generated service/action binary exists at {}",
         binary.display()
     );
+}
+
+#[test]
+fn build_launch_one_shot_runs_metadata_plan_generate_and_cargo() {
+    // Phase 126.M4 — `nros build --launch` runs metadata + plan +
+    // generation + cargo in one invocation. Output_dir is explicit so
+    // the fixture's tree stays clean across runs; the build-binary
+    // pointer comes back from the returned plan.
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_one_shot");
+    let out_root = output.join("build/e2e_system/nros");
+    let generated_dir = out_root.join("generated");
+    let demo_pkg = fixture.join("src/demo_pkg");
+
+    build::run(build::Args {
+        project: Some(fixture.clone()),
+        system_plan: None,
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-one-shot".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: false,
+        target: None,
+        passthrough: Vec::new(),
+        launch: Some(demo_pkg.join("launch/system.launch.xml")),
+        system_pkg: Some("e2e_system".to_string()),
+        metadata: vec![fixture.join("artifacts/talker.metadata.json")],
+        manifest: vec![demo_pkg.join("manifest/system.launch.yaml")],
+        launch_arg: Vec::new(),
+        out_dir: Some(out_root.clone()),
+    })
+    .expect("build --launch one-shot mode completes metadata+plan+generate+cargo");
+
+    let plan_path = out_root.join("nros-plan.json");
+    assert!(plan_path.is_file(), "plan written at {}", plan_path.display());
+    let plan: NrosPlan = serde_json::from_str(&fs::read_to_string(&plan_path).expect("read plan"))
+        .expect("plan parses");
+    assert_eq!(plan.system, "e2e_system");
+    assert!(generated_dir.join("Cargo.toml").is_file());
+    assert!(generated_dir.join("src/main.rs").is_file());
+    let binary = out_root
+        .join("target")
+        .join(&plan.build.target)
+        .join("debug")
+        .join("nros-e2e-generated-one-shot");
+    assert!(binary.is_file(), "one-shot binary exists at {}", binary.display());
 }
 
 fn fixture_workspace() -> PathBuf {

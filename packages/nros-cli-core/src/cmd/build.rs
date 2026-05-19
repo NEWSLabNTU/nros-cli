@@ -1,7 +1,21 @@
 //! `nros build` — Phase 111.A.9.
 //!
-//! Auto-detect the project flavor and delegate. Detection precedence
-//! (highest first), evaluated in the project root (cwd or `--project`):
+//! Two paths, both auto-detected from the argument shape:
+//!
+//! 1. **One-shot orchestration** (Phase 126.M4): when `--launch` is
+//!    supplied, run `metadata` → `plan` → generation → cargo build in
+//!    sequence against a colcon-like workspace. Requires `--system-pkg`
+//!    (the orchestration system name). Pre-existing
+//!    metadata/manifest artifacts may be supplied via `--metadata` /
+//!    `--manifest` to skip re-collection.
+//!
+//! 2. **Pre-planned generation**: when `--system-plan` is supplied,
+//!    skip metadata + plan and just generate + cargo build from the
+//!    existing `nros-plan.json` (the long-standing pre-126.M4 path).
+//!
+//! Otherwise auto-detect the project flavor and delegate (Zephyr west,
+//! CMake, or Cargo) — detection precedence (highest first), evaluated
+//! in the project root (cwd or `--project`):
 //!
 //!   1. `prj.conf` present → Zephyr → `west build`
 //!   2. `CMakeLists.txt` present + no `Cargo.toml` → `cmake -B build && cmake --build build`
@@ -12,9 +26,10 @@
 //! cmake path. Heuristic: if `[lib].crate-type` in Cargo.toml contains
 //! `staticlib` AND CMakeLists.txt exists, prefer cmake.
 
+use crate::cmd::{metadata, plan};
 use crate::orchestration;
 use clap::Args as ClapArgs;
-use eyre::{Result, WrapErr, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,10 +41,44 @@ pub struct Args {
     pub project: Option<PathBuf>,
 
     /// Build a generated nano-ros system package from this nros-plan.json
+    /// (skips the metadata + plan steps; expects a pre-generated plan).
     #[arg(long)]
     pub system_plan: Option<PathBuf>,
 
-    /// Output dir for the generated package (default: <project>/build/<package>/nros/generated)
+    /// One-shot orchestration mode (Phase 126.M4): run `metadata` +
+    /// `plan` + generation + cargo build in sequence from a ROS 2
+    /// launch file. Requires `--system-pkg`. Mutually exclusive with
+    /// `--system-plan`.
+    #[arg(long, conflicts_with = "system_plan")]
+    pub launch: Option<PathBuf>,
+
+    /// Orchestration system package name (one-shot mode). Mirrors
+    /// `nros metadata <system_pkg>` + `nros plan <system_pkg> ...`.
+    #[arg(long)]
+    pub system_pkg: Option<String>,
+
+    /// Pre-collected source metadata JSON (one-shot mode). Repeatable.
+    /// Same shape as `nros metadata --metadata`.
+    #[arg(long = "metadata")]
+    pub metadata: Vec<PathBuf>,
+
+    /// Launch-manifest YAML files (one-shot mode). Repeatable. Same
+    /// shape as `nros plan --manifests`.
+    #[arg(long = "manifest")]
+    pub manifest: Vec<PathBuf>,
+
+    /// Launch arguments passed through to `nros plan` (one-shot mode).
+    /// Repeatable. Mirrors `nros plan --launch-arg`.
+    #[arg(long = "launch-arg")]
+    pub launch_arg: Vec<String>,
+
+    /// Output root for orchestration artifacts (one-shot mode).
+    /// Default: `<project>/build/<system_pkg>/nros`. Mirrors the
+    /// `--out-dir` flag on `nros metadata` / `nros plan`.
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
+
+    /// Output dir for the generated package (default: <out_dir>/generated)
     #[arg(long)]
     pub system_output: Option<PathBuf>,
 
@@ -55,10 +104,76 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let root = match args.project {
+    let root = match args.project.clone() {
         Some(p) => p,
         None => std::env::current_dir()?,
     };
+
+    // Phase 126.M4 — one-shot orchestration mode.
+    if let Some(launch_file) = args.launch.clone() {
+        let system_pkg = args.system_pkg.clone().ok_or_else(|| {
+            eyre!(
+                "`nros build --launch` requires `--system-pkg <name>` \
+                 (the orchestration system package name; mirrors \
+                 `nros metadata <name>`)"
+            )
+        })?;
+        let out_root = args
+            .out_dir
+            .clone()
+            .unwrap_or_else(|| root.join("build").join(&system_pkg).join("nros"));
+        let generated_dir = args
+            .system_output
+            .clone()
+            .unwrap_or_else(|| out_root.join("generated"));
+        let workspace_root = args.nano_ros_workspace.clone().unwrap_or_else(|| root.clone());
+        let package_name = args
+            .system_package
+            .clone()
+            .unwrap_or_else(|| infer_package_name(&root));
+
+        metadata::run(metadata::Args {
+            system_pkg: system_pkg.clone(),
+            workspace: Some(root.clone()),
+            out_dir: Some(out_root.clone()),
+            metadata: args.metadata.clone(),
+        })
+        .wrap_err("metadata step (one-shot build) failed")?;
+
+        plan::run(plan::Args {
+            system_pkg: system_pkg.clone(),
+            launch_file,
+            record: None,
+            workspace: Some(root.clone()),
+            out_dir: Some(out_root.clone()),
+            metadata: Vec::new(),
+            manifests: args.manifest.clone(),
+            nros_toml: Vec::new(),
+            launch_args: args.launch_arg.clone(),
+        })
+        .wrap_err("plan step (one-shot build) failed")?;
+
+        let plan_path = out_root.join("nros-plan.json");
+        if !plan_path.is_file() {
+            bail!(
+                "plan step produced no nros-plan.json at {}",
+                plan_path.display()
+            );
+        }
+
+        orchestration::build::build_generated_package(&orchestration::build::BuildOptions {
+            package_name,
+            output_dir: generated_dir,
+            plan_path,
+            workspace_root,
+            component_workspace: Some(root.clone()),
+            release: args.release,
+            target: args.target,
+            cargo_args: args.passthrough,
+        })?;
+        return Ok(());
+    }
+
     if let Some(plan_path) = args.system_plan {
         let package_name = args
             .system_package
