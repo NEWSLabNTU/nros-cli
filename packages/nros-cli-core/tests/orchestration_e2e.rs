@@ -743,8 +743,13 @@ fn assert_freertos_binary_boots(binary: &Path) {
         output.status,
         combined
     );
+    // Phase 126.M5 — board prints `nros FreeRTOS Platform` (see
+    // `packages/boards/nros-board-freertos/src/node.rs:231`); the
+    // historical "QEMU" word was lost when the board crate split
+    // platform vs board ID. Match the live banner so generated FreeRTOS
+    // binaries are exercised against the same string the runtime emits.
     assert!(
-        combined.contains("nros QEMU FreeRTOS Platform"),
+        combined.contains("nros FreeRTOS Platform"),
         "generated FreeRTOS binary did not print platform banner\n{}",
         combined
     );
