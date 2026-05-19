@@ -264,10 +264,16 @@ fn render_backend_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> St
             path_for_template(&workspace.join("packages/xrce/nros-rmw-xrce-cffi")),
             toml_string_array(&backend_features(&plan.build, "xrce")),
         ),
-        "dds" | "rmw-dds" | "rmw-dds-cffi" => format!(
-            "nros-rmw-dds = {{ path = \"{}\", default-features = false, features = {} }}\n",
-            path_for_template(&workspace.join("packages/dds/nros-rmw-dds")),
-            toml_string_array(&backend_features(&plan.build, "dds")),
+        // Phase 169 (nano-ros 2026-05-19) — dust-dds retired; the
+        // generic "dds" / "rmw-dds" / "rmw-dds-cffi" tokens are no
+        // longer wired up. Cyclone is the DDS backend and is
+        // selected via "cyclonedds" only (see nano-ros Phase 169.5).
+        "cyclonedds" | "rmw-cyclonedds" | "rmw-cyclonedds-cffi" => format!(
+            "# Cyclone DDS is a CMake/C++ project — no Rust shim crate.\n\
+             # Consumers select it via NANO_ROS_RMW=cyclonedds at the CMake\n\
+             # layer (nros-c / nros-cpp). The generated Cargo.toml leaves\n\
+             # the DDS slot empty; the staticlib is linked into the binary\n\
+             # by the CMake glue alongside `corrosion_link_libraries`.\n"
         ),
         _ => String::new(),
     }
@@ -377,8 +383,8 @@ fn generated_feature(feature: &str) -> Option<String> {
         | "rmw-zenoh-cffi"
         | "rmw-xrce"
         | "rmw-xrce-cffi"
-        | "rmw-dds"
-        | "rmw-dds-cffi" => Some("nros/rmw-cffi".to_string()),
+        | "rmw-cyclonedds"
+        | "rmw-cyclonedds-cffi" => Some("nros/rmw-cffi".to_string()),
         feature if feature.starts_with("nros/") || feature.starts_with("nros-orchestration/") => {
             Some(feature.to_string())
         }
@@ -397,7 +403,7 @@ fn rmw_backend_feature(rmw: &str) -> Option<&'static str> {
     match rmw {
         "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => Some("rmw-cffi"),
         "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => Some("rmw-cffi"),
-        "dds" | "rmw-dds" | "rmw-dds-cffi" => Some("rmw-cffi"),
+        "cyclonedds" | "rmw-cyclonedds" | "rmw-cyclonedds-cffi" => Some("rmw-cffi"),
         "cffi" | "rmw-cffi" => None,
         "" | "none" => None,
         _ => None,
@@ -610,8 +616,11 @@ fn render_backend_register_fn(out: &mut String, plan: &NrosPlan) {
         "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => {
             out.push_str("    let _ = nros_rmw_xrce_cffi::register();\n");
         }
-        "dds" | "rmw-dds" | "rmw-dds-cffi" => {
-            out.push_str("    let _ = nros_rmw_dds::register();\n");
+        "cyclonedds" | "rmw-cyclonedds" | "rmw-cyclonedds-cffi" => {
+            // Cyclone DDS is a CMake/C++ project with no Rust shim.
+            // Registration happens through the C ABI at the CMake
+            // layer (NANO_ROS_RMW=cyclonedds wires it in). No Rust
+            // call emitted from the orchestrator.
         }
         _ => {}
     }

@@ -23,7 +23,7 @@ pub struct Args {
     pub platform: String,
 
     /// RMW backend
-    #[arg(long, value_parser = ["zenoh", "xrce", "dds"], default_value = "zenoh")]
+    #[arg(long, value_parser = ["zenoh", "xrce", "cyclonedds"], default_value = "zenoh")]
     pub rmw: String,
 
     /// Source language
