@@ -46,6 +46,13 @@ pub fn build_generated_package(options: &BuildOptions) -> Result<GeneratedPackag
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit())
     .current_dir(&generated.root);
+    // Phase 126.M5.nuttx — strip any inherited rustup pin so the
+    // generated package's `rust-toolchain.toml` (e.g. NuttX's
+    // pinned nightly + rust-src) is actually honoured. Without
+    // this, an outer `cargo test` invocation propagates its own
+    // RUSTUP_TOOLCHAIN through, and rustup never re-resolves
+    // against the generated package's overrides.
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
 
     let status = cmd
         .status()

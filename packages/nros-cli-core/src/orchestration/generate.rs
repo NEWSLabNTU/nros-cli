@@ -130,10 +130,88 @@ fn render_build_rs(options: &GenerateOptions, plan: &NrosPlan) -> String {
             &render_native_link_directives(options, plan),
         )
         .replace(
+            "{{ platform_link_directives }}",
+            &render_platform_link_directives(plan),
+        )
+        .replace(
             "{{ generated_tables_literal }}",
             &format!("{generated_tables:?}"),
         )
 }
+
+/// Phase 126.M5.nuttx — emit build.rs link directives for target
+/// platforms that need to link external kernel/userspace libs into
+/// the final ELF. NuttX (Cortex-A7) needs the staging libs at
+/// `$NUTTX_DIR/staging/lib{c,sched,drivers,...}.a` plus
+/// arch-specific glue + the dramboot linker script. Mirrors what
+/// `examples/qemu-arm-nuttx/rust/zenoh/talker/build.rs` emits per
+/// crate.
+fn render_platform_link_directives(plan: &NrosPlan) -> String {
+    match platform_feature(&plan.build.board, &plan.build.target) {
+        Some("platform-nuttx") => NUTTX_LINK_DIRECTIVES.to_string(),
+        _ => String::new(),
+    }
+}
+
+const NUTTX_LINK_DIRECTIVES: &str = r#"    println!("cargo:rerun-if-env-changed=NUTTX_DIR");
+    if let Ok(nuttx_dir) = env::var("NUTTX_DIR") {
+        let nuttx_dir = PathBuf::from(nuttx_dir);
+        let staging = nuttx_dir.join("staging");
+        if staging.join("libc.a").exists() {
+            // Preprocess the dramboot linker script (it #includes <nuttx/config.h>).
+            let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+            let processed_ld = out_dir.join("dramboot.ld");
+            let linker_script = nuttx_dir.join("boards/arm/qemu/qemu-armv7a/scripts/dramboot.ld");
+            let status = Command::new("arm-none-eabi-gcc")
+                .args([
+                    "-E", "-P", "-x", "c",
+                    &format!("-isystem{}", nuttx_dir.join("include").display()),
+                    "-D__NuttX__", "-D__KERNEL__",
+                    &format!("-I{}", nuttx_dir.join("arch/arm/src/chip").display()),
+                    &format!("-I{}", nuttx_dir.join("arch/arm/src/common").display()),
+                    &format!("-I{}", nuttx_dir.join("arch/arm/src/armv7-a").display()),
+                    &format!("-I{}", nuttx_dir.join("sched").display()),
+                ])
+                .arg(&linker_script)
+                .arg("-o")
+                .arg(&processed_ld)
+                .status()
+                .expect("failed to preprocess linker script");
+            assert!(status.success(), "linker script preprocessing failed");
+
+            let board_src = nuttx_dir.join("arch/arm/src/board");
+            let vectortab = nuttx_dir.join("arch/arm/src/arm_vectortab.o");
+            let gcc_out = Command::new("arm-none-eabi-gcc")
+                .args([
+                    "-mcpu=cortex-a7",
+                    "-mfloat-abi=hard",
+                    "-mfpu=neon-vfpv4",
+                    "-print-libgcc-file-name",
+                ])
+                .output()
+                .expect("failed to find libgcc");
+            let libgcc = String::from_utf8(gcc_out.stdout).unwrap().trim().to_string();
+
+            println!("cargo:rustc-link-arg=-T{}", processed_ld.display());
+            println!("cargo:rustc-link-arg=--entry=__start");
+            println!("cargo:rustc-link-arg=-nostartfiles");
+            println!("cargo:rustc-link-arg=-nodefaultlibs");
+            println!("cargo:rustc-link-arg={}", vectortab.display());
+            println!("cargo:rustc-link-arg=-L{}", staging.display());
+            println!("cargo:rustc-link-arg=-L{}", board_src.display());
+            println!("cargo:rustc-link-arg=-Wl,--start-group");
+            for lib in [
+                "sched", "drivers", "boards", "c", "mm", "arch", "xx", "apps", "net",
+                "crypto", "fs", "binfmt", "openamp", "board",
+            ] {
+                println!("cargo:rustc-link-arg=-l{lib}");
+            }
+            println!("cargo:rustc-link-arg={libgcc}");
+            println!("cargo:rustc-link-arg=-Wl,--end-group");
+            println!("cargo:rerun-if-changed={}", linker_script.display());
+        }
+    }
+"#;
 
 #[derive(Debug, Clone)]
 struct NativeComponentLink {
