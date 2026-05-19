@@ -10,6 +10,7 @@ use std::{
 
 use nros_cli_core::cmd::{build, check, metadata, plan};
 use nros_cli_core::orchestration::{
+    generate::{GenerateOptions, generate_package},
     plan::{NrosPlan, PlanComponent, PlanEntity},
     schema::ParameterValue,
 };
@@ -285,6 +286,105 @@ fn fixture_workspace_builds_generated_nuttx_package() {
     );
 }
 
+/// Phase 126.M5.zephyr — drives the orchestration generator against
+/// the Zephyr platform. Unlike the FreeRTOS/NuttX siblings the
+/// generated package is not a binary crate: zephyr-lang-rust expects
+/// a `staticlib` named `rustapp` (consumed via CMake's
+/// `rust_cargo_application()`), so cargo cannot link the artifact on
+/// its own — that's the kernel image stage owned by `west build`.
+/// The test asserts on file layout instead: the package contains a
+/// `[lib]`-shaped Cargo.toml, a `src/lib.rs` exporting
+/// `rust_main`, plus the Zephyr CMakeLists.txt + prj.conf glue. A
+/// full `west build` smoke run is gated separately on `ZEPHYR_BASE`.
+#[test]
+fn fixture_workspace_generates_zephyr_package_shape() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_zephyr");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-zephyr");
+    let plan_path = out_dir.join("nros-plan-zephyr.json");
+    fs::create_dir_all(&out_dir).expect("create Zephyr output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_zephyr(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize Zephyr plan"),
+    )
+    .expect("write Zephyr plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated Zephyr plan");
+
+    generate_package(&GenerateOptions {
+        package_name: "nros-e2e-generated-zephyr".to_string(),
+        output_dir: generated_dir.clone(),
+        plan_path: plan_path.clone(),
+        nros_path: nano_ros_workspace().join("packages/core/nros"),
+        nros_orchestration_path: nano_ros_workspace().join("packages/core/nros-orchestration"),
+        component_workspace: Some(fixture),
+    })
+    .expect("generate Zephyr package");
+
+    let cargo_toml = fs::read_to_string(generated_dir.join("Cargo.toml"))
+        .expect("read generated Zephyr Cargo.toml");
+    assert!(
+        cargo_toml.contains("[lib]")
+            && cargo_toml.contains("name = \"rustapp\"")
+            && cargo_toml.contains("crate-type = [\"staticlib\"]"),
+        "generated Zephyr Cargo.toml exposes the zephyr-lang-rust staticlib shape:\n{cargo_toml}"
+    );
+    assert!(
+        cargo_toml.contains("zephyr = \"0.1.0\""),
+        "generated Zephyr Cargo.toml depends on the `zephyr` crate:\n{cargo_toml}"
+    );
+    assert!(
+        cargo_toml.contains("zephyr-build = \"0.1.0\""),
+        "generated Zephyr Cargo.toml carries the `zephyr-build` build dep:\n{cargo_toml}"
+    );
+    assert!(
+        cargo_toml.contains("platform-zephyr"),
+        "generated Zephyr Cargo.toml enables the platform-zephyr feature:\n{cargo_toml}"
+    );
+
+    let lib_rs = fs::read_to_string(generated_dir.join("src/lib.rs"))
+        .expect("read generated Zephyr src/lib.rs");
+    assert!(
+        lib_rs.contains("extern \"C\" fn rust_main()"),
+        "generated Zephyr lib.rs exports rust_main():\n{lib_rs}"
+    );
+    assert!(
+        !generated_dir.join("src/main.rs").is_file(),
+        "Zephyr generated package must not emit src/main.rs"
+    );
+
+    let cmake = fs::read_to_string(generated_dir.join("CMakeLists.txt"))
+        .expect("read generated Zephyr CMakeLists.txt");
+    assert!(
+        cmake.contains("find_package(Zephyr") && cmake.contains("rust_cargo_application()"),
+        "generated Zephyr CMakeLists.txt wires rust_cargo_application():\n{cmake}"
+    );
+
+    let prj_conf =
+        fs::read_to_string(generated_dir.join("prj.conf")).expect("read generated Zephyr prj.conf");
+    assert!(
+        prj_conf.contains("CONFIG_RUST=y") && prj_conf.contains("CONFIG_NROS=y"),
+        "generated Zephyr prj.conf enables Rust + nros:\n{prj_conf}"
+    );
+
+    // Zephyr's cargo target comes from zephyr-lang-rust CMake, not
+    // a `[build] target = ...` entry. The orchestrator must NOT
+    // emit a `.cargo/config.toml` for Zephyr.
+    assert!(
+        !generated_dir.join(".cargo").join("config.toml").is_file(),
+        "Zephyr generated package must not emit .cargo/config.toml \
+         (target triple comes from zephyr-lang-rust at CMake time)"
+    );
+}
+
 #[test]
 fn fixture_workspace_links_mixed_c_component_archive() {
     let fixture = fixture_workspace();
@@ -501,7 +601,11 @@ fn build_launch_one_shot_runs_metadata_plan_generate_and_cargo() {
     .expect("build --launch one-shot mode completes metadata+plan+generate+cargo");
 
     let plan_path = out_root.join("nros-plan.json");
-    assert!(plan_path.is_file(), "plan written at {}", plan_path.display());
+    assert!(
+        plan_path.is_file(),
+        "plan written at {}",
+        plan_path.display()
+    );
     let plan: NrosPlan = serde_json::from_str(&fs::read_to_string(&plan_path).expect("read plan"))
         .expect("plan parses");
     assert_eq!(plan.system, "e2e_system");
@@ -512,7 +616,11 @@ fn build_launch_one_shot_runs_metadata_plan_generate_and_cargo() {
         .join(&plan.build.target)
         .join("debug")
         .join("nros-e2e-generated-one-shot");
-    assert!(binary.is_file(), "one-shot binary exists at {}", binary.display());
+    assert!(
+        binary.is_file(),
+        "one-shot binary exists at {}",
+        binary.display()
+    );
 }
 
 fn fixture_workspace() -> PathBuf {
@@ -569,6 +677,17 @@ fn retarget_plan_to_freertos(plan: &mut NrosPlan) {
 fn retarget_plan_to_nuttx(plan: &mut NrosPlan) {
     plan.build.target = "armv7a-nuttx-eabihf".to_string();
     plan.build.board = "nuttx".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_zephyr(plan: &mut NrosPlan) {
+    // native_sim/native/64 is the host-side QEMU-free Zephyr target
+    // exercised by examples/zephyr; cargo never sees this triple
+    // directly (the target comes from zephyr-lang-rust at CMake
+    // time), so the field is recorded for plan completeness only.
+    plan.build.target = "x86_64-unknown-linux-gnu".to_string();
+    plan.build.board = "zephyr".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }

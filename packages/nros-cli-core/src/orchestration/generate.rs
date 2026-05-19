@@ -18,6 +18,11 @@ use super::{
 const CARGO_TEMPLATE: &str = include_str!("../../templates/orchestration/Cargo.toml.jinja");
 const BUILD_TEMPLATE: &str = include_str!("../../templates/orchestration/build.rs.jinja");
 const MAIN_TEMPLATE: &str = include_str!("../../templates/orchestration/main.rs.jinja");
+const LIB_TEMPLATE: &str = include_str!("../../templates/orchestration/lib.rs.jinja");
+const ZEPHYR_CMAKE_TEMPLATE: &str =
+    include_str!("../../templates/orchestration/zephyr/CMakeLists.txt.jinja");
+const ZEPHYR_PRJ_CONF_TEMPLATE: &str =
+    include_str!("../../templates/orchestration/zephyr/prj.conf.jinja");
 
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
@@ -53,7 +58,23 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
 
     write_if_changed(&options.output_dir.join("Cargo.toml"), &cargo_toml)?;
     write_if_changed(&options.output_dir.join("build.rs"), &build_rs)?;
-    write_if_changed(&src_dir.join("main.rs"), MAIN_TEMPLATE)?;
+    // Zephyr ships a Rust staticlib (`name = "rustapp"`,
+    // `crate-type = ["staticlib"]`) consumed by zephyr-lang-rust's
+    // `rust_cargo_application()` CMake function — the cargo source
+    // file is `src/lib.rs`, not `src/main.rs`. Every other platform
+    // uses a binary crate with `src/main.rs`.
+    if matches!(
+        platform_feature(&plan.build.board, &plan.build.target),
+        Some("platform-zephyr")
+    ) {
+        write_if_changed(&src_dir.join("lib.rs"), LIB_TEMPLATE)?;
+        let cmake = render_zephyr_cmake(options);
+        let prj_conf = render_zephyr_prj_conf();
+        write_if_changed(&options.output_dir.join("CMakeLists.txt"), &cmake)?;
+        write_if_changed(&options.output_dir.join("prj.conf"), &prj_conf)?;
+    } else {
+        write_if_changed(&src_dir.join("main.rs"), MAIN_TEMPLATE)?;
+    }
     if let Some(cargo_config) = cargo_config {
         let cargo_dir = options.output_dir.join(".cargo");
         fs::create_dir_all(&cargo_dir).wrap_err_with(|| {
@@ -78,6 +99,7 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
 fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
     CARGO_TEMPLATE
         .replace("{{ package_name }}", &options.package_name)
+        .replace("{{ lib_section }}", &render_lib_section(plan))
         .replace(
             "{{ default_features }}",
             &toml_string_array(&generated_default_features(&plan.build)),
@@ -96,6 +118,40 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
                 render_component_dependencies(options, plan)
             ),
         )
+        .replace("{{ build_dependencies }}", &render_build_dependencies(plan))
+}
+
+/// Phase 126.M5.zephyr — zephyr-lang-rust's
+/// `rust_cargo_application()` looks for a staticlib named
+/// `rustapp` (its CMakeLists.txt hard-codes the link line against
+/// `libstaticlib.a → librustapp.a`). Every other platform stays a
+/// regular binary crate.
+fn render_lib_section(plan: &NrosPlan) -> String {
+    match platform_feature(&plan.build.board, &plan.build.target) {
+        Some("platform-zephyr") => {
+            "\n[lib]\nname = \"rustapp\"\ncrate-type = [\"staticlib\"]\n".to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Phase 126.M5.zephyr — zephyr-lang-rust requires `zephyr-build`
+/// in `[build-dependencies]` so Kconfig constants reach the Rust
+/// staticlib at compile time. Other platforms have an empty
+/// build-deps section today.
+fn render_build_dependencies(plan: &NrosPlan) -> String {
+    match platform_feature(&plan.build.board, &plan.build.target) {
+        Some("platform-zephyr") => "zephyr-build = \"0.1.0\"\n".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn render_zephyr_cmake(options: &GenerateOptions) -> String {
+    ZEPHYR_CMAKE_TEMPLATE.replace("{{ package_name }}", &options.package_name)
+}
+
+fn render_zephyr_prj_conf() -> String {
+    ZEPHYR_PRJ_CONF_TEMPLATE.to_string()
 }
 
 /// Phase 126.M5.nuttx — pin nightly + `rust-src` for targets that use
@@ -400,6 +456,13 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
             "nros-board-nuttx-qemu-arm = {{ path = \"{}\" }}\n",
             path_for_template(&workspace.join("packages/boards/nros-board-nuttx-qemu-arm")),
         ),
+        // Phase 126.M5.zephyr — zephyr-lang-rust integration. The
+        // generated package consumes the Zephyr Rust API through the
+        // `zephyr` crate (provides `set_logger`, `kconfig`, POSIX
+        // shims, the network-readiness wait helper). The kernel +
+        // RMW + nros C runtime are linked at the CMake layer through
+        // `rust_cargo_application()`.
+        Some("platform-zephyr") => "zephyr = \"0.1.0\"\nlog = \"0.4\"\n".to_string(),
         _ => String::new(),
     }
 }
@@ -481,9 +544,12 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
         features.push(format!("nros/{platform}"));
         // Per-platform local feature alias so the generated package's
         // `default = [...]` list can opt into a feature defined in
-        // the generated Cargo.toml's `[features]` block. Currently
-        // only FreeRTOS + NuttX expose such an alias.
-        if matches!(platform, "platform-freertos" | "platform-nuttx") {
+        // the generated Cargo.toml's `[features]` block. FreeRTOS,
+        // NuttX, and Zephyr each expose such an alias.
+        if matches!(
+            platform,
+            "platform-freertos" | "platform-nuttx" | "platform-zephyr"
+        ) {
             features.push(platform.to_string());
         }
     }
