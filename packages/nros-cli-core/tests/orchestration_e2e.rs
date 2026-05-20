@@ -345,6 +345,71 @@ fn fixture_workspace_builds_generated_esp32_package() {
         "generated ESP32 binary exists at {}",
         binary.display()
     );
+
+    assert_esp32_binary_boots(&binary, &out_dir);
+}
+
+/// Phase 126.M5.esp32 — flash-image the generated ESP32-C3 ELF and
+/// boot it under the Espressif `qemu-system-riscv32` fork, asserting
+/// the board banner. Skips cleanly when `espflash` or the Espressif
+/// QEMU fork (with the `esp32c3` machine model) is unavailable —
+/// stock distro `qemu-system-riscv32` (≤ 8.x) lacks that model.
+fn assert_esp32_binary_boots(binary: &Path, out_dir: &Path) {
+    if Command::new("espflash").arg("--version").output().is_err() {
+        eprintln!("[SKIPPED] espflash not found — `cargo install espflash`");
+        return;
+    }
+    let qemu_has_esp32c3 = Command::new("qemu-system-riscv32")
+        .args(["-machine", "help"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("esp32c3"))
+        .unwrap_or(false);
+    if !qemu_has_esp32c3 {
+        eprintln!(
+            "[SKIPPED] qemu-system-riscv32 with `esp32c3` machine not found \
+             (need the Espressif fork — `just esp32 setup-qemu`)"
+        );
+        return;
+    }
+
+    let flash = out_dir.join("nros-e2e-generated-esp32.bin");
+    let save = Command::new("espflash")
+        .args(["save-image", "--chip", "esp32c3", "--flash-size", "4mb", "--merge"])
+        .arg(binary)
+        .arg(&flash)
+        .output()
+        .expect("run espflash save-image");
+    assert!(
+        save.status.success(),
+        "espflash save-image failed:\n{}{}",
+        String::from_utf8_lossy(&save.stdout),
+        String::from_utf8_lossy(&save.stderr),
+    );
+
+    let output = Command::new("timeout")
+        .arg("12s")
+        .arg("qemu-system-riscv32")
+        .args(["-M", "esp32c3", "-icount", "3", "-nographic", "-drive"])
+        .arg(format!("file={},if=mtd,format=raw", flash.display()))
+        .output()
+        .expect("run qemu-system-riscv32 esp32c3");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // timeout exit 124 = QEMU ran the full window without crashing.
+    assert!(
+        output.status.code() == Some(124) || output.status.success(),
+        "generated ESP32 binary exited unexpectedly with {:?}\n{}",
+        output.status,
+        combined
+    );
+    assert!(
+        combined.contains("nros ESP32-C3 QEMU Platform"),
+        "generated ESP32 binary did not print platform banner\n{}",
+        combined
+    );
 }
 
 /// Phase 126.M5.zephyr — drives the orchestration generator against
