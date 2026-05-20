@@ -1,16 +1,20 @@
 //! Draft host planner for Phase 126.C.
 
-use super::manifest::{ManifestArtifact, endpoint_requirements, load_manifest};
-use super::names;
-use super::params::{ParameterInputs, effective_parameters, load_toml_values};
-use super::plan::{NrosPlan, PlanEntity};
-use super::schema::InterfaceRef;
-use super::workspace::{Workspace, unique_paths};
-use eyre::{Context, Result, eyre};
-use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use super::{
+    manifest::{endpoint_requirements, load_manifest, ManifestArtifact},
+    names,
+    params::{effective_parameters, load_toml_values, ParameterInputs},
+    plan::{NrosPlan, PlanBuildOptions, PlanEntity},
+    schema::InterfaceRef,
+    workspace::{unique_paths, Workspace},
+};
+use eyre::{eyre, Context, Result};
+use serde_json::{json, Map, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
@@ -107,7 +111,22 @@ pub fn plan_system(options: PlanOptions) -> Result<PlanningOutput> {
         ));
     }
 
-    let plan = schema_plan_json(&options, &record_path, &instances, &metadata);
+    // Phase 173.5 — derive the `build` block (board / target / rmw /
+    // profile / `[[transport]]`) from the nros.toml overlays, then
+    // validate the transport semantics with a clear error before the
+    // plan is written.
+    let build_json = schema_build_json(&overlays);
+    let build: PlanBuildOptions = serde_json::from_value(build_json.clone())
+        .wrap_err("invalid [build] / [[transport]] section in nros.toml")?;
+    let transport_problems = build.validate_transports();
+    if !transport_problems.is_empty() {
+        return Err(eyre!(
+            "invalid [[transport]] config in nros.toml: {}",
+            transport_problems.join("; ")
+        ));
+    }
+
+    let plan = schema_plan_json(&options, &record_path, &instances, &metadata, build_json);
 
     let plan_path = options.out_root.join("nros-plan.json");
     fs::write(&plan_path, serde_json::to_string_pretty(&plan)?)?;
@@ -443,6 +462,7 @@ fn schema_plan_json(
     record_path: &Path,
     instances: &[Value],
     metadata: &[JsonArtifact],
+    build: Value,
 ) -> Value {
     let components = schema_components(metadata);
     let plan_instances = instances.iter().map(schema_instance).collect::<Vec<_>>();
@@ -471,15 +491,45 @@ fn schema_plan_json(
             "core": null,
             "task": null,
         }],
-        "build": {
-            "target": "x86_64-unknown-linux-gnu",
-            "board": "native",
-            "rmw": "zenoh",
-            "profile": "debug",
-            "features": [],
-            "cfg": {},
-        },
+        "build": build,
     })
+}
+
+/// Phase 173.5 — assemble the plan `build` block from the nros.toml
+/// overlays. Pre-173.5 defaults (native / zenoh / debug) hold when a
+/// key is absent, so a plan with no `[build]` / `[[transport]]` is
+/// byte-identical to before. Later overlays override earlier ones.
+///
+/// TOML `[build]` → the board / target / rmw / profile / features / cfg
+/// fields; TOML `[[transport]]` (array key `transport`) → the
+/// `transports` field. Unknown keys are caught downstream by
+/// `PlanBuildOptions`'s `deny_unknown_fields`.
+fn schema_build_json(overlays: &[Value]) -> Value {
+    let mut build = json!({
+        "target": "x86_64-unknown-linux-gnu",
+        "board": "native",
+        "rmw": "zenoh",
+        "profile": "debug",
+        "features": [],
+        "cfg": {},
+        "transports": [],
+    });
+    let obj = build.as_object_mut().expect("build is an object");
+    for overlay in overlays {
+        if let Some(Value::Object(b)) = overlay.get("build") {
+            for key in ["target", "board", "rmw", "profile", "features", "cfg"] {
+                if let Some(v) = b.get(key) {
+                    obj.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+        // `[[transport]]` in nros.toml deserialises to the array-valued
+        // key `transport`; the plan field is `transports`.
+        if let Some(transports) = overlay.get("transport") {
+            obj.insert("transports".to_string(), transports.clone());
+        }
+    }
+    build
 }
 
 fn schema_components(metadata: &[JsonArtifact]) -> Vec<Value> {
@@ -1899,6 +1949,50 @@ mod tests {
         assert_eq!(next_instance_index(&mut counts, "pkg", "talker"), 1);
     }
 
+    #[test]
+    fn schema_build_json_defaults_when_no_overlay() {
+        // No `[build]` / `[[transport]]` ⇒ pre-173.5 defaults, empty
+        // transports — keeps existing plans byte-identical.
+        let build = schema_build_json(&[]);
+        assert_eq!(build["board"], "native");
+        assert_eq!(build["rmw"], "zenoh");
+        assert_eq!(build["target"], "x86_64-unknown-linux-gnu");
+        assert_eq!(build["transports"].as_array().unwrap().len(), 0);
+        // Round-trips through the typed schema.
+        serde_json::from_value::<PlanBuildOptions>(build).unwrap();
+    }
+
+    #[test]
+    fn schema_build_json_reads_build_and_transports_from_overlay() {
+        // Simulates an nros.toml parsed to JSON: `[build]` table +
+        // `[[transport]]` (array key `transport`).
+        let overlay = json!({
+            "build": { "board": "baremetal", "target": "thumbv7m-none-eabi", "rmw": "zenoh" },
+            "transport": [
+                { "kind": "ethernet", "ip": "10.0.2.50/24", "rmw": "zenoh", "locator": "tcp/10.0.2.2:7447" },
+                { "kind": "serial", "device": "UART0", "baudrate": 115200, "rmw": "cyclonedds" }
+            ]
+        });
+        let build = schema_build_json(std::slice::from_ref(&overlay));
+        assert_eq!(build["board"], "baremetal");
+        assert_eq!(build["target"], "thumbv7m-none-eabi");
+        let typed: PlanBuildOptions = serde_json::from_value(build).unwrap();
+        assert!(typed.is_bridge());
+        assert_eq!(typed.transports[0].ip.as_deref(), Some("10.0.2.50/24"));
+        assert_eq!(typed.transports[1].baudrate, Some(115200));
+        assert!(typed.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn schema_build_json_later_overlay_overrides_earlier() {
+        let first = json!({ "build": { "board": "native" } });
+        let second =
+            json!({ "build": { "board": "freertos" }, "transport": [ { "kind": "ethernet" } ] });
+        let build = schema_build_json(&[first, second]);
+        assert_eq!(build["board"], "freertos");
+        assert_eq!(build["transports"].as_array().unwrap().len(), 1);
+    }
+
     #[cfg(feature = "play-launch-parser")]
     #[test]
     fn plan_system_parses_launch_and_keeps_distinct_instances() {
@@ -2052,11 +2146,9 @@ topics:
             plan["instances"][0]["nodes"][0]["entities"][1]["role"],
             "timer"
         );
-        assert!(
-            plan["instances"][0]["nodes"][0]["entities"][1]
-                .get("resolved_name")
-                .is_none()
-        );
+        assert!(plan["instances"][0]["nodes"][0]["entities"][1]
+            .get("resolved_name")
+            .is_none());
     }
 
     #[cfg(feature = "play-launch-parser")]
