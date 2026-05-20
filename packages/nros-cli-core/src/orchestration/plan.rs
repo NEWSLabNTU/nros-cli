@@ -213,6 +213,56 @@ pub struct PlanSchedContext {
     pub task: Option<String>,
 }
 
+/// Phase 173.5 — physical transport a `[[transport]]` entry selects.
+/// The kind always comes from `nros.toml`; the per-kind value (ip /
+/// baudrate / device) lands wherever that platform's net stack reads it
+/// (board `Config` for `NanoRosOwned`, an RTOS config fragment for
+/// `RtosOwned` — see [`super::generate`] / Phase 173.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    Ethernet,
+    Serial,
+    Can,
+}
+
+impl TransportKind {
+    /// The board crate Cargo feature that enables this transport.
+    pub fn cargo_feature(self) -> &'static str {
+        match self {
+            TransportKind::Ethernet => "ethernet",
+            TransportKind::Serial => "serial",
+            TransportKind::Can => "can",
+        }
+    }
+}
+
+/// Phase 173.5 — one transport⟷RMW binding from `nros.toml`'s
+/// `[[transport]]` array. Two or more entries put the build in **bridge
+/// mode** (each transport runs its own RMW session;
+/// `Executor::open_multi` consumes the resulting `SessionSpec`s).
+///
+/// `rmw`/`locator` are optional per entry; when absent they fall back to
+/// the top-level `build.rmw` / the platform default. The generator —
+/// not hand-written code — turns these into the board transport
+/// feature(s), the per-transport `Config` values, and the RMW deps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanTransport {
+    pub kind: TransportKind,
+    /// IPv4 CIDR (`"10.0.2.50/24"`) or `"dhcp"` — ethernet only.
+    pub ip: Option<String>,
+    /// Device handle (`"UART0"`, `"CAN0"`) — serial / can only.
+    pub device: Option<String>,
+    /// Line rate (serial baud / CAN bitrate) — serial / can only.
+    pub baudrate: Option<u32>,
+    /// RMW that rides this transport. `None` ⇒ inherit `build.rmw`.
+    pub rmw: Option<String>,
+    /// Zenoh/DDS locator seeding this transport's session. `None` ⇒
+    /// platform / env default.
+    pub locator: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanBuildOptions {
@@ -222,4 +272,122 @@ pub struct PlanBuildOptions {
     pub profile: String,
     pub features: Vec<String>,
     pub cfg: ParameterTable,
+    /// Phase 173.5 — `nros.toml` `[[transport]]` entries. Empty ⇒
+    /// zero-config single-transport build (board default transport +
+    /// the single linked RMW). Defaulted so pre-173.5 plans parse.
+    #[serde(default)]
+    pub transports: Vec<PlanTransport>,
+}
+
+impl PlanBuildOptions {
+    /// `true` when more than one transport is declared — the build runs
+    /// multiple RMW sessions via `Executor::open_multi` (bridge mode).
+    pub fn is_bridge(&self) -> bool {
+        self.transports.len() > 1
+    }
+
+    /// Validate the `[[transport]]` array against per-kind field rules.
+    /// Returns the list of human-readable problems (empty ⇒ valid) so
+    /// the caller can surface them all at once rather than one per run.
+    pub fn validate_transports(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (i, t) in self.transports.iter().enumerate() {
+            let at = format!("transport[{i}] (kind = {:?})", t.kind);
+            match t.kind {
+                TransportKind::Ethernet => {
+                    if t.device.is_some() || t.baudrate.is_some() {
+                        problems.push(format!("{at}: `device`/`baudrate` are serial/can-only"));
+                    }
+                }
+                TransportKind::Serial | TransportKind::Can => {
+                    if t.ip.is_some() {
+                        problems.push(format!("{at}: `ip` is ethernet-only"));
+                    }
+                }
+            }
+        }
+        problems
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn build_with(transports_json: &str) -> PlanBuildOptions {
+        let json = format!(
+            r#"{{
+                "target": "thumbv7m-none-eabi",
+                "board": "baremetal",
+                "rmw": "zenoh",
+                "profile": "release",
+                "features": [],
+                "cfg": {{}}{transports_json}
+            }}"#
+        );
+        serde_json::from_str(&json).expect("PlanBuildOptions parses")
+    }
+
+    #[test]
+    fn pre_173_5_plan_without_transports_parses_to_empty() {
+        let build = build_with("");
+        assert!(build.transports.is_empty());
+        assert!(!build.is_bridge());
+        assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn single_ethernet_transport_parses_and_validates() {
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "ethernet", "ip": "10.0.2.50/24", "rmw": "zenoh", "locator": "tcp/10.0.2.2:7447" }
+            ]"#,
+        );
+        assert_eq!(build.transports.len(), 1);
+        assert!(!build.is_bridge());
+        assert_eq!(build.transports[0].kind, TransportKind::Ethernet);
+        assert_eq!(build.transports[0].kind.cargo_feature(), "ethernet");
+        assert_eq!(build.transports[0].ip.as_deref(), Some("10.0.2.50/24"));
+        assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn two_transports_are_bridge_mode() {
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "ethernet", "ip": "dhcp", "rmw": "zenoh" },
+                { "kind": "serial", "device": "UART0", "baudrate": 115200, "rmw": "cyclonedds" }
+            ]"#,
+        );
+        assert!(build.is_bridge());
+        assert_eq!(build.transports[1].kind.cargo_feature(), "serial");
+        assert_eq!(build.transports[1].baudrate, Some(115200));
+        assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn mismatched_transport_fields_are_reported() {
+        // ethernet with a baudrate, serial with an ip — both wrong.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "ethernet", "baudrate": 9600 },
+                { "kind": "serial", "ip": "10.0.0.1/24", "device": "UART0" }
+            ]"#,
+        );
+        let problems = build.validate_transports();
+        assert_eq!(problems.len(), 2, "both mismatches reported: {problems:?}");
+    }
+
+    #[test]
+    fn unknown_transport_kind_is_rejected() {
+        let json = r#"{
+            "target": "x", "board": "native", "rmw": "zenoh",
+            "profile": "release", "features": [], "cfg": {},
+            "transports": [ { "kind": "bluetooth" } ]
+        }"#;
+        assert!(serde_json::from_str::<PlanBuildOptions>(json).is_err());
+    }
 }
