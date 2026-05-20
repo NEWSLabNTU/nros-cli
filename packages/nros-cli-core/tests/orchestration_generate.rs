@@ -441,3 +441,93 @@ fn generated_tables_cover_multiple_instances_of_same_component() {
     assert!(build_rs.contains("CallbackBindingSpec { callback_index: 0, sched_context_index: 1 }"));
     assert!(build_rs.contains("CallbackBindingSpec { callback_index: 1, sched_context_index: 1 }"));
 }
+
+// Phase 173.6 — changing one nros.toml transport line re-generates a
+// working build with zero hand edits. Generate a bare-metal package
+// with `ethernet`, then the same plan with `serial`, and assert the
+// only delta is the board's transport feature (the board crate path,
+// other deps, and the entry are byte-identical).
+#[test]
+fn one_transport_line_change_reflows_only_the_board_feature() {
+    fn gen_with_transport(tag: &str, kind: &str) -> String {
+        let root = temp_output(tag);
+        fs::create_dir_all(&root).expect("create temp plan dir");
+        let plan_path = root.join("nros-plan.json");
+        let plan = include_str!("fixtures/orchestration/plan_pub_sub.json")
+            .replace(
+                "\"target\": \"x86_64-unknown-linux-gnu\"",
+                "\"target\": \"thumbv7m-none-eabi\"",
+            )
+            .replace("\"board\": \"native\"", "\"board\": \"baremetal\"")
+            .replace(
+                "\"cfg\": {}",
+                &format!("\"cfg\": {{}}, \"transports\": [{{ \"kind\": \"{kind}\" }}]"),
+            );
+        fs::write(&plan_path, plan).expect("write plan");
+        let output_dir = root.join("generated");
+        generate_plan(tag, plan_path, output_dir.clone());
+        fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml")
+    }
+
+    let eth = gen_with_transport("reflow_ethernet", "ethernet");
+    let ser = gen_with_transport("reflow_serial", "serial");
+
+    assert!(eth.contains("default-features = false, features = [\"ethernet\"]"));
+    assert!(ser.contains("default-features = false, features = [\"serial\"]"));
+
+    // Everything except the board feature is identical: the diff is the
+    // single `["ethernet"]`/`["serial"]` token. Normalise that token and
+    // assert the rest matches — proving no other manifest edit is needed.
+    let eth_norm = eth.replace("[\"ethernet\"]", "[\"<transport>\"]");
+    let ser_norm = ser.replace("[\"serial\"]", "[\"<transport>\"]");
+    assert_eq!(
+        eth_norm, ser_norm,
+        "ethernet vs serial manifests differ only in the transport feature"
+    );
+}
+
+// Phase 173.7 — negative gate: nano-ros never emits kernel params. The
+// net fragment nano-ros appends to the Zephyr base prj.conf must be
+// net-only — no tick / heap / stack / scheduler / pthread knobs (those
+// are the board's, untouched).
+#[test]
+fn generator_emits_no_kernel_params_in_net_fragment() {
+    let root = temp_output("no_kernel_params_fragment");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let plan_path = root.join("nros-plan.json");
+    let plan = include_str!("fixtures/orchestration/plan_pub_sub.json")
+        .replace(
+            "\"target\": \"x86_64-unknown-linux-gnu\"",
+            "\"target\": \"thumbv7em-none-eabihf\"",
+        )
+        .replace("\"board\": \"native\"", "\"board\": \"zephyr\"")
+        .replace(
+            "\"cfg\": {}",
+            "\"cfg\": {}, \"transports\": [{ \"kind\": \"ethernet\", \"ip\": \"10.0.2.50/24\" }]",
+        );
+    fs::write(&plan_path, plan).expect("write zephyr plan");
+    let output_dir = root.join("generated");
+    generate_plan("no_kernel_params_fragment", plan_path, output_dir.clone());
+
+    let prj = fs::read_to_string(output_dir.join("prj.conf")).expect("read prj.conf");
+    // Isolate the nano-ros-added fragment (everything after the marker).
+    let fragment = prj
+        .split("Phase 173.7 — net config")
+        .nth(1)
+        .expect("net fragment present");
+    assert!(fragment.contains("CONFIG_NET_CONFIG_MY_IPV4_ADDR=\"10.0.2.50\""));
+    for forbidden in [
+        "CLOCK",
+        "HEAP",
+        "STACK",
+        "SCHED",
+        "PTHREAD",
+        "TICKS_PER_SEC",
+        "CONFIG_MAIN",
+    ] {
+        assert!(
+            !fragment.contains(forbidden),
+            "net fragment must not set kernel param `{forbidden}`:\n{fragment}"
+        );
+    }
+}
