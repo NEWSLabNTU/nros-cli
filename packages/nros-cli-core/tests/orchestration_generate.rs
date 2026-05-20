@@ -173,7 +173,7 @@ fn declared_serial_transport_selects_board_feature() {
         .replace("\"board\": \"native\"", "\"board\": \"baremetal\"")
         .replace(
             "\"cfg\": {}",
-            "\"cfg\": {}, \"transports\": [{ \"kind\": \"serial\", \"device\": \"UART0\", \"baudrate\": 115200 }]",
+            "\"cfg\": {}, \"transports\": [{ \"kind\": \"serial\", \"device\": \"UART0\", \"baudrate\": 115200, \"locator\": \"serial/UART0#baudrate=115200\" }]",
         );
     fs::write(&plan_path, plan).expect("write transport plan");
 
@@ -190,6 +190,22 @@ fn declared_serial_transport_selects_board_feature() {
             "nros-board-mps2-an385 = { path = \"/workspace/packages/boards/nros-board-mps2-an385\", default-features = false, features = [\"serial\"] }"
         ),
         "serial transport selects the board `serial` feature with defaults off:\n{cargo_toml}"
+    );
+
+    // Phase 173.5 — the transport `locator` becomes the generated
+    // TRANSPORT_LOCATOR const, and the board entry prefers it over the
+    // board Config default.
+    // build.rs embeds the generated tables as an escaped string
+    // literal, so match the const name + locator value as substrings.
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    assert!(
+        build_rs.contains("TRANSPORT_LOCATOR") && build_rs.contains("serial/UART0#baudrate=115200"),
+        "transport locator emitted as const:\n{build_rs}"
+    );
+    let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
+    assert!(
+        main_rs.contains("nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator)"),
+        "board entry prefers the transport locator:\n{main_rs}"
     );
 }
 

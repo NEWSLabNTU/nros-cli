@@ -283,7 +283,7 @@ fn render_board_entry(entry: &BoardEntry) -> String {
     out.push_str(entry.signature);
     out.push_str(" {\n");
     out.push_str(&format!(
-        "    {crate}::run(\n        {crate}::Config::default(),\n        |board_config| {{\n            let config = ExecutorConfig::new(board_config.zenoh_locator)\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
+        "    {crate}::run(\n        {crate}::Config::default(),\n        |board_config| {{\n            let config = ExecutorConfig::new(nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
         crate = entry.crate_name,
         extra = entry.closure_extra,
     ));
@@ -1610,6 +1610,23 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     out.push_str(&format!(
         "pub const SCHED_CONTEXT_COUNT: usize = {};\n\n",
         plan.sched_contexts.len()
+    ));
+    // Phase 173.5 — the locator from the first `[[transport]]` that
+    // declares one. The board entry prefers it over the board
+    // `Config`'s default; hosted entries keep using env (ZENOH_LOCATOR)
+    // so runtime override still works. `None` ⇒ no transport locator ⇒
+    // board/env default unchanged.
+    let transport_locator = plan
+        .build
+        .transports
+        .iter()
+        .find_map(|t| t.locator.as_deref());
+    out.push_str(&format!(
+        "pub const TRANSPORT_LOCATOR: ::core::option::Option<&str> = {};\n\n",
+        match transport_locator {
+            Some(loc) => format!("::core::option::Option::Some({loc:?})"),
+            None => "::core::option::Option::None".to_string(),
+        }
     ));
     render_backend_register_fn(&mut out, plan);
     render_native_component_ffi(&mut out, plan);
