@@ -4,15 +4,16 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use nros_cli_core::cmd::{build, check, metadata, plan};
-use nros_cli_core::orchestration::{
-    generate::{GenerateOptions, generate_package},
-    plan::{NrosPlan, PlanComponent, PlanEntity},
-    schema::ParameterValue,
+use nros_cli_core::{
+    cmd::{build, check, metadata, plan},
+    orchestration::{
+        generate::{GenerateOptions, generate_package},
+        plan::{NrosPlan, PlanComponent, PlanEntity},
+        schema::ParameterValue,
+    },
 };
 use serde_json::Value;
 
@@ -385,6 +386,63 @@ fn fixture_workspace_generates_zephyr_package_shape() {
     );
 }
 
+/// Phase 126.M5.threadx — drives the orchestration generator against
+/// the ThreadX-Linux board (host-hosted ThreadX + NetX Duo over the
+/// NSOS BSD shim). Builds as a normal x86_64 Linux ELF — no custom
+/// target or build-std, the board crate owns the kernel/NetX link.
+/// Asserts the generated package compiles to a host binary.
+#[test]
+fn fixture_workspace_builds_generated_threadx_linux_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_threadx_linux");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-threadx-linux");
+    let plan_path = out_dir.join("nros-plan-threadx-linux.json");
+    fs::create_dir_all(&out_dir).expect("create ThreadX-Linux output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_threadx_linux(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize ThreadX-Linux plan"),
+    )
+    .expect("write ThreadX-Linux plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated ThreadX-Linux plan");
+    build::run(build::Args {
+        project: Some(fixture),
+        system_plan: Some(plan_path),
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-threadx-linux".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: true,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated ThreadX-Linux package");
+
+    let binary = out_dir
+        .join("target")
+        .join("x86_64-unknown-linux-gnu")
+        .join("release")
+        .join("nros-e2e-generated-threadx-linux");
+    assert!(
+        binary.is_file(),
+        "generated ThreadX-Linux binary exists at {}",
+        binary.display()
+    );
+}
+
 #[test]
 fn fixture_workspace_links_mixed_c_component_archive() {
     let fixture = fixture_workspace();
@@ -688,6 +746,16 @@ fn retarget_plan_to_zephyr(plan: &mut NrosPlan) {
     // time), so the field is recorded for plan completeness only.
     plan.build.target = "x86_64-unknown-linux-gnu".to_string();
     plan.build.board = "zephyr".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_threadx_linux(plan: &mut NrosPlan) {
+    // ThreadX-Linux is a host-hosted build: ThreadX kernel + NetX Duo
+    // (via the NSOS BSD shim) link into a normal x86_64 Linux ELF.
+    // No custom target / build-std — the board crate owns the link.
+    plan.build.target = "x86_64-unknown-linux-gnu".to_string();
+    plan.build.board = "threadx".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }

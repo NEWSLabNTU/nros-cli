@@ -42,7 +42,7 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
     executor.spin_default()
 }
 
-#[cfg(not(feature = "platform-freertos"))]
+#[cfg(not(any(feature = "platform-freertos", feature = "platform-threadx")))]
 fn main() -> core::result::Result<(), nros::NodeError> {
     #[cfg(feature = "std")]
     let config = ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());
@@ -50,6 +50,26 @@ fn main() -> core::result::Result<(), nros::NodeError> {
     let config =
         ExecutorConfig::default_const().node_name(nros_generated::SYSTEM.default_node_name());
     run_system(config)
+}
+
+// Phase 126.M5.threadx — ThreadX-Linux is host-hosted: the board
+// crate's `run()` boots the ThreadX kernel + NetX Duo stack, then
+// invokes the closure on the application thread. Referencing
+// `nros_board_threadx_linux::run` is REQUIRED — it pins the board
+// rlib (and its build-script-linked ThreadX kernel + NetX archives)
+// into the link graph so `--gc-sections` doesn't drop the platform
+// `nros_platform_*` / `_tx_*` symbols.
+#[cfg(feature = "platform-threadx")]
+fn main() -> ! {
+    nros_board_threadx_linux::run(
+        nros_board_threadx_linux::Config::default(),
+        |board_config| {
+            let config = ExecutorConfig::new(board_config.zenoh_locator)
+                .domain_id(board_config.domain_id)
+                .node_name(nros_generated::SYSTEM.default_node_name());
+            run_system(config)
+        },
+    )
 }
 
 #[cfg(feature = "platform-freertos")]

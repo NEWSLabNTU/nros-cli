@@ -5,9 +5,11 @@
 //! host-side adapter that will be tightened once that schema lands.
 
 use eyre::{Context, Result};
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use super::{
     ComponentConfig, NrosPlan,
@@ -463,6 +465,29 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
         // RMW + nros C runtime are linked at the CMake layer through
         // `rust_cargo_application()`.
         Some("platform-zephyr") => "zephyr = \"0.1.0\"\nlog = \"0.4\"\n".to_string(),
+        // Phase 126.M5.threadx — ThreadX board crate. Two variants:
+        // `threadx-linux` (host-hosted ThreadX + NetX Duo over the
+        // NSOS BSD shim; builds as a normal Linux executable) and
+        // `threadx-qemu-riscv64` (bare-metal riscv64gc, QEMU virt +
+        // virtio-net). Both board crates own their kernel / NetX link
+        // via propagating `cargo:rustc-link-lib`, so the generated
+        // package needs only the path dep — no consumer-side build.rs
+        // link directives.
+        Some("platform-threadx") => {
+            if plan.build.target.contains("riscv64") {
+                format!(
+                    "nros-board-threadx-qemu-riscv64 = {{ path = \"{}\" }}\n",
+                    path_for_template(
+                        &workspace.join("packages/boards/nros-board-threadx-qemu-riscv64")
+                    ),
+                )
+            } else {
+                format!(
+                    "nros-board-threadx-linux = {{ path = \"{}\" }}\n",
+                    path_for_template(&workspace.join("packages/boards/nros-board-threadx-linux")),
+                )
+            }
+        }
         _ => String::new(),
     }
 }
@@ -548,7 +573,7 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
         // NuttX, and Zephyr each expose such an alias.
         if matches!(
             platform,
-            "platform-freertos" | "platform-nuttx" | "platform-zephyr"
+            "platform-freertos" | "platform-nuttx" | "platform-zephyr" | "platform-threadx"
         ) {
             features.push(platform.to_string());
         }
