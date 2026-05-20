@@ -511,6 +511,63 @@ fn fixture_workspace_generates_zephyr_package_shape() {
     );
 }
 
+/// Phase 126.M5.stm32f4 — drives the orchestration generator against
+/// the STM32F4 board (NUCLEO-F429ZI, Cortex-M4F, thumbv7em-none-eabihf).
+/// no_std/no_main + cortex-m-rt `#[entry]`; defmt-rtt diagnostics +
+/// panic-probe. Asserts the generated package compiles to a thumbv7em
+/// ELF (real-hardware target — no QEMU boot).
+#[test]
+fn fixture_workspace_builds_generated_stm32f4_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_stm32f4");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-stm32f4");
+    let plan_path = out_dir.join("nros-plan-stm32f4.json");
+    fs::create_dir_all(&out_dir).expect("create STM32F4 output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_stm32f4(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize STM32F4 plan"),
+    )
+    .expect("write STM32F4 plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated STM32F4 plan");
+    build::run(build::Args {
+        project: Some(fixture),
+        system_plan: Some(plan_path),
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-stm32f4".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: true,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated STM32F4 package");
+
+    let binary = out_dir
+        .join("target")
+        .join("thumbv7em-none-eabihf")
+        .join("release")
+        .join("nros-e2e-generated-stm32f4");
+    assert!(
+        binary.is_file(),
+        "generated STM32F4 binary exists at {}",
+        binary.display()
+    );
+}
+
 /// Phase 126.M5.bare-metal — drives the orchestration generator
 /// against the pure Cortex-M3 board (MPS2-AN385, thumbv7m-none-eabi).
 /// no_std/no_main + cortex-m-rt `#[entry]`; the board crate owns
@@ -944,6 +1001,17 @@ fn retarget_plan_to_bare_metal(plan: &mut NrosPlan) {
     // cortex-m-rt `#[entry]`, semihosting panic + QEMU exit.
     plan.build.target = "thumbv7m-none-eabi".to_string();
     plan.build.board = "bare-metal".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_stm32f4(plan: &mut NrosPlan) {
+    // STM32F4 (NUCLEO-F429ZI, Cortex-M4F, thumbv7em-none-eabihf).
+    // no_std/no_main, cortex-m-rt `#[entry]`, defmt-rtt diagnostics,
+    // panic-probe. Real-hardware flash target (probe-rs) — the e2e
+    // test asserts the build artifact only.
+    plan.build.target = "thumbv7em-none-eabihf".to_string();
+    plan.build.board = "stm32f4".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }

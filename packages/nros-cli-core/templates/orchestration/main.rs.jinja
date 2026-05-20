@@ -2,7 +2,8 @@
     any(
         feature = "platform-freertos",
         feature = "platform-bare-metal",
-        feature = "platform-esp32-qemu"
+        feature = "platform-esp32-qemu",
+        feature = "platform-stm32"
     ),
     no_std
 )]
@@ -10,7 +11,8 @@
     any(
         feature = "platform-freertos",
         feature = "platform-bare-metal",
-        feature = "platform-esp32-qemu"
+        feature = "platform-esp32-qemu",
+        feature = "platform-stm32"
     ),
     no_main
 )]
@@ -30,6 +32,17 @@ use panic_semihosting as _;
 // reads. Both must be referenced at the crate root.
 #[cfg(feature = "platform-esp32-qemu")]
 use esp_backtrace as _;
+
+// Phase 126.M5.stm32f4 — defmt-rtt is the log transport, panic-probe
+// the panic handler, and defmt requires a `timestamp!` definition in
+// every binary crate. All three must live at the generated package's
+// crate root.
+#[cfg(feature = "platform-stm32")]
+use defmt_rtt as _;
+#[cfg(feature = "platform-stm32")]
+use panic_probe as _;
+#[cfg(feature = "platform-stm32")]
+defmt::timestamp!("{=u64:us}", { 0 });
 
 fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::NodeError> {
     nros_generated::register_backends();
@@ -66,7 +79,8 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
     feature = "platform-freertos",
     feature = "platform-threadx",
     feature = "platform-bare-metal",
-    feature = "platform-esp32-qemu"
+    feature = "platform-esp32-qemu",
+    feature = "platform-stm32"
 )))]
 fn main() -> core::result::Result<(), nros::NodeError> {
     #[cfg(feature = "std")]
@@ -87,6 +101,25 @@ fn main() -> core::result::Result<(), nros::NodeError> {
 fn main() -> ! {
     nros_board_mps2_an385::run(
         nros_board_mps2_an385::Config::default(),
+        |board_config| {
+            let config = ExecutorConfig::new(board_config.zenoh_locator)
+                .domain_id(board_config.domain_id)
+                .node_name(nros_generated::SYSTEM.default_node_name());
+            run_system(config)
+        },
+    )
+}
+
+// Phase 126.M5.stm32f4 — STM32F4 (Cortex-M4F). Entry via cortex-m-rt's
+// `#[entry]` (re-exported by the board crate). `run()` does clock +
+// Ethernet + smoltcp init then invokes the closure; referencing it
+// pins the board rlib + its linker-script / vector-table
+// contributions into the image. Diagnostics flow over defmt-rtt.
+#[cfg(feature = "platform-stm32")]
+#[nros_board_stm32f4::entry]
+fn main() -> ! {
+    nros_board_stm32f4::run(
+        nros_board_stm32f4::Config::default(),
         |board_config| {
             let config = ExecutorConfig::new(board_config.zenoh_locator)
                 .domain_id(board_config.domain_id)

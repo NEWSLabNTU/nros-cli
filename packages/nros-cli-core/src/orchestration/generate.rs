@@ -346,6 +346,24 @@ build-std = ["core", "alloc"]
 "#
         ));
     }
+    // Phase 126.M5.stm32f4 — STM32F4 (Cortex-M4F, thumbv7em-none-eabihf).
+    // cortex-m-rt's `link.x` placed via the board crate's memory.x;
+    // diagnostics go over defmt-rtt (no QEMU runner — STM32F4 is real
+    // hardware flashed with probe-rs, so the e2e test asserts the build
+    // artifact only).
+    if stm32_chip(&plan.build.board).is_some() {
+        return Some(
+            r#"[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]
+"#
+            .to_string(),
+        );
+    }
     match platform_feature(&plan.build.board, &plan.build.target) {
         Some("platform-freertos") => Some(
             r#"[target.thumbv7m-none-eabi]
@@ -518,6 +536,21 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
             path_for_template(&workspace.join("packages/boards/nros-board-esp32-qemu")),
         );
     }
+    // Phase 126.M5.stm32f4 — STM32F4 boards pull the board crate (with
+    // the chip feature) + the defmt logging + panic-probe crates.
+    // defmt's `timestamp!` macro + panic-probe's panic handler +
+    // defmt-rtt's transport must be visible at the generated package's
+    // crate root, so they're direct deps (not just transitive via the
+    // board crate).
+    if let Some(chip) = stm32_chip(&plan.build.board) {
+        return format!(
+            "nros-board-stm32f4 = {{ path = \"{}\", features = [\"{chip}\"] }}\n\
+             panic-probe = {{ version = \"0.3\", features = [\"print-defmt\"] }}\n\
+             defmt = \"0.3\"\n\
+             defmt-rtt = \"0.4\"\n",
+            path_for_template(&workspace.join("packages/boards/nros-board-stm32f4")),
+        );
+    }
     match platform_feature(&plan.build.board, &plan.build.target) {
         Some("platform-posix") => format!(
             "nros-platform-cffi = {{ path = \"{}\", default-features = false, features = [\"posix-c-port\"] }}\n",
@@ -665,13 +698,17 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
             features.push(platform.to_string());
         }
         // `platform-bare-metal` is the local alias for the pure
-        // Cortex-M3 (mps2-an385) entry. ESP32 boards ALSO map onto the
-        // `platform-bare-metal` nros feature, but use a SEPARATE local
-        // `platform-esp32-qemu` alias (pushed below) to gate their
-        // esp-hal `#[main]` entry — so the bare-metal alias must be
-        // suppressed for esp32, else both entries compile and the
-        // bare-metal one references the unavailable `nros-board-mps2-an385`.
-        if platform == "platform-bare-metal" && esp32_chip(&build.board).is_none() {
+        // Cortex-M3 (mps2-an385) entry. ESP32 and STM32F4 boards ALSO
+        // map onto the `platform-bare-metal` nros feature, but use
+        // SEPARATE local aliases (`platform-esp32-qemu` /
+        // `platform-stm32`, pushed below) to gate their own entries —
+        // so the bare-metal alias must be suppressed for them, else
+        // multiple board entries compile and reference unavailable
+        // board crates.
+        if platform == "platform-bare-metal"
+            && esp32_chip(&build.board).is_none()
+            && stm32_chip(&build.board).is_none()
+        {
             features.push(platform.to_string());
         }
     }
@@ -682,6 +719,13 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
     // `platform_feature` collapses esp32 onto bare-metal.
     if esp32_chip(&build.board).is_some() {
         features.push("platform-esp32-qemu".to_string());
+    }
+    // Phase 126.M5.stm32f4 — STM32F4 boards forward to
+    // `platform-bare-metal` (above) but use the local `platform-stm32`
+    // alias to gate the defmt imports + cortex-m-rt `#[entry]` in
+    // main.rs.jinja. `stm32_chip()` is the discriminator.
+    if stm32_chip(&build.board).is_some() {
+        features.push("platform-stm32".to_string());
     }
     if uses_rmw_cffi(&build.rmw) {
         features.push("nros/rmw-cffi".to_string());
@@ -723,6 +767,11 @@ fn platform_feature(board: &str, target: &str) -> Option<&'static str> {
         "esp32-qemu" | "esp32" | "esp32c3" | "esp32-c3" | "esp32s3" | "esp32-s3" => {
             Some("platform-bare-metal")
         }
+        // Phase 126.M5.stm32f4 — STM32F4 (Cortex-M4F, thumbv7em-none-eabihf)
+        // maps onto the generic `platform-bare-metal` nros feature; the
+        // chip-specific board feature + defmt deps are driven separately
+        // via `stm32_chip()`.
+        "stm32f4" | "stm32f429" | "stm32f407" => Some("platform-bare-metal"),
         "baremetal" | "bare-metal" => Some("platform-bare-metal"),
         "orin-spe" => Some("platform-orin-spe"),
         _ if target.contains("linux") => Some("platform-posix"),
@@ -749,6 +798,19 @@ fn esp32_target(chip: &str) -> &'static str {
         "esp32s3" => "xtensa-esp32s3-none-elf",
         // esp32c3 (and any other RISC-V ESP32) use riscv32imc.
         _ => "riscv32imc-unknown-none-elf",
+    }
+}
+
+/// Phase 126.M5.stm32f4 — chip selection for STM32F4 boards. Returns
+/// the `nros-board-stm32f4` chip feature string (`stm32f429` /
+/// `stm32f407`). `None` for non-STM32F4 boards. `stm32_chip()` is the
+/// discriminator that separates STM32F4 from the other two boards that
+/// also map onto `platform-bare-metal` (mps2-an385 + ESP32).
+fn stm32_chip(board: &str) -> Option<&'static str> {
+    match board {
+        "stm32f4" | "stm32f429" => Some("stm32f429"),
+        "stm32f407" => Some("stm32f407"),
+        _ => None,
     }
 }
 
