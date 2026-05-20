@@ -1006,9 +1006,18 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
         // board crate). The chip feature (`esp32c3` / `esp32s3`) gates each.
         PlatformKind::Esp32 => {
             let chip = p.chip.unwrap_or("esp32c3");
+            // Phase 173.6 — the board crate is chip-specific: ESP32-C3
+            // runs under QEMU (OpenETH NIC, ethernet/serial); ESP32-S3 is
+            // real Xtensa hardware (serial). Selected from `profile().chip`,
+            // not a new match arm.
+            let board_crate = if chip == "esp32s3" {
+                "nros-board-esp32s3"
+            } else {
+                "nros-board-esp32-qemu"
+            };
             let board = board_dep(
-                "nros-board-esp32-qemu",
-                &path_for_template(&workspace.join("packages/boards/nros-board-esp32-qemu")),
+                board_crate,
+                &path_for_template(&workspace.join(format!("packages/boards/{board_crate}"))),
                 &[],
                 &plan.build,
             );
@@ -1471,6 +1480,22 @@ nros_board_esp32_qemu::esp_bootloader_esp_idf::esp_app_desc!();",
     closure_extra: "\n                .clock_us(nros_board_esp32_qemu::nros_platform_esp32_qemu::clock::clock_us)",
 };
 
+// Phase 173.6 — ESP32-S3 (Xtensa) real-hardware entry. Same esp-hal
+// `#[main]` shape as the C3-under-QEMU board, but the crate is
+// `nros_board_esp32s3` (serial transport, no QEMU NIC).
+const BOARD_ENTRY_ESP32S3: BoardEntry = BoardEntry {
+    crate_name: "nros_board_esp32s3",
+    comment: "\
+// Phase 173.6 — ESP32-S3 esp-hal `#[main]` entry. The board's `run()`
+// initialises the chip + serial transport + log writer, then drives the
+// user closure and loops forever (ESP32 has no process exit).",
+    signature: "#[esp_hal::main]\nfn main() -> !",
+    crate_root_extra: "\
+use esp_backtrace as _;
+nros_board_esp32s3::esp_bootloader_esp_idf::esp_app_desc!();",
+    closure_extra: "\n                .clock_us(nros_board_esp32s3::nros_platform_esp32s3::clock::clock_us)",
+};
+
 /// FreeRTOS on MPS2-AN385. Entry `extern "C" fn _start`.
 const BOARD_ENTRY_FREERTOS: BoardEntry = BoardEntry {
     crate_name: "nros_board_mps2_an385_freertos",
@@ -1603,7 +1628,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             Some("esp32s3"),
-            Some(BOARD_ENTRY_ESP32_QEMU),
+            Some(BOARD_ENTRY_ESP32S3),
         ),
         // STM32F4 (Cortex-M4F) maps onto `platform-bare-metal`; the chip
         // board feature + defmt deps come from `chip`.

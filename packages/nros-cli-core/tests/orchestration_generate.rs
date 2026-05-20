@@ -626,4 +626,18 @@ fn esp32s3_selects_esp_toolchain_and_xtensa_target() {
         cargo_config.contains("target = \"xtensa-esp32s3-none-elf\""),
         "esp32-s3 targets xtensa:\n{cargo_config}"
     );
+
+    // The chip selects the S3 board crate + esp-hal esp32s3 features, and
+    // the entry runs through it — all from the single profile() row.
+    let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("Cargo.toml");
+    assert!(
+        cargo_toml.contains("nros-board-esp32s3 =")
+            && cargo_toml.contains("features = [\"esp32s3\", \"unstable\"]"),
+        "esp32-s3 board crate + esp-hal s3 features:\n{cargo_toml}"
+    );
+    let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("main.rs");
+    assert!(
+        main_rs.contains("nros_board_esp32s3::run"),
+        "esp32-s3 entry runs through the S3 board:\n{main_rs}"
+    );
 }
