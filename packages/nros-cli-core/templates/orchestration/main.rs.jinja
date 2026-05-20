@@ -1,5 +1,11 @@
-#![cfg_attr(feature = "platform-freertos", no_std)]
-#![cfg_attr(feature = "platform-freertos", no_main)]
+#![cfg_attr(
+    any(feature = "platform-freertos", feature = "platform-esp32-qemu"),
+    no_std
+)]
+#![cfg_attr(
+    any(feature = "platform-freertos", feature = "platform-esp32-qemu"),
+    no_main
+)]
 
 mod nros_generated {
     core::include!(core::concat!(core::env!("OUT_DIR"), "/nros_generated.rs"));
@@ -10,6 +16,12 @@ use nros_orchestration::CallbackHandleTable;
 
 #[cfg(feature = "platform-freertos")]
 use panic_semihosting as _;
+
+// Phase 126.M5.esp32 — esp-backtrace provides the panic handler;
+// esp-bootloader emits the app descriptor the second-stage bootloader
+// reads. Both must be referenced at the crate root.
+#[cfg(feature = "platform-esp32-qemu")]
+use esp_backtrace as _;
 
 fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::NodeError> {
     nros_generated::register_backends();
@@ -42,7 +54,11 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
     executor.spin_default()
 }
 
-#[cfg(not(any(feature = "platform-freertos", feature = "platform-threadx")))]
+#[cfg(not(any(
+    feature = "platform-freertos",
+    feature = "platform-threadx",
+    feature = "platform-esp32-qemu"
+)))]
 fn main() -> core::result::Result<(), nros::NodeError> {
     #[cfg(feature = "std")]
     let config = ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());
@@ -67,6 +83,30 @@ fn main() -> ! {
             let config = ExecutorConfig::new(board_config.zenoh_locator)
                 .domain_id(board_config.domain_id)
                 .node_name(nros_generated::SYSTEM.default_node_name());
+            run_system(config)
+        },
+    )
+}
+
+// Phase 126.M5.esp32 — esp-hal `#[main]` entry. The board's `run()`
+// initialises the chip + network + log writer, then drives the user
+// closure and loops forever (ESP32 has no process exit). The board
+// `Config` carries the zenoh locator + domain id (defaults from the
+// board crate; override via a config.toml the generator could embed
+// in a follow-up).
+#[cfg(feature = "platform-esp32-qemu")]
+nros_board_esp32_qemu::esp_bootloader_esp_idf::esp_app_desc!();
+
+#[cfg(feature = "platform-esp32-qemu")]
+#[esp_hal::main]
+fn main() -> ! {
+    nros_board_esp32_qemu::run(
+        nros_board_esp32_qemu::Config::default(),
+        |board_config| {
+            let config = ExecutorConfig::new(board_config.zenoh_locator)
+                .domain_id(board_config.domain_id)
+                .node_name(nros_generated::SYSTEM.default_node_name())
+                .clock_us(nros_board_esp32_qemu::nros_platform_esp32_qemu::clock::clock_us);
             run_system(config)
         },
     )

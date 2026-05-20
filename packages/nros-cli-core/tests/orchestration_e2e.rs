@@ -287,6 +287,66 @@ fn fixture_workspace_builds_generated_nuttx_package() {
     );
 }
 
+/// Phase 126.M5.esp32 — drives the orchestration generator against
+/// the ESP32-C3 QEMU board (riscv32imc-unknown-none-elf, esp-hal
+/// bare-metal). Skipped when the pinned nightly + `rust-src` aren't
+/// installed (build-std needs them). Asserts the generated package
+/// compiles to a riscv32imc ELF.
+///
+/// QEMU boot smoke deferred — the Espressif QEMU fork + flash-image
+/// step live in the `just esp32` recipes, not this codegen test.
+#[test]
+fn fixture_workspace_builds_generated_esp32_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_esp32");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-esp32");
+    let plan_path = out_dir.join("nros-plan-esp32.json");
+    fs::create_dir_all(&out_dir).expect("create ESP32 output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_esp32(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize ESP32 plan"),
+    )
+    .expect("write ESP32 plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated ESP32 plan");
+    build::run(build::Args {
+        project: Some(fixture),
+        system_plan: Some(plan_path),
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-esp32".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: true,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated ESP32 package");
+
+    let binary = out_dir
+        .join("target")
+        .join("riscv32imc-unknown-none-elf")
+        .join("release")
+        .join("nros-e2e-generated-esp32");
+    assert!(
+        binary.is_file(),
+        "generated ESP32 binary exists at {}",
+        binary.display()
+    );
+}
+
 /// Phase 126.M5.zephyr — drives the orchestration generator against
 /// the Zephyr platform. Unlike the FreeRTOS/NuttX siblings the
 /// generated package is not a binary crate: zephyr-lang-rust expects
@@ -735,6 +795,13 @@ fn retarget_plan_to_freertos(plan: &mut NrosPlan) {
 fn retarget_plan_to_nuttx(plan: &mut NrosPlan) {
     plan.build.target = "armv7a-nuttx-eabihf".to_string();
     plan.build.board = "nuttx".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_esp32(plan: &mut NrosPlan) {
+    plan.build.target = "riscv32imc-unknown-none-elf".to_string();
+    plan.build.board = "esp32-qemu".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }
