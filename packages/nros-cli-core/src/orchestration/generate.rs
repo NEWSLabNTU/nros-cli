@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::{
-    plan::{PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext},
+    plan::{PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext, TransportKind},
     schema::{DeadlinePolicy, ParameterValue, SchedClass},
     ComponentConfig, NrosPlan,
 };
@@ -71,7 +71,7 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
     ) {
         write_if_changed(&src_dir.join("lib.rs"), LIB_TEMPLATE)?;
         let cmake = render_zephyr_cmake(options);
-        let prj_conf = render_zephyr_prj_conf();
+        let prj_conf = render_zephyr_prj_conf(&plan);
         write_if_changed(&options.output_dir.join("CMakeLists.txt"), &cmake)?;
         write_if_changed(&options.output_dir.join("prj.conf"), &prj_conf)?;
     } else {
@@ -89,6 +89,14 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
     }
     if let Some(toolchain) = rust_toolchain {
         write_if_changed(&options.output_dir.join("rust-toolchain.toml"), &toolchain)?;
+    }
+    // Phase 173.7 — NuttX is RtosOwned: the NuttX kernel owns the net
+    // stack, so transport IP lands in the NuttX defconfig, not the board
+    // `Config`. Emit an additive `nuttx-net.defconfig` fragment from
+    // `[[transport]]` for the user to merge into the board defconfig
+    // (NuttX is built out-of-tree). No transports ⇒ no file.
+    if let Some(fragment) = nuttx_net_fragment(&plan) {
+        write_if_changed(&options.output_dir.join("nuttx-net.defconfig"), &fragment)?;
     }
 
     Ok(GeneratedPackage {
@@ -152,8 +160,124 @@ fn render_zephyr_cmake(options: &GenerateOptions) -> String {
     ZEPHYR_CMAKE_TEMPLATE.replace("{{ package_name }}", &options.package_name)
 }
 
-fn render_zephyr_prj_conf() -> String {
-    ZEPHYR_PRJ_CONF_TEMPLATE.to_string()
+fn render_zephyr_prj_conf(plan: &NrosPlan) -> String {
+    // Phase 173.7 — append the net config derived from nros.toml
+    // `[[transport]]` as an additive fragment. The base prj.conf
+    // (kernel + generic networking) is the board's; nano-ros only adds
+    // the *net knobs* (static IP / DHCP). No transport ⇒ no fragment ⇒
+    // byte-identical base.
+    format!(
+        "{}{}",
+        ZEPHYR_PRJ_CONF_TEMPLATE,
+        zephyr_net_fragment(&plan.build)
+    )
+}
+
+/// Phase 173.7 — Zephyr `CONFIG_NET_CONFIG_*` lines from the ethernet
+/// transport's `ip` (`"dhcp"` or `"<addr>/<prefix>"`). Empty when no
+/// ethernet transport / no `ip` is declared.
+fn zephyr_net_fragment(build: &PlanBuildOptions) -> String {
+    let Some(eth) = build
+        .transports
+        .iter()
+        .find(|t| t.kind == TransportKind::Ethernet)
+    else {
+        return String::new();
+    };
+    let Some(ip) = eth.ip.as_deref() else {
+        return String::new();
+    };
+    let mut out = String::from(
+        "\n# Phase 173.7 — net config from nros.toml [[transport]] (additive).\n\
+         CONFIG_NET_CONFIG_SETTINGS=y\n",
+    );
+    if ip.eq_ignore_ascii_case("dhcp") {
+        out.push_str("CONFIG_NET_DHCPV4=y\n");
+    } else {
+        let (addr, prefix) = ip.split_once('/').unwrap_or((ip, "24"));
+        out.push_str(&format!("CONFIG_NET_CONFIG_MY_IPV4_ADDR=\"{addr}\"\n"));
+        if let Some(mask) = prefix_to_netmask(prefix) {
+            out.push_str(&format!("CONFIG_NET_CONFIG_MY_IPV4_NETMASK=\"{mask}\"\n"));
+        }
+    }
+    out
+}
+
+/// IPv4 prefix length → dotted netmask (`24` → `255.255.255.0`).
+fn prefix_to_netmask(prefix: &str) -> Option<String> {
+    let bits: u32 = prefix.parse().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let mask: u32 = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    Some(format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff,
+        (mask >> 16) & 0xff,
+        (mask >> 8) & 0xff,
+        mask & 0xff
+    ))
+}
+
+/// Dotted IPv4 → NuttX defconfig hex literal (`"10.0.2.50"` →
+/// `"0x0a000232"`). `None` on malformed input.
+fn ipv4_to_hex(addr: &str) -> Option<String> {
+    let mut octets = [0u8; 4];
+    let mut n = 0;
+    for part in addr.split('.') {
+        if n == 4 {
+            return None;
+        }
+        octets[n] = part.parse().ok()?;
+        n += 1;
+    }
+    if n != 4 {
+        return None;
+    }
+    Some(format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        octets[0], octets[1], octets[2], octets[3]
+    ))
+}
+
+/// Phase 173.7 — NuttX `CONFIG_NETINIT_*` defconfig fragment from the
+/// ethernet transport's `ip`. `None` (no file emitted) unless the plan
+/// targets NuttX *and* declares an ethernet transport with an `ip` —
+/// keeping the no-transport NuttX build byte-identical (no extra file).
+fn nuttx_net_fragment(plan: &NrosPlan) -> Option<String> {
+    if profile(&plan.build.board, &plan.build.target).map(|p| p.kind) != Some(PlatformKind::Nuttx) {
+        return None;
+    }
+    let eth = plan
+        .build
+        .transports
+        .iter()
+        .find(|t| t.kind == TransportKind::Ethernet)?;
+    let ip = eth.ip.as_deref()?;
+    let mut out = String::from(
+        "# Phase 173.7 — NuttX net config from nros.toml [[transport]].\n\
+         # Additive fragment — merge into the board defconfig (NuttX is\n\
+         # built out-of-tree). nano-ros emits only the net knobs; kernel\n\
+         # config stays the board's.\n\
+         CONFIG_NET=y\n\
+         CONFIG_NET_IPv4=y\n",
+    );
+    if ip.eq_ignore_ascii_case("dhcp") {
+        out.push_str("CONFIG_NETINIT_DHCPC=y\n");
+    } else {
+        let (addr, prefix) = ip.split_once('/').unwrap_or((ip, "24"));
+        if let Some(hex) = ipv4_to_hex(addr) {
+            out.push_str(&format!("CONFIG_NETINIT_IPADDR={hex}\n"));
+        }
+        if let Some(mask) = prefix_to_netmask(prefix).as_deref().and_then(ipv4_to_hex) {
+            out.push_str(&format!("CONFIG_NETINIT_NETMASK={mask}\n"));
+        }
+    }
+    Some(out)
 }
 
 /// Phase 126.M5.nuttx — pin nightly + `rust-src` for targets that use
@@ -1862,4 +1986,65 @@ fn stable_plan_id(plan: &NrosPlan) -> u32 {
         hash = hash.wrapping_mul(0x01000193);
     }
     hash
+}
+
+#[cfg(test)]
+mod net_fragment_tests {
+    use super::*;
+    use crate::orchestration::plan::PlanTransport;
+
+    fn build_with(transports: Vec<PlanTransport>) -> PlanBuildOptions {
+        let mut build: PlanBuildOptions = serde_json::from_value(serde_json::json!({
+            "target": "x", "board": "native", "rmw": "zenoh",
+            "profile": "release", "features": [], "cfg": {}
+        }))
+        .unwrap();
+        build.transports = transports;
+        build
+    }
+
+    fn eth(ip: &str) -> PlanTransport {
+        PlanTransport {
+            kind: TransportKind::Ethernet,
+            ip: Some(ip.to_string()),
+            device: None,
+            baudrate: None,
+            rmw: None,
+            locator: None,
+        }
+    }
+
+    #[test]
+    fn prefix_to_netmask_converts_common_prefixes() {
+        assert_eq!(prefix_to_netmask("24").as_deref(), Some("255.255.255.0"));
+        assert_eq!(prefix_to_netmask("16").as_deref(), Some("255.255.0.0"));
+        assert_eq!(prefix_to_netmask("8").as_deref(), Some("255.0.0.0"));
+        assert_eq!(prefix_to_netmask("0").as_deref(), Some("0.0.0.0"));
+        assert_eq!(prefix_to_netmask("33"), None);
+    }
+
+    #[test]
+    fn ipv4_to_hex_packs_octets() {
+        assert_eq!(ipv4_to_hex("10.0.2.50").as_deref(), Some("0x0a000232"));
+        assert_eq!(ipv4_to_hex("255.255.255.0").as_deref(), Some("0xffffff00"));
+        assert_eq!(ipv4_to_hex("10.0.2"), None);
+        assert_eq!(ipv4_to_hex("10.0.2.999"), None);
+    }
+
+    #[test]
+    fn zephyr_fragment_empty_without_transport() {
+        assert!(zephyr_net_fragment(&build_with(vec![])).is_empty());
+    }
+
+    #[test]
+    fn zephyr_fragment_static_ip_and_dhcp() {
+        let stat = zephyr_net_fragment(&build_with(vec![eth("10.0.2.50/24")]));
+        assert!(stat.contains("CONFIG_NET_CONFIG_SETTINGS=y"));
+        assert!(stat.contains("CONFIG_NET_CONFIG_MY_IPV4_ADDR=\"10.0.2.50\""));
+        assert!(stat.contains("CONFIG_NET_CONFIG_MY_IPV4_NETMASK=\"255.255.255.0\""));
+
+        let dhcp = zephyr_net_fragment(&build_with(vec![eth("dhcp")]));
+        assert!(dhcp.contains("CONFIG_NET_DHCPV4=y"));
+        assert!(!dhcp.contains("MY_IPV4_ADDR"));
+    }
 }
