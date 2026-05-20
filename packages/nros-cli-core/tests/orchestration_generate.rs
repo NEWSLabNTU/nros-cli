@@ -146,7 +146,7 @@ fn generated_package_features_follow_rtos_plan() {
     let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
 
     assert!(cargo_toml.contains(
-        "default = [\"nros/platform-zephyr\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
+        "default = [\"nros/platform-zephyr\", \"platform-zephyr\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
     assert!(!cargo_toml.contains("\"std\""));
     assert!(!cargo_toml.contains("platform-posix"));
@@ -186,7 +186,11 @@ fn generated_package_wires_freertos_entry() {
     assert!(cargo_config.contains("mps2_an385.ld"));
 
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
-    assert!(main_rs.contains("#![cfg_attr(feature = \"platform-freertos\", no_std)]"));
+    // Phase 126 collapsed the per-platform `no_std` attr into one shared
+    // `any(...)` cfg_attr; assert the crate is no_std + the freertos
+    // feature participates rather than the obsolete single-feature form.
+    assert!(main_rs.contains("no_std"));
+    assert!(main_rs.contains("feature = \"platform-freertos\""));
     assert!(main_rs.contains("extern \"C\" fn _start() -> !"));
     assert!(main_rs.contains("nros_board_mps2_an385_freertos::run"));
 }
