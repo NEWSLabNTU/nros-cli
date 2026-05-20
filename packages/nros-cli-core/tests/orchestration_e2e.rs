@@ -236,6 +236,10 @@ fn fixture_workspace_builds_generated_nuttx_package() {
         );
         return;
     }
+    if let Some(reason) = build_std_nightly_skip() {
+        eprintln!("{reason}");
+        return;
+    }
 
     let fixture = fixture_workspace();
     let output = temp_output("orchestration_e2e_nuttx");
@@ -297,6 +301,11 @@ fn fixture_workspace_builds_generated_nuttx_package() {
 /// step live in the `just esp32` recipes, not this codegen test.
 #[test]
 fn fixture_workspace_builds_generated_esp32_package() {
+    if let Some(reason) = build_std_nightly_skip() {
+        eprintln!("{reason}");
+        return;
+    }
+
     let fixture = fixture_workspace();
     let output = temp_output("orchestration_e2e_esp32");
     let out_dir = output.join("build/e2e_system/nros");
@@ -1002,6 +1011,50 @@ fn nano_ros_workspace() -> PathBuf {
         .nth(4)
         .expect("nano-ros workspace ancestor")
         .to_path_buf()
+}
+
+/// Phase 177.5 — precondition guard for `-Z build-std` e2e tests (NuttX,
+/// ESP32). Returns a `[SKIPPED]` reason when the pinned nightly + its
+/// `rust-src` component isn't installed, so the build-std targets skip
+/// cleanly instead of failing partway through with an opaque
+/// `can't find crate for 'core'`. The channel is read from the
+/// workspace `tools/rust-toolchain.toml` — the single source of truth
+/// the generated packages and `just` recipes also pin to.
+fn build_std_nightly_skip() -> Option<String> {
+    let toolchain_file = nano_ros_workspace().join("tools/rust-toolchain.toml");
+    let channel = fs::read_to_string(&toolchain_file).ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            let rest = line
+                .trim()
+                .strip_prefix("channel")?
+                .trim_start()
+                .strip_prefix('=')?;
+            Some(rest.trim().trim_matches('"').to_string())
+        })
+    })?;
+
+    let has_rust_src = Command::new("rustup")
+        .args(["component", "list", "--installed", "--toolchain", &channel])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|c| c.trim() == "rust-src")
+        })
+        .unwrap_or(false);
+
+    if has_rust_src {
+        None
+    } else {
+        Some(format!(
+            "[SKIPPED] `-Z build-std` needs the pinned nightly + rust-src — install with \
+             `rustup toolchain install {channel}` && \
+             `rustup component add rust-src --toolchain {channel}` \
+             (channel pinned in tools/rust-toolchain.toml)"
+        ))
+    }
 }
 
 fn fixture_plan(name: &str) -> NrosPlan {
