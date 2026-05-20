@@ -231,6 +231,61 @@ fn run_system_bridge() -> core::result::Result<(), nros::NodeError> {
 ///
 /// The `nros-orchestration` import is unused on Zephyr's staticlib path,
 /// so this is only invoked for the binary-crate (`main.rs`) platforms.
+/// Parse `"10.0.2.50/24"` (or bare `"10.0.2.50"`, prefix defaults 24)
+/// into octets + prefix. `None` on malformed input.
+fn parse_ipv4_cidr(s: &str) -> Option<([u8; 4], u8)> {
+    let (addr, prefix) = s.split_once('/').unwrap_or((s, "24"));
+    let prefix: u8 = prefix.parse().ok()?;
+    let mut octets = [0u8; 4];
+    let mut n = 0;
+    for part in addr.split('.') {
+        if n == 4 {
+            return None;
+        }
+        octets[n] = part.parse().ok()?;
+        n += 1;
+    }
+    (n == 4).then_some((octets, prefix))
+}
+
+/// Phase 173.5 — the `TransportConfig` setter calls the generated
+/// `apply_transport_config` emits, derived from `[[transport]]`: a
+/// static ethernet `ip` → `set_ipv4`, a serial `baudrate` →
+/// `set_baudrate`. `dhcp` and missing values emit nothing.
+fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
+    let mut calls = Vec::new();
+    for t in &build.transports {
+        if let Some(ip) = t.ip.as_deref() {
+            if !ip.eq_ignore_ascii_case("dhcp") {
+                if let Some((o, prefix)) = parse_ipv4_cidr(ip) {
+                    calls.push(format!(
+                        "    c.set_ipv4([{}, {}, {}, {}], {prefix});",
+                        o[0], o[1], o[2], o[3]
+                    ));
+                }
+            }
+        }
+        if let Some(baud) = t.baudrate {
+            calls.push(format!("    c.set_baudrate({baud});"));
+        }
+    }
+    calls
+}
+
+/// Whether the generator emits an `apply_transport_config` fn + the
+/// board-entry mutation: only for `NanoRosOwned` board platforms (the
+/// board owns the net stack) that declare a static IP or baud. RtosOwned
+/// targets route IP into a config fragment instead (Phase 173.7); hosted
+/// (posix) has no board `Config`.
+fn emits_transport_config_override(plan: &NrosPlan) -> bool {
+    let Some(p) = profile(&plan.build.board, &plan.build.target) else {
+        return false;
+    };
+    p.board_entry.is_some()
+        && p.net_stack == NetStack::NanoRosOwned
+        && !transport_config_setter_calls(&plan.build).is_empty()
+}
+
 fn render_main(plan: &NrosPlan) -> String {
     let profile = profile(&plan.build.board, &plan.build.target);
     let board_entry = profile.and_then(|p| p.board_entry);
@@ -269,6 +324,8 @@ fn render_main(plan: &NrosPlan) -> String {
         out.push('\n');
     }
 
+    let apply_config = emits_transport_config_override(plan);
+
     out.push('\n');
     match board_entry {
         None => out.push_str(if bridge {
@@ -276,7 +333,7 @@ fn render_main(plan: &NrosPlan) -> String {
         } else {
             HOSTED_MAIN
         }),
-        Some(entry) => out.push_str(&render_board_entry(&entry, bridge)),
+        Some(entry) => out.push_str(&render_board_entry(&entry, bridge, apply_config)),
     }
     out.push('\n');
 
@@ -304,7 +361,7 @@ fn main() -> core::result::Result<(), nros::NodeError> {
 /// Render the `<board>::run(..)` entry for a board-driven platform. The
 /// `ExecutorConfig` builder chain is identical across boards apart from
 /// the board crate name and the per-board `closure_extra` suffix.
-fn render_board_entry(entry: &BoardEntry, bridge: bool) -> String {
+fn render_board_entry(entry: &BoardEntry, bridge: bool, apply_config: bool) -> String {
     let mut out = String::new();
     if !entry.comment.is_empty() {
         out.push_str(entry.comment);
@@ -312,17 +369,30 @@ fn render_board_entry(entry: &BoardEntry, bridge: bool) -> String {
     }
     out.push_str(entry.signature);
     out.push_str(" {\n");
+
+    // The board `Config` handed to `run`: either a plain default, or a
+    // default with the nros.toml transport IP / baud applied (NanoRosOwned
+    // — Phase 173.5). Either way `run` drives hardware init from it.
+    let cfg_expr = if apply_config {
+        format!(
+            "{{\n            let mut cfg = {crate}::Config::default();\n            nros_generated::apply_transport_config(&mut cfg);\n            cfg\n        }}",
+            crate = entry.crate_name,
+        )
+    } else {
+        format!("{crate}::Config::default()", crate = entry.crate_name)
+    };
+
     if bridge {
         // Bridge mode: the board `run` still drives hardware init, but the
         // sessions come from `SESSION_SPECS` via `run_system_bridge` — the
         // single-session `ExecutorConfig` is unused.
         out.push_str(&format!(
-            "    {crate}::run(\n        {crate}::Config::default(),\n        |_board_config| {{\n            run_system_bridge()\n        }},\n    )\n}}",
+            "    {crate}::run(\n        {cfg_expr},\n        |_board_config| {{\n            run_system_bridge()\n        }},\n    )\n}}",
             crate = entry.crate_name,
         ));
     } else {
         out.push_str(&format!(
-            "    {crate}::run(\n        {crate}::Config::default(),\n        |board_config| {{\n            let config = ExecutorConfig::new(nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
+            "    {crate}::run(\n        {cfg_expr},\n        |board_config| {{\n            let config = ExecutorConfig::new(nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
             crate = entry.crate_name,
             extra = entry.closure_extra,
         ));
@@ -1731,6 +1801,18 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
             ));
         }
         out.push_str("];\n\n");
+    }
+    // Phase 173.5 — write the nros.toml transport IP / baud into the
+    // board `Config` (NanoRosOwned). The board entry calls this on a
+    // `Config::default()` before `run`, so `init_hardware` brings up the
+    // NIC / UART with the configured values.
+    if emits_transport_config_override(plan) {
+        out.push_str("pub fn apply_transport_config<C: nros::BoardTransportConfig>(c: &mut C) {\n");
+        for call in transport_config_setter_calls(&plan.build) {
+            out.push_str(&call);
+            out.push('\n');
+        }
+        out.push_str("}\n\n");
     }
     render_backend_register_fn(&mut out, plan);
     render_native_component_ffi(&mut out, plan);

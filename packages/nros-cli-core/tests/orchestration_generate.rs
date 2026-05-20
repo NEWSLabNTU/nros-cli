@@ -210,6 +210,18 @@ fn declared_serial_transport_selects_board_feature() {
         main_rs.contains("nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator)"),
         "board entry prefers the transport locator:\n{main_rs}"
     );
+
+    // Phase 173.5 — NanoRosOwned: the serial baudrate lands in the board
+    // `Config` via apply_transport_config, which the board entry calls on
+    // a Config::default() before run().
+    assert!(
+        build_rs.contains("apply_transport_config") && build_rs.contains("set_baudrate(115200)"),
+        "baudrate written into board Config:\n{build_rs}"
+    );
+    assert!(
+        main_rs.contains("nros_generated::apply_transport_config(&mut cfg)"),
+        "board entry applies the transport Config override:\n{main_rs}"
+    );
 }
 
 #[test]
