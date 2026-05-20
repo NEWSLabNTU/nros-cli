@@ -3,7 +3,8 @@
         feature = "platform-freertos",
         feature = "platform-bare-metal",
         feature = "platform-esp32-qemu",
-        feature = "platform-stm32"
+        feature = "platform-stm32",
+        feature = "platform-threadx-riscv64"
     ),
     no_std
 )]
@@ -12,7 +13,8 @@
         feature = "platform-freertos",
         feature = "platform-bare-metal",
         feature = "platform-esp32-qemu",
-        feature = "platform-stm32"
+        feature = "platform-stm32",
+        feature = "platform-threadx-riscv64"
     ),
     no_main
 )]
@@ -78,6 +80,7 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
 #[cfg(not(any(
     feature = "platform-freertos",
     feature = "platform-threadx",
+    feature = "platform-threadx-riscv64",
     feature = "platform-bare-metal",
     feature = "platform-esp32-qemu",
     feature = "platform-stm32"
@@ -140,6 +143,26 @@ fn main() -> ! {
 fn main() -> ! {
     nros_board_threadx_linux::run(
         nros_board_threadx_linux::Config::default(),
+        |board_config| {
+            let config = ExecutorConfig::new(board_config.zenoh_locator)
+                .domain_id(board_config.domain_id)
+                .node_name(nros_generated::SYSTEM.default_node_name());
+            run_system(config)
+        },
+    )
+}
+
+// Phase 126.M5.threadx-riscv64 — bare-metal ThreadX on QEMU RISC-V
+// virt. Entry is `#[no_mangle] extern "C" fn main` (the board's
+// `link.lds` jumps `_start -> main`). `run()` boots the ThreadX
+// kernel + NetX Duo over virtio-net then invokes the closure;
+// referencing it pins the board rlib + its kernel/NetX archives +
+// the linker script into the image.
+#[cfg(feature = "platform-threadx-riscv64")]
+#[unsafe(no_mangle)]
+extern "C" fn main() -> ! {
+    nros_board_threadx_qemu_riscv64::run(
+        nros_board_threadx_qemu_riscv64::Config::default(),
         |board_config| {
             let config = ExecutorConfig::new(board_config.zenoh_locator)
                 .domain_id(board_config.domain_id)

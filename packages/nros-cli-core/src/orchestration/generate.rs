@@ -364,6 +364,48 @@ rustflags = [
             .to_string(),
         );
     }
+    // Phase 126.M5.threadx-riscv64 — bare-metal ThreadX on QEMU RISC-V
+    // virt (riscv64gc-unknown-none-elf). `link.lds` is emitted to the
+    // board crate's OUT_DIR + surfaced via `cargo:rustc-link-search`
+    // (which propagates), so the rustflag references it by name. The
+    // ThreadX kernel + NetX C builds need the RV64 port + config dirs;
+    // the example pins them via env (the threadx-linux defaults in
+    // `.envrc` point at the wrong port). Absolute paths so the
+    // generated package (built out-of-tree) resolves them.
+    if matches!(
+        platform_feature(&plan.build.board, &plan.build.target),
+        Some("platform-threadx")
+    ) && plan.build.target.contains("riscv64")
+    {
+        let workspace = nros_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)?;
+        let config_dir = path_for_template(
+            &workspace.join("packages/boards/nros-board-threadx-qemu-riscv64/config"),
+        );
+        let extra_includes = path_for_template(
+            &workspace
+                .join("third-party/threadx/kernel/ports/risc-v64/gnu/example_build/qemu_virt"),
+        );
+        return Some(format!(
+            r#"[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tlink.lds",
+    "-C", "link-arg=--nmagic",
+]
+
+[env]
+NETX_CONFIG_DIR = {{ value = "{config_dir}", force = true }}
+THREADX_CONFIG_DIR = {{ value = "{config_dir}", force = true }}
+THREADX_PORT = {{ value = "risc-v64/gnu", force = true }}
+THREADX_EXTRA_INCLUDES = {{ value = "{extra_includes}", force = true }}
+"#
+        ));
+    }
     match platform_feature(&plan.build.board, &plan.build.target) {
         Some("platform-freertos") => Some(
             r#"[target.thumbv7m-none-eabi]
@@ -693,9 +735,21 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
         // NuttX, and Zephyr each expose such an alias.
         if matches!(
             platform,
-            "platform-freertos" | "platform-nuttx" | "platform-zephyr" | "platform-threadx"
+            "platform-freertos" | "platform-nuttx" | "platform-zephyr"
         ) {
             features.push(platform.to_string());
+        }
+        // ThreadX has two boards behind the single `platform-threadx`
+        // nros feature: host-hosted `threadx-linux` (normal `fn main`)
+        // and bare-metal `threadx-qemu-riscv64` (`#[no_mangle] extern
+        // "C" fn main`, riscv64gc). They need DISTINCT local entry
+        // aliases so only one board entry compiles in main.rs.jinja.
+        if platform == "platform-threadx" {
+            if build.target.contains("riscv64") {
+                features.push("platform-threadx-riscv64".to_string());
+            } else {
+                features.push("platform-threadx".to_string());
+            }
         }
         // `platform-bare-metal` is the local alias for the pure
         // Cortex-M3 (mps2-an385) entry. ESP32 and STM32F4 boards ALSO

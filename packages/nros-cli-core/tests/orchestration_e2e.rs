@@ -374,7 +374,14 @@ fn assert_esp32_binary_boots(binary: &Path, out_dir: &Path) {
 
     let flash = out_dir.join("nros-e2e-generated-esp32.bin");
     let save = Command::new("espflash")
-        .args(["save-image", "--chip", "esp32c3", "--flash-size", "4mb", "--merge"])
+        .args([
+            "save-image",
+            "--chip",
+            "esp32c3",
+            "--flash-size",
+            "4mb",
+            "--merge",
+        ])
         .arg(binary)
         .arg(&flash)
         .output()
@@ -508,6 +515,63 @@ fn fixture_workspace_generates_zephyr_package_shape() {
         !generated_dir.join(".cargo").join("config.toml").is_file(),
         "Zephyr generated package must not emit .cargo/config.toml \
          (target triple comes from zephyr-lang-rust at CMake time)"
+    );
+}
+
+/// Phase 126.M5.threadx-riscv64 — drives the orchestration generator
+/// against bare-metal ThreadX on QEMU RISC-V virt
+/// (riscv64gc-unknown-none-elf). no_std/no_main + `#[no_mangle] extern
+/// "C" fn main`; ThreadX kernel + NetX Duo over virtio-net. Asserts
+/// the generated package compiles to a riscv64gc ELF.
+#[test]
+fn fixture_workspace_builds_generated_threadx_riscv64_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_threadx_riscv64");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-threadx-riscv64");
+    let plan_path = out_dir.join("nros-plan-threadx-riscv64.json");
+    fs::create_dir_all(&out_dir).expect("create ThreadX-RISCV64 output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_threadx_riscv64(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize ThreadX-RISCV64 plan"),
+    )
+    .expect("write ThreadX-RISCV64 plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated ThreadX-RISCV64 plan");
+    build::run(build::Args {
+        project: Some(fixture),
+        system_plan: Some(plan_path),
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-threadx-riscv64".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: true,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated ThreadX-RISCV64 package");
+
+    let binary = out_dir
+        .join("target")
+        .join("riscv64gc-unknown-none-elf")
+        .join("release")
+        .join("nros-e2e-generated-threadx-riscv64");
+    assert!(
+        binary.is_file(),
+        "generated ThreadX-RISCV64 binary exists at {}",
+        binary.display()
     );
 }
 
@@ -1012,6 +1076,17 @@ fn retarget_plan_to_stm32f4(plan: &mut NrosPlan) {
     // test asserts the build artifact only.
     plan.build.target = "thumbv7em-none-eabihf".to_string();
     plan.build.board = "stm32f4".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_threadx_riscv64(plan: &mut NrosPlan) {
+    // Bare-metal ThreadX on QEMU RISC-V virt (riscv64gc-unknown-none-elf).
+    // no_std/no_main, `#[no_mangle] extern "C" fn main`, ThreadX kernel +
+    // NetX Duo over virtio-net. The `riscv64` target discriminates it
+    // from the host-hosted threadx-linux variant.
+    plan.build.target = "riscv64gc-unknown-none-elf".to_string();
+    plan.build.board = "threadx".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }
