@@ -594,3 +594,36 @@ fn zero_config_package_hardcodes_no_network_constants() {
         );
     }
 }
+
+/// Phase 173.6 — esp32-s3 (Xtensa) is a single `profile()` row: the
+/// generator emits the espup `esp` channel rust-toolchain.toml + the
+/// xtensa target in .cargo/config.toml, with zero edits to the
+/// (collapsed) per-platform render arms.
+#[test]
+fn esp32s3_selects_esp_toolchain_and_xtensa_target() {
+    let root = temp_output("esp32s3_esp_toolchain");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let plan_path = root.join("nros-plan.json");
+    let plan = include_str!("fixtures/orchestration/plan_pub_sub.json")
+        .replace(
+            "\"target\": \"x86_64-unknown-linux-gnu\"",
+            "\"target\": \"xtensa-esp32s3-none-elf\"",
+        )
+        .replace("\"board\": \"native\"", "\"board\": \"esp32s3\"");
+    fs::write(&plan_path, plan).expect("write esp32s3 plan");
+    let output_dir = root.join("generated");
+    generate_plan("esp32s3_esp_toolchain", plan_path, output_dir.clone());
+
+    let toolchain =
+        fs::read_to_string(output_dir.join("rust-toolchain.toml")).expect("rust-toolchain.toml");
+    assert!(
+        toolchain.contains("channel = \"esp\""),
+        "esp32-s3 selects the espup esp channel:\n{toolchain}"
+    );
+    let cargo_config =
+        fs::read_to_string(output_dir.join(".cargo/config.toml")).expect("cargo config");
+    assert!(
+        cargo_config.contains("target = \"xtensa-esp32s3-none-elf\""),
+        "esp32-s3 targets xtensa:\n{cargo_config}"
+    );
+}
