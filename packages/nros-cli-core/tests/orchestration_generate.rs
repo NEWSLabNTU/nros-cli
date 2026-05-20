@@ -543,3 +543,54 @@ fn generator_emits_no_kernel_params_in_net_fragment() {
         );
     }
 }
+
+/// Phase 173.6 — grep gate: the generated package bakes in no network
+/// constant of its own. Every transport/IP/locator value must come from
+/// either the board `Config::default` (board-intrinsic, in the board
+/// crate — not the generated package) or `nros.toml`. A zero-config
+/// (no `[[transport]]`) package therefore must contain no IPv4 literal
+/// and no `tcp/`/`serial/` locator anywhere in its generated sources.
+#[test]
+fn zero_config_package_hardcodes_no_network_constants() {
+    /// True if `s` contains a `d.d.d.d` IPv4-looking literal.
+    fn contains_ipv4(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        // Slide a window; count dot-separated all-digit groups.
+        for start in 0..bytes.len() {
+            let mut i = start;
+            let mut groups = 0;
+            loop {
+                let g0 = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == g0 {
+                    break; // no digits → not an octet
+                }
+                groups += 1;
+                if groups == 4 {
+                    return true;
+                }
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1; // consume separator, continue
+                } else {
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    let output_dir = generate_fixture("zero_config_no_net_constants", "plan_pub_sub.json");
+    for file in ["src/main.rs", "build.rs"] {
+        let text = fs::read_to_string(output_dir.join(file)).expect("read generated file");
+        assert!(
+            !contains_ipv4(&text),
+            "{file} hardcodes an IPv4 literal (should come from board Config / nros.toml):\n{text}"
+        );
+        assert!(
+            !text.contains("tcp/") && !text.contains("serial/"),
+            "{file} hardcodes a locator (should come from board Config / nros.toml):\n{text}"
+        );
+    }
+}
