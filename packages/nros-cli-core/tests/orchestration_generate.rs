@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use nros_cli_core::orchestration::generate::{generate_package, GenerateOptions};
+use nros_cli_core::orchestration::generate::{GenerateOptions, generate_package};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -73,8 +73,11 @@ fn generated_package_writes_manifest_build_script_and_main() {
         "default = [\"std\", \"nros/platform-posix\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
     assert!(cargo_toml.contains("nros = { path = \"/workspace/packages/core/nros\""));
-    assert!(cargo_toml
-        .contains("nros-orchestration = { path = \"/workspace/packages/core/nros-orchestration\""));
+    assert!(
+        cargo_toml.contains(
+            "nros-orchestration = { path = \"/workspace/packages/core/nros-orchestration\""
+        )
+    );
     assert!(cargo_toml.contains("nros-platform-cffi = { path = \"/workspace/packages/core/nros-platform-cffi\", default-features = false, features = [\"posix-c-port\"] }"));
     assert!(!cargo_toml.contains("nros-cli-core"));
     assert!(!cargo_toml.contains("serde_json"));
@@ -206,6 +209,59 @@ fn declared_serial_transport_selects_board_feature() {
     assert!(
         main_rs.contains("nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator)"),
         "board entry prefers the transport locator:\n{main_rs}"
+    );
+}
+
+#[test]
+fn bridge_two_transports_emit_open_multi_and_session_specs() {
+    // Phase 173.5 — two `[[transport]]` entries (each with its own rmw)
+    // put the build in bridge mode: both RMW deps are emitted, a
+    // SESSION_SPECS array is generated, and the entry opens via
+    // Executor::open_multi instead of Executor::open.
+    let root = temp_output("bridge_two_transports");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let plan_path = root.join("nros-plan.json");
+    let plan = include_str!("fixtures/orchestration/plan_pub_sub.json").replace(
+        "\"cfg\": {}",
+        "\"cfg\": {}, \"transports\": [\
+            { \"kind\": \"ethernet\", \"ip\": \"dhcp\", \"rmw\": \"zenoh\", \"locator\": \"tcp/10.0.2.2:7447\" },\
+            { \"kind\": \"serial\", \"device\": \"UART0\", \"baudrate\": 115200, \"rmw\": \"cyclonedds\" }\
+        ]",
+    );
+    fs::write(&plan_path, plan).expect("write bridge plan");
+
+    let output_dir = root.join("generated");
+    generate_plan("bridge_two_transports", plan_path, output_dir.clone());
+
+    // Both RMW backends are linked.
+    let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        cargo_toml.contains("nros-rmw-zenoh ="),
+        "zenoh backend dep emitted:\n{cargo_toml}"
+    );
+    assert!(
+        cargo_toml.contains("Cyclone DDS is a CMake/C++ project"),
+        "cyclonedds backend slot noted:\n{cargo_toml}"
+    );
+
+    // SESSION_SPECS array + per-transport specs in the generated tables.
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    assert!(
+        build_rs.contains("SESSION_SPECS"),
+        "session specs:\n{build_rs}"
+    );
+    assert!(
+        build_rs.contains("SessionSpec::new(\\\"zenoh\\\"")
+            && build_rs.contains("SessionSpec::new(\\\"cyclonedds\\\""),
+        "per-transport specs:\n{build_rs}"
+    );
+
+    // The entry opens via open_multi.
+    let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
+    assert!(
+        main_rs.contains("Executor::open_multi(&nros_generated::SESSION_SPECS)")
+            && main_rs.contains("run_system_bridge()"),
+        "bridge entry uses open_multi:\n{main_rs}"
     );
 }
 

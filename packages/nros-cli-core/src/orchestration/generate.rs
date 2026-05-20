@@ -12,9 +12,9 @@ use std::{
 };
 
 use super::{
+    ComponentConfig, NrosPlan,
     plan::{PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext, TransportKind},
     schema::{DeadlinePolicy, ParameterValue, SchedClass},
-    ComponentConfig, NrosPlan,
 };
 
 const CARGO_TEMPLATE: &str = include_str!("../../templates/orchestration/Cargo.toml.jinja");
@@ -175,7 +175,10 @@ use nros_orchestration::CallbackHandleTable;";
 const RUN_SYSTEM: &str = "\
 fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::NodeError> {
     nros_generated::register_backends();
-    let mut executor = Executor::open(&config)?;
+    run_executor(Executor::open(&config)?)
+}
+
+fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeError> {
     let mut callback_handles = CallbackHandleTable::<{ nros_generated::CALLBACK_COUNT }>::new();
 
     let mut sched_context_ids =
@@ -202,6 +205,15 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
 
     #[cfg(not(feature = \"std\"))]
     executor.spin_default()
+}";
+
+/// Phase 173.5 — bridge entry helper, emitted only in bridge mode. Opens
+/// every declared transport's RMW session via `Executor::open_multi`,
+/// then runs the same post-open flow as `run_system`.
+const RUN_SYSTEM_BRIDGE: &str = "\
+fn run_system_bridge() -> core::result::Result<(), nros::NodeError> {
+    nros_generated::register_backends();
+    run_executor(Executor::open_multi(&nros_generated::SESSION_SPECS)?)
 }";
 
 /// Phase 173.2b — render the generated `src/main.rs` from the resolved
@@ -250,10 +262,21 @@ fn render_main(plan: &NrosPlan) -> String {
     out.push_str(RUN_SYSTEM);
     out.push('\n');
 
+    let bridge = plan.build.is_bridge();
+    if bridge {
+        out.push('\n');
+        out.push_str(RUN_SYSTEM_BRIDGE);
+        out.push('\n');
+    }
+
     out.push('\n');
     match board_entry {
-        None => out.push_str(HOSTED_MAIN),
-        Some(entry) => out.push_str(&render_board_entry(&entry)),
+        None => out.push_str(if bridge {
+            HOSTED_MAIN_BRIDGE
+        } else {
+            HOSTED_MAIN
+        }),
+        Some(entry) => out.push_str(&render_board_entry(&entry, bridge)),
     }
     out.push('\n');
 
@@ -271,10 +294,17 @@ fn main() -> core::result::Result<(), nros::NodeError> {
     run_system(config)
 }";
 
+/// Phase 173.5 — hosted bridge entry: the per-transport sessions come
+/// from `SESSION_SPECS`, so the `ExecutorConfig` is bypassed entirely.
+const HOSTED_MAIN_BRIDGE: &str = "\
+fn main() -> core::result::Result<(), nros::NodeError> {
+    run_system_bridge()
+}";
+
 /// Render the `<board>::run(..)` entry for a board-driven platform. The
 /// `ExecutorConfig` builder chain is identical across boards apart from
 /// the board crate name and the per-board `closure_extra` suffix.
-fn render_board_entry(entry: &BoardEntry) -> String {
+fn render_board_entry(entry: &BoardEntry, bridge: bool) -> String {
     let mut out = String::new();
     if !entry.comment.is_empty() {
         out.push_str(entry.comment);
@@ -282,11 +312,21 @@ fn render_board_entry(entry: &BoardEntry) -> String {
     }
     out.push_str(entry.signature);
     out.push_str(" {\n");
-    out.push_str(&format!(
-        "    {crate}::run(\n        {crate}::Config::default(),\n        |board_config| {{\n            let config = ExecutorConfig::new(nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
-        crate = entry.crate_name,
-        extra = entry.closure_extra,
-    ));
+    if bridge {
+        // Bridge mode: the board `run` still drives hardware init, but the
+        // sessions come from `SESSION_SPECS` via `run_system_bridge` — the
+        // single-session `ExecutorConfig` is unused.
+        out.push_str(&format!(
+            "    {crate}::run(\n        {crate}::Config::default(),\n        |_board_config| {{\n            run_system_bridge()\n        }},\n    )\n}}",
+            crate = entry.crate_name,
+        ));
+    } else {
+        out.push_str(&format!(
+            "    {crate}::run(\n        {crate}::Config::default(),\n        |board_config| {{\n            let config = ExecutorConfig::new(nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
+            crate = entry.crate_name,
+            extra = entry.closure_extra,
+        ));
+    }
     out
 }
 
@@ -984,35 +1024,80 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
     }
 }
 
-fn render_backend_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> String {
-    let Some(workspace) = workspace_from_nros_path(&options.nros_path) else {
-        return String::new();
+/// Canonical RMW name (`zenoh` / `xrce` / `cyclonedds`) from any of the
+/// accepted token spellings. `None` for empty / unknown.
+fn normalize_rmw(rmw: &str) -> Option<&'static str> {
+    match rmw {
+        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => Some("zenoh"),
+        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => Some("xrce"),
+        "cyclonedds" | "rmw-cyclonedds" | "rmw-cyclonedds-cffi" => Some("cyclonedds"),
+        _ => None,
+    }
+}
+
+/// Phase 173.5 — the set of canonical RMW backends the build links: the
+/// union of every `[[transport]].rmw` (falling back to `build.rmw` when
+/// a transport omits it), deduped. With no transports declared it is
+/// just `build.rmw` — so single-RMW builds are byte-identical.
+fn rmw_set(build: &PlanBuildOptions) -> Vec<&'static str> {
+    let mut set: Vec<&'static str> = Vec::new();
+    let raw: Vec<&str> = if build.transports.is_empty() {
+        vec![build.rmw.as_str()]
+    } else {
+        build
+            .transports
+            .iter()
+            .map(|t| t.rmw.as_deref().unwrap_or(build.rmw.as_str()))
+            .collect()
     };
-    match plan.build.rmw.as_str() {
-        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => format!(
+    for r in raw {
+        if let Some(n) = normalize_rmw(r) {
+            if !set.contains(&n) {
+                set.push(n);
+            }
+        }
+    }
+    set
+}
+
+/// Cargo dep line(s) for one canonical RMW backend.
+fn render_one_backend(workspace: &Path, build: &PlanBuildOptions, rmw: &str) -> String {
+    match rmw {
+        "zenoh" => format!(
             "nros-rmw-zenoh = {{ path = \"{}\", default-features = false, features = {} }}\n",
             path_for_template(&workspace.join("packages/zpico/nros-rmw-zenoh")),
-            toml_string_array(&backend_features(&plan.build, "zenoh")),
+            toml_string_array(&backend_features(build, "zenoh")),
         ),
-        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => format!(
+        "xrce" => format!(
             "nros-rmw-xrce-cffi = {{ path = \"{}\", default-features = false, features = {} }}\n",
             path_for_template(&workspace.join("packages/xrce/nros-rmw-xrce-cffi")),
-            toml_string_array(&backend_features(&plan.build, "xrce")),
+            toml_string_array(&backend_features(build, "xrce")),
         ),
         // Phase 169 (nano-ros 2026-05-19) — dust-dds retired; the
         // generic "dds" / "rmw-dds" / "rmw-dds-cffi" tokens are no
         // longer wired up. Cyclone is the DDS backend and is
         // selected via "cyclonedds" only (see nano-ros Phase 169.5).
-        "cyclonedds" | "rmw-cyclonedds" | "rmw-cyclonedds-cffi" => {
-            "# Cyclone DDS is a CMake/C++ project — no Rust shim crate.\n\
+        "cyclonedds" => "# Cyclone DDS is a CMake/C++ project — no Rust shim crate.\n\
              # Consumers select it via NANO_ROS_RMW=cyclonedds at the CMake\n\
              # layer (nros-c / nros-cpp). The generated Cargo.toml leaves\n\
              # the DDS slot empty; the staticlib is linked into the binary\n\
              # by the CMake glue alongside `corrosion_link_libraries`.\n"
-                .to_string()
-        }
+            .to_string(),
         _ => String::new(),
     }
+}
+
+fn render_backend_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> String {
+    let Some(workspace) = workspace_from_nros_path(&options.nros_path) else {
+        return String::new();
+    };
+    // Phase 173.5 — emit a dep for every RMW the transports bind to
+    // (bridge mode links 2+). Single-RMW (or no `[[transport]]`) emits
+    // exactly one, byte-identical to before.
+    rmw_set(&plan.build)
+        .iter()
+        .map(|rmw| render_one_backend(&workspace, &plan.build, rmw))
+        .collect()
 }
 
 fn workspace_from_nros_path(nros_path: &Path) -> Option<PathBuf> {
@@ -1628,6 +1713,25 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
             None => "::core::option::Option::None".to_string(),
         }
     ));
+    // Phase 173.5 — bridge mode (≥2 transports): one SessionSpec per
+    // transport (its rmw + locator), consumed by `Executor::open_multi`.
+    // Emitted only when bridging — single-transport builds use
+    // `Executor::open` and never reference this.
+    if plan.build.is_bridge() {
+        out.push_str(&format!(
+            "pub static SESSION_SPECS: [nros::SessionSpec<'static>; {}] = [\n",
+            plan.build.transports.len()
+        ));
+        for t in &plan.build.transports {
+            let rmw = t.rmw.as_deref().unwrap_or(plan.build.rmw.as_str());
+            let canonical = normalize_rmw(rmw).unwrap_or(rmw);
+            let locator = t.locator.as_deref().unwrap_or("");
+            out.push_str(&format!(
+                "    nros::SessionSpec::new({canonical:?}, {locator:?}),\n"
+            ));
+        }
+        out.push_str("];\n\n");
+    }
     render_backend_register_fn(&mut out, plan);
     render_native_component_ffi(&mut out, plan);
     render_components(&mut out, plan);
@@ -1773,20 +1877,18 @@ fn render_native_component_ffi(out: &mut String, plan: &NrosPlan) {
 
 fn render_backend_register_fn(out: &mut String, plan: &NrosPlan) {
     out.push_str("pub fn register_backends() {\n");
-    match plan.build.rmw.as_str() {
-        "zenoh" | "rmw-zenoh" | "rmw-zenoh-cffi" => {
-            out.push_str("    let _ = nros_rmw_zenoh::register();\n");
+    // Phase 173.5 — register every RMW the transports bind to (bridge
+    // mode registers 2+ before `Executor::open_multi`). Single-RMW emits
+    // one call, byte-identical.
+    for rmw in rmw_set(&plan.build) {
+        match rmw {
+            "zenoh" => out.push_str("    let _ = nros_rmw_zenoh::register();\n"),
+            "xrce" => out.push_str("    let _ = nros_rmw_xrce_cffi::register();\n"),
+            // Cyclone DDS is a CMake/C++ project with no Rust shim;
+            // registration happens through the C ABI at the CMake layer
+            // (NANO_ROS_RMW=cyclonedds). No Rust call emitted.
+            _ => {}
         }
-        "xrce" | "rmw-xrce" | "rmw-xrce-cffi" => {
-            out.push_str("    let _ = nros_rmw_xrce_cffi::register();\n");
-        }
-        "cyclonedds" | "rmw-cyclonedds" | "rmw-cyclonedds-cffi" => {
-            // Cyclone DDS is a CMake/C++ project with no Rust shim.
-            // Registration happens through the C ABI at the CMake
-            // layer (NANO_ROS_RMW=cyclonedds wires it in). No Rust
-            // call emitted from the orchestrator.
-        }
-        _ => {}
     }
     out.push_str("}\n\n");
 }

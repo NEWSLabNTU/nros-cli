@@ -1,15 +1,15 @@
 //! Draft host planner for Phase 126.C.
 
 use super::{
-    manifest::{endpoint_requirements, load_manifest, ManifestArtifact},
+    manifest::{ManifestArtifact, endpoint_requirements, load_manifest},
     names,
-    params::{effective_parameters, load_toml_values, ParameterInputs},
+    params::{ParameterInputs, effective_parameters, load_toml_values},
     plan::{NrosPlan, PlanBuildOptions, PlanEntity},
     schema::InterfaceRef,
-    workspace::{unique_paths, Workspace},
+    workspace::{Workspace, unique_paths},
 };
-use eyre::{eyre, Context, Result};
-use serde_json::{json, Map, Value};
+use eyre::{Context, Result, eyre};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -2146,9 +2146,11 @@ topics:
             plan["instances"][0]["nodes"][0]["entities"][1]["role"],
             "timer"
         );
-        assert!(plan["instances"][0]["nodes"][0]["entities"][1]
-            .get("resolved_name")
-            .is_none());
+        assert!(
+            plan["instances"][0]["nodes"][0]["entities"][1]
+                .get("resolved_name")
+                .is_none()
+        );
     }
 
     #[cfg(feature = "play-launch-parser")]
