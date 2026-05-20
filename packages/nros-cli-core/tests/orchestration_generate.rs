@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use nros_cli_core::orchestration::generate::{GenerateOptions, generate_package};
+use nros_cli_core::orchestration::generate::{generate_package, GenerateOptions};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -73,11 +73,8 @@ fn generated_package_writes_manifest_build_script_and_main() {
         "default = [\"std\", \"nros/platform-posix\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
     assert!(cargo_toml.contains("nros = { path = \"/workspace/packages/core/nros\""));
-    assert!(
-        cargo_toml.contains(
-            "nros-orchestration = { path = \"/workspace/packages/core/nros-orchestration\""
-        )
-    );
+    assert!(cargo_toml
+        .contains("nros-orchestration = { path = \"/workspace/packages/core/nros-orchestration\""));
     assert!(cargo_toml.contains("nros-platform-cffi = { path = \"/workspace/packages/core/nros-platform-cffi\", default-features = false, features = [\"posix-c-port\"] }"));
     assert!(!cargo_toml.contains("nros-cli-core"));
     assert!(!cargo_toml.contains("serde_json"));
@@ -151,6 +148,43 @@ fn generated_package_features_follow_rtos_plan() {
     assert!(!cargo_toml.contains("\"std\""));
     assert!(!cargo_toml.contains("platform-posix"));
     assert!(!cargo_toml.contains("nros-platform-cffi"));
+}
+
+#[test]
+fn declared_serial_transport_selects_board_feature() {
+    // Phase 173.5 — a `[[transport]]` entry drives the board crate's
+    // transport feature. A bare-metal board + a single serial transport
+    // ⇒ the board dep disables defaults and selects `serial` (swapping
+    // off the board's default `ethernet`).
+    let root = temp_output("declared_serial_transport_selects_board_feature");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let plan_path = root.join("nros-plan.json");
+    let plan = include_str!("fixtures/orchestration/plan_pub_sub.json")
+        .replace(
+            "\"target\": \"x86_64-unknown-linux-gnu\"",
+            "\"target\": \"thumbv7m-none-eabi\"",
+        )
+        .replace("\"board\": \"native\"", "\"board\": \"baremetal\"")
+        .replace(
+            "\"cfg\": {}",
+            "\"cfg\": {}, \"transports\": [{ \"kind\": \"serial\", \"device\": \"UART0\", \"baudrate\": 115200 }]",
+        );
+    fs::write(&plan_path, plan).expect("write transport plan");
+
+    let output_dir = root.join("generated");
+    generate_plan(
+        "declared_serial_transport_selects_board_feature",
+        plan_path,
+        output_dir.clone(),
+    );
+
+    let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        cargo_toml.contains(
+            "nros-board-mps2-an385 = { path = \"/workspace/packages/boards/nros-board-mps2-an385\", default-features = false, features = [\"serial\"] }"
+        ),
+        "serial transport selects the board `serial` feature with defaults off:\n{cargo_toml}"
+    );
 }
 
 #[test]

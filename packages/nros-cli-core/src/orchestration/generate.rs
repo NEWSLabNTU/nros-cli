@@ -12,9 +12,9 @@ use std::{
 };
 
 use super::{
-    ComponentConfig, NrosPlan,
     plan::{PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext},
     schema::{DeadlinePolicy, ParameterValue, SchedClass},
+    ComponentConfig, NrosPlan,
 };
 
 const CARGO_TEMPLATE: &str = include_str!("../../templates/orchestration/Cargo.toml.jinja");
@@ -558,6 +558,56 @@ fn static_library_name(path: &Path) -> Option<String> {
     Some(stem.strip_prefix("lib").unwrap_or(stem).to_string())
 }
 
+/// Phase 173.5 — board transport Cargo features from `[[transport]]`,
+/// deduped (`ethernet` / `serial` / `can`). Empty when no transports
+/// declared.
+fn transport_cargo_features(build: &PlanBuildOptions) -> Vec<String> {
+    let mut feats: Vec<String> = Vec::new();
+    for t in &build.transports {
+        let f = t.kind.cargo_feature().to_string();
+        if !feats.contains(&f) {
+            feats.push(f);
+        }
+    }
+    feats
+}
+
+/// Phase 173.5 — format a board crate path dep, merging the board's
+/// intrinsic `base_features` (e.g. the stm32 chip) with the declared
+/// transport features.
+///
+/// When `[[transport]]` is declared the board's **default** features are
+/// disabled so the transport selection is authoritative (the
+/// `ethernet`→`serial` swap, or a bridge's multi-transport set). With no
+/// declared transports the dep is emitted exactly as pre-173.5 (board
+/// defaults left on) — keeping existing generated manifests
+/// byte-identical.
+fn board_dep(name: &str, path: &str, base_features: &[&str], build: &PlanBuildOptions) -> String {
+    let transports = transport_cargo_features(build);
+    if transports.is_empty() {
+        if base_features.is_empty() {
+            format!("{name} = {{ path = \"{path}\" }}\n")
+        } else {
+            let base: Vec<String> = base_features.iter().map(|s| s.to_string()).collect();
+            format!(
+                "{name} = {{ path = \"{path}\", features = {} }}\n",
+                toml_string_array(&base)
+            )
+        }
+    } else {
+        let mut feats: Vec<String> = base_features.iter().map(|s| s.to_string()).collect();
+        for t in transports {
+            if !feats.contains(&t) {
+                feats.push(t);
+            }
+        }
+        format!(
+            "{name} = {{ path = \"{path}\", default-features = false, features = {} }}\n",
+            toml_string_array(&feats)
+        )
+    }
+}
+
 fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> String {
     let Some(workspace) = workspace_from_nros_path(&options.nros_path) else {
         return String::new();
@@ -574,12 +624,17 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
         // board crate). The chip feature (`esp32c3` / `esp32s3`) gates each.
         PlatformKind::Esp32 => {
             let chip = p.chip.unwrap_or("esp32c3");
+            let board = board_dep(
+                "nros-board-esp32-qemu",
+                &path_for_template(&workspace.join("packages/boards/nros-board-esp32-qemu")),
+                &[],
+                &plan.build,
+            );
             format!(
-                "nros-board-esp32-qemu = {{ path = \"{}\" }}\n\
+                "{board}\
                  esp-hal = {{ version = \"~1.0.0\", features = [\"{chip}\", \"unstable\"] }}\n\
                  esp-backtrace = {{ version = \"~0.18.0\", features = [\"{chip}\", \"panic-handler\", \"println\"] }}\n\
                  esp-bootloader-esp-idf = {{ version = \"~0.4.0\", features = [\"{chip}\"] }}\n",
-                path_for_template(&workspace.join("packages/boards/nros-board-esp32-qemu")),
             )
         }
         // Phase 126.M5.stm32f4 — STM32F4 boards pull the board crate (with
@@ -590,12 +645,17 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
         // board crate).
         PlatformKind::Stm32 => {
             let chip = p.chip.unwrap_or("stm32f429");
+            let board = board_dep(
+                "nros-board-stm32f4",
+                &path_for_template(&workspace.join("packages/boards/nros-board-stm32f4")),
+                &[chip],
+                &plan.build,
+            );
             format!(
-                "nros-board-stm32f4 = {{ path = \"{}\", features = [\"{chip}\"] }}\n\
+                "{board}\
                  panic-probe = {{ version = \"0.3\", features = [\"print-defmt\"] }}\n\
                  defmt = \"0.3\"\n\
                  defmt-rtt = \"0.4\"\n",
-                path_for_template(&workspace.join("packages/boards/nros-board-stm32f4")),
             )
         }
         PlatformKind::Posix => format!(
@@ -603,8 +663,15 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
             path_for_template(&workspace.join("packages/core/nros-platform-cffi")),
         ),
         PlatformKind::Freertos => format!(
-            "nros-board-mps2-an385-freertos = {{ path = \"{}\" }}\npanic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
-            path_for_template(&workspace.join("packages/boards/nros-board-mps2-an385-freertos")),
+            "{}panic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
+            board_dep(
+                "nros-board-mps2-an385-freertos",
+                &path_for_template(
+                    &workspace.join("packages/boards/nros-board-mps2-an385-freertos")
+                ),
+                &[],
+                &plan.build,
+            ),
         ),
         // Phase 126.M5.bare-metal — pure Cortex-M3 (MPS2-AN385,
         // thumbv7m-none-eabi). The board crate owns hardware + lwIP +
@@ -612,8 +679,13 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
         // macro; panic-semihosting provides the `no_std` panic
         // handler + QEMU exit.
         PlatformKind::BareMetal => format!(
-            "nros-board-mps2-an385 = {{ path = \"{}\" }}\npanic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
-            path_for_template(&workspace.join("packages/boards/nros-board-mps2-an385")),
+            "{}panic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
+            board_dep(
+                "nros-board-mps2-an385",
+                &path_for_template(&workspace.join("packages/boards/nros-board-mps2-an385")),
+                &[],
+                &plan.build,
+            ),
         ),
         // Phase 126.M5.nuttx — NuttX QEMU ARM (Cortex-A7 + virtio-net,
         // armv7a-nuttx-eabihf target). The board crate provides the
@@ -638,13 +710,17 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
         // via propagating `cargo:rustc-link-lib`, so the generated
         // package needs only the path dep — no consumer-side build.rs
         // link directives.
-        PlatformKind::ThreadxRiscv64 => format!(
-            "nros-board-threadx-qemu-riscv64 = {{ path = \"{}\" }}\n",
-            path_for_template(&workspace.join("packages/boards/nros-board-threadx-qemu-riscv64")),
+        PlatformKind::ThreadxRiscv64 => board_dep(
+            "nros-board-threadx-qemu-riscv64",
+            &path_for_template(&workspace.join("packages/boards/nros-board-threadx-qemu-riscv64")),
+            &[],
+            &plan.build,
         ),
-        PlatformKind::ThreadxLinux => format!(
-            "nros-board-threadx-linux = {{ path = \"{}\" }}\n",
-            path_for_template(&workspace.join("packages/boards/nros-board-threadx-linux")),
+        PlatformKind::ThreadxLinux => board_dep(
+            "nros-board-threadx-linux",
+            &path_for_template(&workspace.join("packages/boards/nros-board-threadx-linux")),
+            &[],
+            &plan.build,
         ),
         PlatformKind::OrinSpe => String::new(),
     }
