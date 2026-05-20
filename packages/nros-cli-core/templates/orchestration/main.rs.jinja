@@ -1,9 +1,17 @@
 #![cfg_attr(
-    any(feature = "platform-freertos", feature = "platform-esp32-qemu"),
+    any(
+        feature = "platform-freertos",
+        feature = "platform-bare-metal",
+        feature = "platform-esp32-qemu"
+    ),
     no_std
 )]
 #![cfg_attr(
-    any(feature = "platform-freertos", feature = "platform-esp32-qemu"),
+    any(
+        feature = "platform-freertos",
+        feature = "platform-bare-metal",
+        feature = "platform-esp32-qemu"
+    ),
     no_main
 )]
 
@@ -14,7 +22,7 @@ mod nros_generated {
 use nros::prelude::*;
 use nros_orchestration::CallbackHandleTable;
 
-#[cfg(feature = "platform-freertos")]
+#[cfg(any(feature = "platform-freertos", feature = "platform-bare-metal"))]
 use panic_semihosting as _;
 
 // Phase 126.M5.esp32 — esp-backtrace provides the panic handler;
@@ -57,6 +65,7 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
 #[cfg(not(any(
     feature = "platform-freertos",
     feature = "platform-threadx",
+    feature = "platform-bare-metal",
     feature = "platform-esp32-qemu"
 )))]
 fn main() -> core::result::Result<(), nros::NodeError> {
@@ -66,6 +75,25 @@ fn main() -> core::result::Result<(), nros::NodeError> {
     let config =
         ExecutorConfig::default_const().node_name(nros_generated::SYSTEM.default_node_name());
     run_system(config)
+}
+
+// Phase 126.M5.bare-metal — pure Cortex-M3 (MPS2-AN385). Entry comes
+// from cortex-m-rt's `#[entry]` (re-exported by the board crate).
+// The board crate's `run()` does hardware + smoltcp/lwIP init then
+// invokes the closure; referencing it pins the board rlib + its
+// linker-script / vector-table contributions into the image.
+#[cfg(feature = "platform-bare-metal")]
+#[nros_board_mps2_an385::entry]
+fn main() -> ! {
+    nros_board_mps2_an385::run(
+        nros_board_mps2_an385::Config::default(),
+        |board_config| {
+            let config = ExecutorConfig::new(board_config.zenoh_locator)
+                .domain_id(board_config.domain_id)
+                .node_name(nros_generated::SYSTEM.default_node_name());
+            run_system(config)
+        },
+    )
 }
 
 // Phase 126.M5.threadx — ThreadX-Linux is host-hosted: the board

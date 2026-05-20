@@ -446,6 +446,63 @@ fn fixture_workspace_generates_zephyr_package_shape() {
     );
 }
 
+/// Phase 126.M5.bare-metal — drives the orchestration generator
+/// against the pure Cortex-M3 board (MPS2-AN385, thumbv7m-none-eabi).
+/// no_std/no_main + cortex-m-rt `#[entry]`; the board crate owns
+/// hardware + smoltcp init and the cortex-m-rt linker script. Asserts
+/// the generated package compiles to a thumbv7m ELF.
+#[test]
+fn fixture_workspace_builds_generated_bare_metal_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_bare_metal");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-bare-metal");
+    let plan_path = out_dir.join("nros-plan-bare-metal.json");
+    fs::create_dir_all(&out_dir).expect("create bare-metal output dir");
+
+    let mut plan = fixture_plan("plan_multi_instance.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_bare_metal(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize bare-metal plan"),
+    )
+    .expect("write bare-metal plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated bare-metal plan");
+    build::run(build::Args {
+        project: Some(fixture),
+        system_plan: Some(plan_path),
+        system_output: Some(generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-bare-metal".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: true,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated bare-metal package");
+
+    let binary = out_dir
+        .join("target")
+        .join("thumbv7m-none-eabi")
+        .join("release")
+        .join("nros-e2e-generated-bare-metal");
+    assert!(
+        binary.is_file(),
+        "generated bare-metal binary exists at {}",
+        binary.display()
+    );
+}
+
 /// Phase 126.M5.threadx — drives the orchestration generator against
 /// the ThreadX-Linux board (host-hosted ThreadX + NetX Duo over the
 /// NSOS BSD shim). Builds as a normal x86_64 Linux ELF — no custom
@@ -813,6 +870,15 @@ fn retarget_plan_to_zephyr(plan: &mut NrosPlan) {
     // time), so the field is recorded for plan completeness only.
     plan.build.target = "x86_64-unknown-linux-gnu".to_string();
     plan.build.board = "zephyr".to_string();
+    plan.build.rmw = "zenoh".to_string();
+    plan.build.profile = "release".to_string();
+}
+
+fn retarget_plan_to_bare_metal(plan: &mut NrosPlan) {
+    // Pure Cortex-M3 (MPS2-AN385, thumbv7m-none-eabi). no_std/no_main,
+    // cortex-m-rt `#[entry]`, semihosting panic + QEMU exit.
+    plan.build.target = "thumbv7m-none-eabi".to_string();
+    plan.build.board = "bare-metal".to_string();
     plan.build.rmw = "zenoh".to_string();
     plan.build.profile = "release".to_string();
 }

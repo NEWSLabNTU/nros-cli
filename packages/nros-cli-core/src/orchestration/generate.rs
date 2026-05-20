@@ -357,6 +357,20 @@ rustflags = [
 "#
             .to_string(),
         ),
+        // Phase 126.M5.bare-metal — pure Cortex-M3. cortex-m-rt's
+        // `link.x` linker script (pulled in via the board crate's
+        // memory.x) places the vector table + sections; the QEMU
+        // runner boots the ELF as an mps2-an385 kernel image with
+        // semihosting for stdout + exit.
+        Some("platform-bare-metal") => Some(
+            r#"[target.thumbv7m-none-eabi]
+runner = "qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -kernel"
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]
+"#
+            .to_string(),
+        ),
         // Phase 126.M5.nuttx — NuttX QEMU ARM target wiring.
         // armv7a-nuttx-eabihf needs build-std (Rust stdlib rebuilt
         // against NuttX's libc), the cortex-a7 + neon-vfpv4 ABI
@@ -513,6 +527,15 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
             "nros-board-mps2-an385-freertos = {{ path = \"{}\" }}\npanic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
             path_for_template(&workspace.join("packages/boards/nros-board-mps2-an385-freertos")),
         ),
+        // Phase 126.M5.bare-metal — pure Cortex-M3 (MPS2-AN385,
+        // thumbv7m-none-eabi). The board crate owns hardware + lwIP +
+        // smoltcp init and re-exports the `cortex-m-rt` `#[entry]`
+        // macro; panic-semihosting provides the `no_std` panic
+        // handler + QEMU exit.
+        Some("platform-bare-metal") => format!(
+            "nros-board-mps2-an385 = {{ path = \"{}\" }}\npanic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
+            path_for_template(&workspace.join("packages/boards/nros-board-mps2-an385")),
+        ),
         // Phase 126.M5.nuttx — NuttX QEMU ARM (Cortex-A7 + virtio-net,
         // armv7a-nuttx-eabihf target). The board crate provides the
         // BoardInit shim; NuttX kernel + virtio-net + BSD sockets are
@@ -639,6 +662,16 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
             platform,
             "platform-freertos" | "platform-nuttx" | "platform-zephyr" | "platform-threadx"
         ) {
+            features.push(platform.to_string());
+        }
+        // `platform-bare-metal` is the local alias for the pure
+        // Cortex-M3 (mps2-an385) entry. ESP32 boards ALSO map onto the
+        // `platform-bare-metal` nros feature, but use a SEPARATE local
+        // `platform-esp32-qemu` alias (pushed below) to gate their
+        // esp-hal `#[main]` entry — so the bare-metal alias must be
+        // suppressed for esp32, else both entries compile and the
+        // bare-metal one references the unavailable `nros-board-mps2-an385`.
+        if platform == "platform-bare-metal" && esp32_chip(&build.board).is_none() {
             features.push(platform.to_string());
         }
     }
