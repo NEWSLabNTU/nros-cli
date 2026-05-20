@@ -19,7 +19,6 @@ use super::{
 
 const CARGO_TEMPLATE: &str = include_str!("../../templates/orchestration/Cargo.toml.jinja");
 const BUILD_TEMPLATE: &str = include_str!("../../templates/orchestration/build.rs.jinja");
-const MAIN_TEMPLATE: &str = include_str!("../../templates/orchestration/main.rs.jinja");
 const LIB_TEMPLATE: &str = include_str!("../../templates/orchestration/lib.rs.jinja");
 const ZEPHYR_CMAKE_TEMPLATE: &str =
     include_str!("../../templates/orchestration/zephyr/CMakeLists.txt.jinja");
@@ -75,7 +74,7 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         write_if_changed(&options.output_dir.join("CMakeLists.txt"), &cmake)?;
         write_if_changed(&options.output_dir.join("prj.conf"), &prj_conf)?;
     } else {
-        write_if_changed(&src_dir.join("main.rs"), MAIN_TEMPLATE)?;
+        write_if_changed(&src_dir.join("main.rs"), &render_main(&plan))?;
     }
     if let Some(cargo_config) = cargo_config {
         let cargo_dir = options.output_dir.join(".cargo");
@@ -154,6 +153,141 @@ fn render_build_dependencies(plan: &NrosPlan) -> String {
         Some(EntryKind::ZephyrStaticlib) => "zephyr-build = \"0.1.0\"\n".to_string(),
         _ => String::new(),
     }
+}
+
+/// Phase 173.2b — crate-root preamble shared by every generated
+/// `src/main.rs`: the `nros_generated` include module plus the two
+/// always-present `use`s. Board-specific crate-root items
+/// (`crate_root_extra`) and the no_std/no_main attrs are layered on by
+/// `render_main`.
+const MAIN_PREAMBLE: &str = "\
+mod nros_generated {
+    core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));
+}
+
+use nros::prelude::*;
+use nros_orchestration::CallbackHandleTable;";
+
+/// Phase 173.2b — the `run_system` helper, emitted verbatim into every
+/// non-Zephyr `src/main.rs` (formerly `main.rs.jinja` lines 49-78). It is
+/// platform-agnostic: each entry shape just builds an `ExecutorConfig`
+/// and hands it to `run_system`.
+const RUN_SYSTEM: &str = "\
+fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::NodeError> {
+    nros_generated::register_backends();
+    let mut executor = Executor::open(&config)?;
+    let mut callback_handles = CallbackHandleTable::<{ nros_generated::CALLBACK_COUNT }>::new();
+
+    let mut sched_context_ids =
+        [executor.default_sched_context_id(); nros_generated::SCHED_CONTEXT_COUNT + 1];
+    for (index, spec) in nros_generated::SCHED_CONTEXTS.iter().copied().enumerate() {
+        sched_context_ids[index + 1] = executor.create_sched_context(spec.to_nros_node())?;
+    }
+
+    nros_generated::instantiate_components(&mut executor, &mut callback_handles)?;
+
+    for binding in nros_generated::CALLBACK_BINDINGS.iter().copied() {
+        let handle = callback_handles
+            .get(binding.callback_index)
+            .ok_or(nros::NodeError::NotInitialized)?;
+        let sched_context = sched_context_ids
+            .get(binding.sched_context_index)
+            .copied()
+            .ok_or(nros::NodeError::InvalidSchedContextBinding)?;
+        executor.bind_handle_to_sched_context(handle, sched_context)?;
+    }
+
+    #[cfg(feature = \"std\")]
+    return executor.spin_blocking(SpinOptions::default());
+
+    #[cfg(not(feature = \"std\"))]
+    executor.spin_default()
+}";
+
+/// Phase 173.2b — render the generated `src/main.rs` from the resolved
+/// `profile()`, replacing the static `main.rs.jinja` (which shipped every
+/// platform's `#[cfg(feature = \"platform-X\")]` entry block). One entry
+/// shape is chosen by the profile's `board_entry`:
+///
+/// * `None` — hosted native/posix `fn main` that builds
+///   `ExecutorConfig::from_env()` (std) / `default_const()` (no_std) and
+///   calls `run_system`.
+/// * `Some(entry)` — `<board>::run(<board>::Config::default(), closure)`
+///   where the closure threads the board `Config` into `ExecutorConfig`.
+///   no_std/no_main is emitted when the entry is a bare-metal `BoardRun`
+///   (threadx-linux is a `HostedMain` board host and stays std).
+///
+/// The `nros-orchestration` import is unused on Zephyr's staticlib path,
+/// so this is only invoked for the binary-crate (`main.rs`) platforms.
+fn render_main(plan: &NrosPlan) -> String {
+    let profile = profile(&plan.build.board, &plan.build.target);
+    let board_entry = profile.and_then(|p| p.board_entry);
+    let no_std = matches!(
+        profile,
+        Some(PlatformProfile {
+            entry_kind: EntryKind::BoardRun,
+            board_entry: Some(_),
+            ..
+        })
+    );
+
+    let mut out = String::new();
+    if no_std {
+        out.push_str("#![no_std]\n#![no_main]\n\n");
+    }
+    out.push_str(MAIN_PREAMBLE);
+    out.push('\n');
+
+    if let Some(entry) = board_entry
+        && !entry.crate_root_extra.is_empty()
+    {
+        out.push('\n');
+        out.push_str(entry.crate_root_extra);
+        out.push('\n');
+    }
+
+    out.push('\n');
+    out.push_str(RUN_SYSTEM);
+    out.push('\n');
+
+    out.push('\n');
+    match board_entry {
+        None => out.push_str(HOSTED_MAIN),
+        Some(entry) => out.push_str(&render_board_entry(&entry)),
+    }
+    out.push('\n');
+
+    out
+}
+
+/// Hosted native/posix entry (formerly `main.rs.jinja` lines 88-95).
+const HOSTED_MAIN: &str = "\
+fn main() -> core::result::Result<(), nros::NodeError> {
+    #[cfg(feature = \"std\")]
+    let config = ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());
+    #[cfg(not(feature = \"std\"))]
+    let config =
+        ExecutorConfig::default_const().node_name(nros_generated::SYSTEM.default_node_name());
+    run_system(config)
+}";
+
+/// Render the `<board>::run(..)` entry for a board-driven platform. The
+/// `ExecutorConfig` builder chain is identical across boards apart from
+/// the board crate name and the per-board `closure_extra` suffix.
+fn render_board_entry(entry: &BoardEntry) -> String {
+    let mut out = String::new();
+    if !entry.comment.is_empty() {
+        out.push_str(entry.comment);
+        out.push('\n');
+    }
+    out.push_str(entry.signature);
+    out.push_str(" {\n");
+    out.push_str(&format!(
+        "    {crate}::run(\n        {crate}::Config::default(),\n        |board_config| {{\n            let config = ExecutorConfig::new(board_config.zenoh_locator)\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
+        crate = entry.crate_name,
+        extra = entry.closure_extra,
+    ));
+    out
 }
 
 fn render_zephyr_cmake(options: &GenerateOptions) -> String {
@@ -925,12 +1059,12 @@ fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
         features.push("std".to_string());
     }
     // Phase 173.2 — `nros/<feature>` + the per-platform local aliases
-    // (which gate the board entry in `main.rs.jinja`) both come from the
-    // single `profile()` descriptor. ESP32/STM32 carry only their own
-    // alias (`platform-esp32-qemu` / `platform-stm32`), NOT the
-    // `platform-bare-metal` alias — so the bare-metal entry stays gated
-    // off for them even though they share the `platform-bare-metal`
-    // nros feature.
+    // (which gate the platform-specific Cargo deps + cfg) both come from
+    // the single `profile()` descriptor. (Since Phase 173.2b the
+    // `src/main.rs` entry is selected by `render_main` from
+    // `profile().board_entry`, not by these feature aliases.) ESP32/STM32
+    // carry only their own alias (`platform-esp32-qemu` /
+    // `platform-stm32`), NOT the `platform-bare-metal` alias.
     if let Some(p) = profile(&build.board, &build.target) {
         features.push(format!("nros/{}", p.nros_platform_feature));
         for alias in p.local_aliases {
@@ -1011,8 +1145,9 @@ enum LinkKind {
 }
 
 /// Shape of the generated package's entry point (`src/main.rs` /
-/// `src/lib.rs`). Consumed by `main.rs.jinja` (Phase 173.2b will branch
-/// on it instead of per-platform `#[cfg]` blocks).
+/// `src/lib.rs`). `render_main` branches on this (and on `board_entry`)
+/// to emit one entry shape, replacing the per-platform `#[cfg]` blocks
+/// the old `main.rs.jinja` shipped (Phase 173.2b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     /// Hosted Rust `fn main` (posix / threadx-linux host).
@@ -1044,7 +1179,9 @@ struct PlatformProfile {
     /// STM32 both map onto `platform-bare-metal`.
     nros_platform_feature: &'static str,
     /// Extra local default-feature aliases beyond `nros/<feature>` (gate
-    /// the per-board entry in `main.rs.jinja`).
+    /// the platform-specific Cargo deps + cfg). Note: since Phase 173.2b
+    /// the `src/main.rs` entry shape is chosen by `render_main` from
+    /// `board_entry`, not by these aliases.
     local_aliases: &'static [&'static str],
     toolchain: Toolchain,
     link_kind: LinkKind,
@@ -1054,7 +1191,125 @@ struct PlatformProfile {
     /// esp-hal (`esp32c3`/`esp32s3`) or stm32 (`stm32f429`/`stm32f407`)
     /// chip feature; `None` for non-chip platforms.
     chip: Option<&'static str>,
+    /// Phase 173.2b — `src/main.rs` entry shape. `None` for hosted
+    /// native/posix (which calls `run_system` directly via `fn main`);
+    /// `Some(spec)` for board-driven entries (bare-metal / RTOS hosts
+    /// whose board rlib's `run()` boots hardware then drives the user
+    /// closure). The hosted threadx-linux host is `HostedMain` yet still
+    /// carries a `BoardEntry` because it boots the ThreadX kernel via
+    /// `nros_board_threadx_linux::run`.
+    board_entry: Option<BoardEntry>,
 }
+
+/// Phase 173.2b — the per-board pieces `render_main` interpolates into
+/// the shared board-run entry shape. Everything else (the `run_system`
+/// helper, the `ExecutorConfig::new(..).domain_id(..).node_name(..)`
+/// chain, the closure scaffolding) is identical across boards.
+#[derive(Debug, Clone, Copy)]
+struct BoardEntry {
+    /// Board rlib invoked as `<crate>::run(<crate>::Config::default(), ..)`.
+    crate_name: &'static str,
+    /// Doc comment emitted directly above the entry fn.
+    comment: &'static str,
+    /// Attribute(s) + `fn` signature line(s) preceding the fn body
+    /// (e.g. `#[nros_board_mps2_an385::entry]\nfn main() -> !`).
+    signature: &'static str,
+    /// Panic-handler / log-transport `use`s (and any other crate-root
+    /// items) pinned at the crate root above the entry.
+    crate_root_extra: &'static str,
+    /// Builder-chain suffix appended inside the closure (e.g. esp32's
+    /// `.clock_us(...)`); empty for boards with no extra config.
+    closure_extra: &'static str,
+}
+
+/// Pure Cortex-M3 (MPS2-AN385). Entry via cortex-m-rt's `#[entry]`.
+const BOARD_ENTRY_BARE_METAL: BoardEntry = BoardEntry {
+    crate_name: "nros_board_mps2_an385",
+    comment: "\
+// Phase 126.M5.bare-metal — pure Cortex-M3 (MPS2-AN385). Entry comes
+// from cortex-m-rt's `#[entry]` (re-exported by the board crate).
+// The board crate's `run()` does hardware + smoltcp/lwIP init then
+// invokes the closure; referencing it pins the board rlib + its
+// linker-script / vector-table contributions into the image.",
+    signature: "#[nros_board_mps2_an385::entry]\nfn main() -> !",
+    crate_root_extra: "use panic_semihosting as _;",
+    closure_extra: "",
+};
+
+/// STM32F4 (Cortex-M4F). Entry via cortex-m-rt's `#[entry]`.
+const BOARD_ENTRY_STM32: BoardEntry = BoardEntry {
+    crate_name: "nros_board_stm32f4",
+    comment: "\
+// Phase 126.M5.stm32f4 — STM32F4 (Cortex-M4F). Entry via cortex-m-rt's
+// `#[entry]` (re-exported by the board crate). `run()` does clock +
+// Ethernet + smoltcp init then invokes the closure; referencing it
+// pins the board rlib + its linker-script / vector-table
+// contributions into the image. Diagnostics flow over defmt-rtt.",
+    signature: "#[nros_board_stm32f4::entry]\nfn main() -> !",
+    crate_root_extra: "\
+use defmt_rtt as _;
+use panic_probe as _;
+defmt::timestamp!(\"{=u64:us}\", { 0 });",
+    closure_extra: "",
+};
+
+/// ThreadX-Linux host: board `run()` boots ThreadX + NetX Duo on the
+/// application thread (hosted `fn main`, not bare-metal).
+const BOARD_ENTRY_THREADX_LINUX: BoardEntry = BoardEntry {
+    crate_name: "nros_board_threadx_linux",
+    comment: "\
+// Phase 126.M5.threadx — ThreadX-Linux is host-hosted: the board
+// crate's `run()` boots the ThreadX kernel + NetX Duo stack, then
+// invokes the closure on the application thread. Referencing
+// `nros_board_threadx_linux::run` is REQUIRED — it pins the board
+// rlib (and its build-script-linked ThreadX kernel + NetX archives)
+// into the link graph so `--gc-sections` doesn't drop the platform
+// `nros_platform_*` / `_tx_*` symbols.",
+    signature: "fn main() -> !",
+    crate_root_extra: "",
+    closure_extra: "",
+};
+
+/// Bare-metal ThreadX on QEMU RISC-V virt. Entry `_start -> main`.
+const BOARD_ENTRY_THREADX_RISCV64: BoardEntry = BoardEntry {
+    crate_name: "nros_board_threadx_qemu_riscv64",
+    comment: "\
+// Phase 126.M5.threadx-riscv64 — bare-metal ThreadX on QEMU RISC-V
+// virt. Entry is `#[no_mangle] extern \"C\" fn main` (the board's
+// `link.lds` jumps `_start -> main`). `run()` boots the ThreadX
+// kernel + NetX Duo over virtio-net then invokes the closure;
+// referencing it pins the board rlib + its kernel/NetX archives +
+// the linker script into the image.",
+    signature: "#[unsafe(no_mangle)]\nextern \"C\" fn main() -> !",
+    crate_root_extra: "",
+    closure_extra: "",
+};
+
+/// ESP32-C3 under QEMU (esp-hal). Entry via esp-hal's `#[main]`.
+const BOARD_ENTRY_ESP32_QEMU: BoardEntry = BoardEntry {
+    crate_name: "nros_board_esp32_qemu",
+    comment: "\
+// Phase 126.M5.esp32 — esp-hal `#[main]` entry. The board's `run()`
+// initialises the chip + network + log writer, then drives the user
+// closure and loops forever (ESP32 has no process exit). The board
+// `Config` carries the zenoh locator + domain id (defaults from the
+// board crate; override via a config.toml the generator could embed
+// in a follow-up).",
+    signature: "#[esp_hal::main]\nfn main() -> !",
+    crate_root_extra: "\
+use esp_backtrace as _;
+nros_board_esp32_qemu::esp_bootloader_esp_idf::esp_app_desc!();",
+    closure_extra: "\n                .clock_us(nros_board_esp32_qemu::nros_platform_esp32_qemu::clock::clock_us)",
+};
+
+/// FreeRTOS on MPS2-AN385. Entry `extern "C" fn _start`.
+const BOARD_ENTRY_FREERTOS: BoardEntry = BoardEntry {
+    crate_name: "nros_board_mps2_an385_freertos",
+    comment: "",
+    signature: "#[unsafe(no_mangle)]\nextern \"C\" fn _start() -> !",
+    crate_root_extra: "use panic_semihosting as _;",
+    closure_extra: "",
+};
 
 /// Single board/target → profile resolver. The one place new platforms
 /// register. `None` = unsupported `(board, target)`.
@@ -1066,7 +1321,8 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
               link_kind,
               entry_kind,
               net_stack,
-              chip| {
+              chip,
+              board_entry| {
         Some(PlatformProfile {
             kind,
             nros_platform_feature,
@@ -1076,6 +1332,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             entry_kind,
             net_stack,
             chip,
+            board_entry,
         })
     };
     match board {
@@ -1088,6 +1345,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::HostedMain,
             NetStack::NanoRosOwned,
             None,
+            None,
         ),
         "zephyr" => mk(
             PlatformKind::Zephyr,
@@ -1097,6 +1355,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             LinkKind::None,
             EntryKind::ZephyrStaticlib,
             NetStack::RtosOwned,
+            None,
             None,
         ),
         "freertos" | "freeRTOS" | "FreeRTOS" => mk(
@@ -1108,6 +1367,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             None,
+            Some(BOARD_ENTRY_FREERTOS),
         ),
         "nuttx" | "NuttX" => mk(
             PlatformKind::Nuttx,
@@ -1117,6 +1377,12 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             LinkKind::NuttxStaging,
             EntryKind::BoardRun,
             NetStack::RtosOwned,
+            None,
+            // Phase 173.2b — NuttX is `BoardRun` but the legacy template
+            // shipped no NuttX entry block, so the hosted `fn main`
+            // (active for any non-`#[cfg]`-gated platform) drives it
+            // today. `None` preserves that std hosted shape byte-for-byte;
+            // a NuttX `BoardEntry` is a future follow-up.
             None,
         ),
         "threadx" | "ThreadX" => {
@@ -1130,6 +1396,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
                     EntryKind::BoardRun,
                     NetStack::NanoRosOwned,
                     None,
+                    Some(BOARD_ENTRY_THREADX_RISCV64),
                 )
             } else {
                 mk(
@@ -1141,6 +1408,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
                     EntryKind::HostedMain,
                     NetStack::NanoRosOwned,
                     None,
+                    Some(BOARD_ENTRY_THREADX_LINUX),
                 )
             }
         }
@@ -1155,6 +1423,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             Some("esp32c3"),
+            Some(BOARD_ENTRY_ESP32_QEMU),
         ),
         "esp32s3" | "esp32-s3" => mk(
             PlatformKind::Esp32,
@@ -1165,6 +1434,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             Some("esp32s3"),
+            Some(BOARD_ENTRY_ESP32_QEMU),
         ),
         // STM32F4 (Cortex-M4F) maps onto `platform-bare-metal`; the chip
         // board feature + defmt deps come from `chip`.
@@ -1177,6 +1447,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             Some("stm32f429"),
+            Some(BOARD_ENTRY_STM32),
         ),
         "stm32f407" => mk(
             PlatformKind::Stm32,
@@ -1187,6 +1458,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             Some("stm32f407"),
+            Some(BOARD_ENTRY_STM32),
         ),
         "baremetal" | "bare-metal" => mk(
             PlatformKind::BareMetal,
@@ -1197,6 +1469,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             None,
+            Some(BOARD_ENTRY_BARE_METAL),
         ),
         "orin-spe" => mk(
             PlatformKind::OrinSpe,
@@ -1207,6 +1480,10 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             EntryKind::BoardRun,
             NetStack::NanoRosOwned,
             None,
+            // Phase 173.2b — like NuttX, orin-spe is `BoardRun` but had no
+            // legacy template entry block; the hosted `fn main` drives it.
+            // `None` keeps that std hosted shape byte-identical.
+            None,
         ),
         _ if target.contains("linux") => mk(
             PlatformKind::Posix,
@@ -1216,6 +1493,7 @@ fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
             LinkKind::None,
             EntryKind::HostedMain,
             NetStack::NanoRosOwned,
+            None,
             None,
         ),
         _ => None,

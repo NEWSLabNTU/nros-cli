@@ -117,6 +117,12 @@ fn generated_package_writes_manifest_build_script_and_main() {
     assert!(main_rs.contains("bind_handle_to_sched_context"));
     assert!(main_rs.contains("spin_blocking(SpinOptions::default())"));
     assert!(main_rs.contains("spin_default()"));
+    // Phase 173.2b — native/posix is the hosted `HostedMain` shape: a
+    // plain `fn main() -> Result<..>`, no `#![no_std]` and no board
+    // `run()` entry leaking in from a bare-metal platform.
+    assert!(main_rs.contains("fn main() -> core::result::Result<(), nros::NodeError> {"));
+    assert!(!main_rs.contains("#![no_std]"));
+    assert!(!main_rs.contains("::run("));
 }
 
 #[test]
@@ -220,13 +226,21 @@ fn generated_package_wires_freertos_entry() {
     assert!(cargo_config.contains("mps2_an385.ld"));
 
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
-    // Phase 126 collapsed the per-platform `no_std` attr into one shared
-    // `any(...)` cfg_attr; assert the crate is no_std + the freertos
-    // feature participates rather than the obsolete single-feature form.
-    assert!(main_rs.contains("no_std"));
-    assert!(main_rs.contains("feature = \"platform-freertos\""));
+    // Phase 173.2b collapsed the per-platform `#[cfg(feature = ...)]` entry
+    // blocks into one shape chosen by `profile().board_entry`. FreeRTOS is a
+    // bare-metal `BoardRun`, so the generated `main.rs` is unconditional
+    // `#![no_std]` / `#![no_main]` with a single `_start` entry that drives
+    // the board crate's `run()` — no `cfg(feature = "platform-freertos")`
+    // gate survives.
+    assert!(main_rs.contains("#![no_std]"));
+    assert!(main_rs.contains("#![no_main]"));
+    assert!(main_rs.contains("use panic_semihosting as _;"));
     assert!(main_rs.contains("extern \"C\" fn _start() -> !"));
-    assert!(main_rs.contains("nros_board_mps2_an385_freertos::run"));
+    assert!(main_rs.contains("nros_board_mps2_an385_freertos::run("));
+    assert!(main_rs.contains("nros_board_mps2_an385_freertos::Config::default()"));
+    // Single shape: no other platform's entry leaks in.
+    assert!(!main_rs.contains("ExecutorConfig::from_env()"));
+    assert!(!main_rs.contains("esp_hal::main"));
 }
 
 #[test]
