@@ -567,6 +567,86 @@ function(nros_generate_interfaces target)
     endforeach()
   endif()
 
+  # Phase 171.C.runtime — Cyclone DDS topic-descriptor typesupport.
+  # Keep this mirrored with the canonical repo-root
+  # cmake/NanoRosGenerateInterfaces.cmake copy while this legacy codegen
+  # module remains in-tree.
+  if(NANO_ROS_RMW STREQUAL "cyclonedds"
+     AND COMMAND nros_rmw_cyclonedds_generate_from_msg)
+    set(_cyc_ifaces "")
+    foreach(_if ${_interface_files})
+      if(_if MATCHES "\\.(msg|srv|action)$")
+        file(READ "${_if}" _if_body)
+        if(_if_body MATCHES "(\n|^)[ \t]*wstring[ \t<\\[]")
+          message(STATUS
+            "nros_generate_interfaces(${target}): skipping cyclonedds "
+            "descriptor for ${_if} — `wstring` is unsupported by the "
+            "bundled Cyclone DDS 0.10.5 idlc.")
+        else()
+          list(APPEND _cyc_ifaces "${_if}")
+        endif()
+      endif()
+    endforeach()
+    if(_cyc_ifaces)
+      list(GET _cyc_ifaces 0 _cyc_first)
+      get_filename_component(_cyc_ifdir "${_cyc_first}" DIRECTORY)
+      get_filename_component(_cyc_pkgdir "${_cyc_ifdir}" DIRECTORY)
+      set(_cyc_idl_root "${CMAKE_BINARY_DIR}/cyclonedds-ts/_idlroot")
+      set(_cyc_gen_root "${CMAKE_BINARY_DIR}/cyclonedds-ts/_genroot")
+      nros_rmw_cyclonedds_generate_from_msg(_cyc_sources
+        PKG_NAME   "${target}"
+        PKG_DIR    "${_cyc_pkgdir}"
+        INTERFACES ${_cyc_ifaces}
+        INCLUDE_ROOT "${_cyc_idl_root}"
+        GEN_ROOT     "${_cyc_gen_root}"
+        OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/cyclonedds-ts/${target}")
+      if(_cyc_sources)
+        add_library(${target}__cyclonedds_ts STATIC ${_cyc_sources})
+        target_include_directories(${target}__cyclonedds_ts PRIVATE
+          "${_cyc_gen_root}")
+        if(TARGET nros_rmw_cyclonedds)
+          target_include_directories(${target}__cyclonedds_ts PRIVATE
+            "$<TARGET_PROPERTY:nros_rmw_cyclonedds,INTERFACE_INCLUDE_DIRECTORIES>")
+        endif()
+        if(TARGET freertos_kernel)
+          target_link_libraries(${target}__cyclonedds_ts PRIVATE freertos_kernel)
+        endif()
+        foreach(_dep ${_ARG_DEPENDENCIES})
+          if(TARGET ${_dep}__cyclonedds_ts)
+            add_dependencies(${target}__cyclonedds_ts ${_dep}__cyclonedds_ts)
+          endif()
+        endforeach()
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24"
+           AND NOT CMAKE_SYSTEM_NAME STREQUAL "Generic")
+          foreach(_dep ${_ARG_DEPENDENCIES})
+            if(TARGET ${_dep}__cyclonedds_ts)
+              target_link_libraries(${_lib_target} INTERFACE
+                "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_dep}__cyclonedds_ts>")
+            endif()
+          endforeach()
+          target_link_libraries(${_lib_target} INTERFACE
+            "$<LINK_LIBRARY:WHOLE_ARCHIVE,${target}__cyclonedds_ts>")
+        else()
+          set(_cyc_force_load_libs "")
+          foreach(_dep ${_ARG_DEPENDENCIES})
+            if(TARGET ${_dep}__cyclonedds_ts)
+              list(APPEND _cyc_force_load_libs ${_dep}__cyclonedds_ts)
+            endif()
+          endforeach()
+          list(APPEND _cyc_force_load_libs ${target}__cyclonedds_ts)
+          target_link_libraries(${_lib_target} INTERFACE
+            "-Wl,--whole-archive"
+            ${_cyc_force_load_libs}
+            "-Wl,--no-whole-archive")
+          if(TARGET nros_rmw_cyclonedds)
+            target_link_libraries(${_lib_target} INTERFACE
+              "$<TARGET_FILE:nros_rmw_cyclonedds>")
+          endif()
+        endif()
+      endif()
+    endif()
+  endif()
+
   # Install
   if(NOT _ARG_SKIP_INSTALL)
     if(_ARG_LANGUAGE STREQUAL "CPP")
