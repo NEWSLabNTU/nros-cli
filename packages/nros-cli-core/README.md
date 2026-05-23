@@ -1,6 +1,6 @@
 # nros-cli-core
 
-Library backing the [`nros` CLI](https://crates.io/crates/nros-cli) and the [`cargo nano-ros`](https://crates.io/crates/cargo-nano-ros) subcommand. Contains the subcommand dispatch, project scaffolder, config inspector, build / run / doctor wrappers, and shell-completion generator.
+Library backing the canonical [`nros` CLI](https://crates.io/crates/nros-cli). Contains the subcommand dispatch, project scaffolder, config inspector, build / run / doctor wrappers, codegen commands, and shell-completion generator.
 
 ## License
 

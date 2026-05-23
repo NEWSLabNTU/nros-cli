@@ -116,7 +116,7 @@ class NrosBuildTask(TaskExtensionPoint):
         """Generate workspace-level interface bindings (once per workspace).
 
         Checks NrosBindingAugmentation for collected interface dependencies,
-        then runs cargo nano-ros generate-rust/generate-cpp as needed.
+        then runs `nros generate-rust` once for the workspace as needed.
         Output goes to build/nros_bindings/<interface_pkg>/.
         """
         global _bindings_generated
@@ -145,26 +145,34 @@ class NrosBuildTask(TaskExtensionPoint):
 
         logger.info(f"Generating nros bindings for: {', '.join(sorted(interface_deps))}")
 
-        # Generate Rust bindings if any Rust nros packages exist
+        # Generate Rust bindings if any Rust nros packages exist.
         if NrosBindingAugmentation._needs_rust:
-            for dep in sorted(interface_deps):
-                dep_dir = bindings_dir / dep
-                if dep_dir.exists() and any(dep_dir.rglob("*.rs")):
-                    logger.debug(f"Rust bindings for '{dep}' already exist")
-                    continue
-                cmd = [
-                    "cargo",
-                    "nano-ros",
-                    "bindgen",
-                    "--package",
-                    dep,
-                    "--output",
-                    str(bindings_dir / dep),
-                ]
-                rc = await run(self.context, cmd)
-                if rc and rc.returncode != 0:
-                    logger.error(f"Failed to generate Rust bindings for '{dep}'")
-                    return rc.returncode
+            manifest = bindings_dir / "package.xml"
+            deps_xml = "\n".join(f"  <depend>{dep}</depend>" for dep in sorted(interface_deps))
+            manifest.write_text(
+                '<?xml version="1.0"?>\n'
+                '<package format="3">\n'
+                "  <name>nros_colcon_bindings</name>\n"
+                "  <version>0.0.0</version>\n"
+                "  <description>Generated nano-ros binding manifest</description>\n"
+                '  <maintainer email="noreply@example.com">nano-ros</maintainer>\n'
+                "  <license>Apache-2.0</license>\n"
+                f"{deps_xml}\n"
+                "</package>\n",
+                encoding="utf-8",
+            )
+            cmd = [
+                "nros",
+                "generate-rust",
+                "--manifest",
+                str(manifest),
+                "--output",
+                str(bindings_dir),
+            ]
+            rc = await run(self.context, cmd)
+            if rc and rc.returncode != 0:
+                logger.error("Failed to generate Rust bindings with nros")
+                return rc.returncode
 
         # C/C++ bindings are handled by CMake's nano_ros_generate_interfaces()
         # during the cmake build step — not here.

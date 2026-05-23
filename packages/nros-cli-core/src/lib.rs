@@ -1,10 +1,8 @@
 //! Shared library backing the `nros` CLI.
 //!
-//! `nros-cli` (the standalone binary) and `cargo-nano-ros` (the cargo
-//! subcommand) both dispatch through this crate so the user-visible verbs
-//! stay in lockstep across entry points. Phase 111 introduces this split;
-//! the long-term shape is documented in
-//! `docs/roadmap/phase-111-ux-cli-and-release-channels.md`.
+//! `nros-cli` owns the canonical user-facing command surface. The older
+//! `cargo-nano-ros` subcommand remains as a compatibility adapter for
+//! Cargo workflows, while new scripts should call `nros` directly.
 
 pub mod cmd;
 pub mod orchestration;

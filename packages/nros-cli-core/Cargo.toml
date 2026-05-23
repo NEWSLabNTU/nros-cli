@@ -5,7 +5,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Library backing the `nros` CLI: subcommand dispatch + shared logic, used by both the `nros` standalone binary and the `cargo nano-ros` shim."
+description = "Library backing the canonical `nros` CLI: subcommand dispatch, project scaffolding, config inspection, build, run, doctor, and codegen."
 homepage.workspace = true
 documentation.workspace = true
 readme = "README.md"
@@ -34,7 +34,7 @@ cargo_metadata = "0.18"
 play_launch_parser = { path = "../../third-party/play_launch_parser/crates/play_launch_parser", optional = true }
 ros-launch-manifest-types = { path = "../../third-party/ros-launch-manifest/types" }
 
-# Reuse generate-{rust,c,cpp} surface from cargo-nano-ros — avoids
-# re-implementing codegen and keeps `nros generate` byte-for-byte
-# identical to `cargo nano-ros generate-*`.
+# Reuse the codegen implementation that still lives in the
+# cargo-nano-ros library crate. The canonical CLI surface is
+# `nros generate-rust`; the Cargo subcommand is compatibility-only.
 cargo-nano-ros = { workspace = true }

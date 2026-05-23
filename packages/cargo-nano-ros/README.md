@@ -1,13 +1,13 @@
 # cargo-nano-ros
 
-`cargo nano-ros` — Cargo subcommand front-end for [nano-ros](https://github.com/NEWSLabNTU/nano-ros) message generation. Reads `package.xml`, resolves transitive ROS 2 dependencies from the ament index, and emits a tree of generated Rust crates under `generated/` with a `.cargo/config.toml` `[patch.crates-io]` block wired to them.
+Compatibility Cargo subcommand for [nano-ros](https://github.com/NEWSLabNTU/nano-ros) message generation. The canonical user CLI is `nros`; install it from the `nros-cli` crate and run `nros generate-rust`.
 
 ```bash
-cargo install cargo-nano-ros
-cargo nano-ros generate --force
+cargo install nros-cli
+nros generate-rust --force
 ```
 
-Subcommands: `generate-rust`, `generate-c`, `generate-cpp`. Internally this crate is a thin shim over `nros-cli-core`; users on machines without Cargo can install the `nros` CLI for the same surface.
+`cargo nano-ros generate-rust` remains available for older Cargo workflows, but new scripts and docs should use `nros generate-rust`.
 
 ## License
 
