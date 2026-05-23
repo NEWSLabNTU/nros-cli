@@ -6,12 +6,11 @@
 
 use cargo_nano_ros::{
     GenerateCStandaloneConfig, GenerateConfig, generate_c_from_package_xml,
-    generate_from_package_xml,
+    generate_from_package_xml, parse_rename,
 };
 use clap::{Args as ClapArgs, ValueEnum};
 use eyre::{Result, eyre};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Lang {
@@ -33,7 +32,7 @@ pub struct Args {
     pub manifest: PathBuf,
 
     /// Output directory for generated bindings
-    #[arg(long, default_value = "generated")]
+    #[arg(long, short = 'o', default_value = "generated")]
     pub output: PathBuf,
 
     /// ROS 2 edition (`humble` | `iron`)
@@ -50,8 +49,62 @@ pub struct Args {
 
     /// Generate `.cargo/config.toml` with `[patch.crates-io]` entries
     /// (Rust only)
-    #[arg(long)]
+    #[arg(long, alias = "config")]
     pub generate_config: bool,
+
+    /// Path to nros crates directory for generated Cargo config patches
+    /// (Rust only)
+    #[arg(long, conflicts_with = "nano_ros_git")]
+    pub nano_ros_path: Option<PathBuf>,
+
+    /// Use nros git repository for generated Cargo config patches
+    /// (Rust only)
+    #[arg(long, conflicts_with = "nano_ros_path")]
+    pub nano_ros_git: bool,
+
+    /// Rename a generated package: --rename old_pkg=new_crate_name
+    /// (Rust only)
+    #[arg(long, value_parser = parse_rename)]
+    pub rename: Vec<(String, String)>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct RustArgs {
+    /// Path to `package.xml`
+    #[arg(long, default_value = "package.xml")]
+    pub manifest: PathBuf,
+
+    /// Output directory for generated bindings
+    #[arg(long, short = 'o', default_value = "generated")]
+    pub output: PathBuf,
+
+    /// ROS 2 edition (`humble` | `iron`)
+    #[arg(long, default_value = "humble")]
+    pub ros_edition: String,
+
+    /// Overwrite existing bindings
+    #[arg(long)]
+    pub force: bool,
+
+    /// Verbose output
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Generate `.cargo/config.toml` with `[patch.crates-io]` entries
+    #[arg(long, alias = "config")]
+    pub generate_config: bool,
+
+    /// Path to nros crates directory for generated Cargo config patches
+    #[arg(long, conflicts_with = "nano_ros_git")]
+    pub nano_ros_path: Option<PathBuf>,
+
+    /// Use nros git repository for generated Cargo config patches
+    #[arg(long, conflicts_with = "nano_ros_path")]
+    pub nano_ros_git: bool,
+
+    /// Rename a generated package: --rename old_pkg=new_crate_name
+    #[arg(long, value_parser = parse_rename)]
+    pub rename: Vec<(String, String)>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -72,18 +125,35 @@ pub fn run(args: Args) -> Result<()> {
     }
 }
 
+pub fn run_rust(args: RustArgs) -> Result<()> {
+    generate_rust_from_config(GenerateConfig {
+        manifest_path: args.manifest,
+        output_dir: args.output,
+        generate_config: args.generate_config,
+        nano_ros_path: args.nano_ros_path,
+        nano_ros_git: args.nano_ros_git,
+        force: args.force,
+        verbose: args.verbose,
+        ros_edition: args.ros_edition,
+        renames: args.rename.into_iter().collect(),
+    })
+}
+
 fn generate_rust(args: &Args) -> Result<()> {
-    let cfg = GenerateConfig {
+    generate_rust_from_config(GenerateConfig {
         manifest_path: args.manifest.clone(),
         output_dir: args.output.clone(),
         generate_config: args.generate_config,
-        nano_ros_path: None,
-        nano_ros_git: false,
+        nano_ros_path: args.nano_ros_path.clone(),
+        nano_ros_git: args.nano_ros_git,
         force: args.force,
         verbose: args.verbose,
         ros_edition: args.ros_edition.clone(),
-        renames: HashMap::new(),
-    };
+        renames: args.rename.clone().into_iter().collect::<HashMap<_, _>>(),
+    })
+}
+
+fn generate_rust_from_config(cfg: GenerateConfig) -> Result<()> {
     generate_from_package_xml(cfg)
 }
 

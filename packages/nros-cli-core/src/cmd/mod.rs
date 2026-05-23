@@ -34,6 +34,10 @@ pub enum Cmd {
     /// Generate Rust / C / C++ message bindings from `package.xml`
     Generate(generate::Args),
 
+    /// Generate Rust message bindings from `package.xml`
+    #[command(name = "generate-rust")]
+    GenerateRust(generate::RustArgs),
+
     /// Collect component source metadata for orchestration planning
     Metadata(metadata::Args),
 

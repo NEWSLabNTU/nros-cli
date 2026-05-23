@@ -42,10 +42,11 @@ pub mod workflow;
 
 use eyre::{Result, WrapErr, eyre};
 use rosidl_bindgen::ament::{AmentIndex, Package};
-use rosidl_codegen::RosEdition;
-use rosidl_codegen::utils::to_snake_case;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use rosidl_codegen::{RosEdition, utils::to_snake_case};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 /// Idempotent file write — skip the write (and the mtime bump) if the file
 /// already contains exactly the same bytes. Codegen reruns under cmake
@@ -232,17 +233,12 @@ pub fn generate_from_package_xml(config: GenerateConfig) -> Result<()> {
     for (pkg_name, package) in &interface_packages {
         let pkg_output = config.output_dir.join(pkg_name);
 
-        // Skip if exists and not forcing
-        if pkg_output.exists() && !config.force {
-            if config.verbose {
-                println!("  Skipping {} (already exists)", pkg_name);
-            }
-            generated_packages.push(pkg_name.clone());
-            continue;
-        }
-
         if config.verbose {
-            println!("  Generating {}...", pkg_name);
+            if pkg_output.exists() && !config.force {
+                println!("  Refreshing {} (reuses unchanged files)", pkg_name);
+            } else {
+                println!("  Generating {}...", pkg_name);
+            }
         }
 
         let result =

@@ -19,6 +19,7 @@ pub fn run(cmd: cmd::Cmd) -> Result<()> {
     match cmd {
         cmd::Cmd::New(args) => cmd::new::run(args),
         cmd::Cmd::Generate(args) => cmd::generate::run(args),
+        cmd::Cmd::GenerateRust(args) => cmd::generate::run_rust(args),
         cmd::Cmd::Metadata(args) => cmd::metadata::run(args),
         cmd::Cmd::Plan(args) => cmd::plan::run(args),
         cmd::Cmd::Check(args) => cmd::check::run(args),
