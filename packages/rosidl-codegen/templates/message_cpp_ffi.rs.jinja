@@ -144,6 +144,7 @@ pub unsafe extern "C" fn {{ ffi_serialize_fn }}(
     0
 {%- else %}
     // Empty message — serialize CDR header only
+    let _ = msg_ptr;
     if buf_len < 4 {
         return -1;
     }
@@ -181,6 +182,7 @@ pub unsafe extern "C" fn {{ ffi_publish_fn }}(
     unsafe { nros_cpp_publish_raw(handle, buf.as_ptr(), len) }
 {%- else %}
     // Empty message — publish CDR header only
+    let _ = msg_ptr;
     let buf = [0u8, 1u8, 0u8, 0u8]; // CDR LE header
     unsafe { nros_cpp_publish_raw(handle, buf.as_ptr(), 4) }
 {%- endif %}
