@@ -1,7 +1,6 @@
 //! The `nros` standalone binary — Phase 111.A.2.
 //!
-//! Pure clap dispatch shell. All real work lives in `nros-cli-core` so
-//! the `cargo nano-ros` adapter can share it byte-for-byte.
+//! Pure clap dispatch shell. All real work lives in `nros-cli-core`.
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};

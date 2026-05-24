@@ -1,13 +1,15 @@
 # cargo-nano-ros
 
-Compatibility Cargo subcommand for [nano-ros](https://github.com/NEWSLabNTU/nano-ros) message generation. The canonical user CLI is `nros`; install it from the `nros-cli` crate and run `nros generate-rust`.
+Shared codegen library for [nano-ros](https://github.com/NEWSLabNTU/nano-ros) message generation. The canonical user CLI is `nros`; install it from the `nros-cli` crate.
 
 ```bash
 cargo install nros-cli
 nros generate-rust --force
 ```
 
-`cargo nano-ros generate-rust` remains available for older Cargo workflows, but new scripts and docs should use `nros generate-rust`.
+This package no longer builds a `cargo nano-ros` command. Existing codegen
+internals still use the `cargo_nano_ros` Rust library until that library is
+renamed or split.
 
 ## License
 

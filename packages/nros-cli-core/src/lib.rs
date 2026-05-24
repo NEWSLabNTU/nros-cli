@@ -1,8 +1,8 @@
 //! Shared library backing the `nros` CLI.
 //!
-//! `nros-cli` owns the canonical user-facing command surface. The older
-//! `cargo-nano-ros` subcommand remains as a compatibility adapter for
-//! Cargo workflows, while new scripts should call `nros` directly.
+//! `nros-cli` owns the canonical user-facing command surface. Codegen
+//! implementation details still live in the `cargo_nano_ros` library until
+//! that library is renamed or split.
 
 pub mod cmd;
 pub mod orchestration;

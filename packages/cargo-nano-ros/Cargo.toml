@@ -5,20 +5,16 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Standalone build tool for nano-ros: generate message bindings from package.xml"
+description = "Shared nano-ros codegen library used by the nros CLI"
 homepage.workspace = true
 documentation.workspace = true
 readme = "README.md"
-keywords = ["ros2", "cargo", "subcommand", "codegen", "embedded"]
-categories = ["development-tools::cargo-plugins", "development-tools::build-utils", "command-line-utilities"]
+keywords = ["ros2", "codegen", "embedded"]
+categories = ["development-tools::build-utils"]
 
 [lib]
 name = "cargo_nano_ros"
 path = "src/lib.rs"
-
-[[bin]]
-name = "cargo-nano-ros"
-path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

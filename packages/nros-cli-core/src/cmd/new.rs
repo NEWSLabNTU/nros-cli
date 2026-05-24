@@ -1,7 +1,7 @@
 //! `nros new <name>` — Phase 111.A.4.
 //!
-//! Forwards to `cargo_nano_ros::scaffold::scaffold_package` so output
-//! stays in lockstep with the legacy `cargo nano-ros new` entry point.
+//! Forwards to `cargo_nano_ros::scaffold::scaffold_package` so the CLI
+//! stays in lockstep with the shared scaffolding implementation.
 //! Use-case (`talker` / `listener` / `service` / `action`) and RMW-choice
 //! diversification are accepted at the CLI for forward-compat but
 //! currently affect only the printed "Next steps" banner — full

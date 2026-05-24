@@ -1,8 +1,7 @@
 //! `nros generate <lang>` — message bindings codegen.
 //!
-//! Phase 111.A.5. Wraps the existing `cargo_nano_ros` library API
-//! one-for-one so output is byte-identical to `cargo nano-ros
-//! generate-{rust,c,cpp}`.
+//! Phase 111.A.5. Wraps the existing `cargo_nano_ros` library API so the
+//! canonical `nros` command reuses the same codegen implementation.
 
 use cargo_nano_ros::{
     GenerateCStandaloneConfig, GenerateConfig, generate_c_from_package_xml,

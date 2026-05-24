@@ -13,7 +13,7 @@ nros doctor
 nros board list
 ```
 
-Thin binary on top of `nros-cli-core`. Both this crate and the legacy `cargo nano-ros` subcommand route through the same library.
+Thin binary on top of `nros-cli-core`.
 
 ## License
 
