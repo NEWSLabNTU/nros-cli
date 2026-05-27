@@ -1,0 +1,20 @@
+# Phase 172.U — root nros.toml (SSOT) for the orchestration_e2e fixture.
+#
+# The whole system + its deployments live in this one file; `nros deploy
+# <name>` reads it (no per-package system nros.toml, no flag-driven build).
+# Used by the `deploy_native_self_from_root_nros_toml` cutover test.
+
+[workspace]
+default = "native"
+
+[system]
+launch = "src/demo_pkg/launch/system.launch.xml"
+components = ["demo_pkg"]
+rmw = "zenoh"
+domain_id = 0
+
+# self ownership model: nano-ros owns the toolchain, the generated entry lib's
+# self-shim is the binary (no deploy/ code dir).
+[deploy.native]
+kind = "self"
+target = "x86_64-unknown-linux-gnu"

@@ -1648,6 +1648,26 @@ fn temp_output(name: &str) -> PathBuf {
     dir
 }
 
+/// Phase 172.U — the config-unification half of the cutover: the whole `self`
+/// deployment resolves from ONE root `nros.toml` via `nros deploy native` (no
+/// flag-driven build, no per-package system config) — `[workspace].default` →
+/// `[deploy.native]` → `[system]`, pin assert, var-set. Dry-run because the
+/// real build is blocked on a known gap: `nros deploy` does not yet collect
+/// component source metadata (no `--metadata` input, no auto-extraction via the
+/// 172.E `build_metadata` driver), so the metadata→plan step fails
+/// `missing-source-metadata`. See the 172.U note in the phase doc.
+#[test]
+fn deploy_native_self_from_root_nros_toml() {
+    let fixture = fixture_workspace();
+    deploy::run(deploy::Args {
+        name: None, // exercise [workspace].default = "native"
+        config: fixture.join("nros.toml"),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        dry_run: true,
+    })
+    .expect("nros deploy (default) resolves the self deploy from one root nros.toml");
+}
+
 /// Phase 172.V — the vendor-lib deploy template's `[deploy]` table resolves +
 /// the runner var-set (`{self}` / `{entry_lib}` / `{vendor.dir}`) substitutes
 /// end-to-end via `nros deploy --dry-run`: parse → resolve → vendor-pin assert

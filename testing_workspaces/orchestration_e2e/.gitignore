@@ -1,0 +1,4 @@
+# Phase 172.U — `nros deploy` writes the generated entry lib + build artifacts
+# under the workspace; keep them out of git.
+/build/
+**/target/
