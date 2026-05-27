@@ -23,6 +23,7 @@ pub mod monitor;
 pub mod new;
 pub mod plan;
 pub mod run_target;
+pub mod scaffold_deploy;
 pub mod version;
 
 #[cfg(feature = "release")]
