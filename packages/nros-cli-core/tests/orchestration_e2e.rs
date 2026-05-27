@@ -1142,6 +1142,45 @@ fn metadata_mode_build_emits_source_metadata_for_component() {
     assert_eq!(node.timers[0].id, "timer_publish");
 }
 
+/// Phase 172.E CLI wiring — `nros metadata --build` discovers the declared
+/// `probe_pkg` component (via its `component_nros.toml`), compiles + runs it in
+/// metadata mode to produce the missing `source-metadata`, then collects it.
+#[test]
+fn metadata_build_discovers_and_produces_missing_source_metadata() {
+    let ws = codegen_root().join("testing_workspaces/metadata_build_ws");
+    let produced = ws.join("src/probe_pkg/node.metadata.json");
+    let _ = fs::remove_file(&produced); // start clean (gitignored)
+    let out = temp_output("metadata_build_discovery");
+
+    metadata::run(metadata::Args {
+        system_pkg: "probe_sys".to_string(),
+        workspace: Some(ws.clone()),
+        out_dir: Some(out.clone()),
+        metadata: Vec::new(),
+        build: true,
+        nano_ros_workspace: Some(nano_ros_workspace()),
+    })
+    .expect("nros metadata --build discovers + produces missing source metadata");
+
+    // The component's declared source-metadata path was produced...
+    assert!(
+        produced.is_file(),
+        "metadata-mode build wrote {}",
+        produced.display()
+    );
+    let meta: SourceMetadata =
+        serde_json::from_str(&fs::read_to_string(&produced).expect("read produced"))
+            .expect("valid SourceMetadata");
+    assert_eq!(meta.package, "probe_pkg");
+    assert_eq!(meta.nodes.len(), 1);
+    assert_eq!(meta.nodes[0].id, "probe_node");
+    assert_eq!(meta.nodes[0].timers.len(), 1);
+    // ...and collected into the out metadata dir.
+    assert!(out.join("metadata/node.metadata.json").is_file());
+
+    let _ = fs::remove_file(&produced); // don't leave it in the source tree
+}
+
 fn fixture_workspace() -> PathBuf {
     codegen_root().join("testing_workspaces/orchestration_e2e")
 }
