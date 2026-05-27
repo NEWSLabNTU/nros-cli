@@ -5,7 +5,7 @@ use std::{
 };
 
 use nros_cli_core::{
-    cmd::{check, metadata, plan},
+    cmd::{check, explain, metadata, plan},
     orchestration::plan::NrosPlan,
 };
 
@@ -53,6 +53,27 @@ fn orchestration_metadata_plan_check_commands_share_artifacts() {
     assert_eq!(plan.instances[0].callbacks.len(), 1);
     assert_eq!(plan.instances[0].sched_bindings.len(), 1);
     assert_eq!(plan.instances[0].parameters[0].name, "rate_hz");
+
+    // `explain` renders the same artifact readably (Phase 172.F). Capture the
+    // rendering and assert it surfaces the plan's structure — system header,
+    // the launch-instance→component map, a node, the parameter + its source,
+    // and the callback→context binding.
+    let mut buf = Vec::new();
+    explain::render(&plan, &mut buf).expect("explain renders without write error");
+    let out = String::from_utf8(buf).expect("explain output is utf-8");
+    assert!(
+        out.contains("system `system_pkg`"),
+        "missing system header:\n{out}"
+    );
+    assert!(
+        out.contains("Instances (1)"),
+        "missing instances section:\n{out}"
+    );
+    assert!(
+        out.contains("rate_hz = "),
+        "missing resolved parameter:\n{out}"
+    );
+    assert!(out.contains("→"), "missing instance/binding arrow:\n{out}");
 }
 
 /// Phase 172.G — a callback whose `group` matches a declared

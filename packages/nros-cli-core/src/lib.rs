@@ -21,6 +21,7 @@ pub fn run(cmd: cmd::Cmd) -> Result<()> {
         cmd::Cmd::Metadata(args) => cmd::metadata::run(args),
         cmd::Cmd::Plan(args) => cmd::plan::run(args),
         cmd::Cmd::Check(args) => cmd::check::run(args),
+        cmd::Cmd::Explain(args) => cmd::explain::run(args),
         cmd::Cmd::Config(args) => cmd::config::run(args),
         cmd::Cmd::Build(args) => cmd::build::run(args),
         cmd::Cmd::Run(args) => cmd::run_target::run(args),

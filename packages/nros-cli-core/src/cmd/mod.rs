@@ -15,6 +15,7 @@ pub mod check;
 pub mod completions;
 pub mod config;
 pub mod doctor;
+pub mod explain;
 pub mod generate;
 pub mod metadata;
 pub mod monitor;
@@ -46,6 +47,9 @@ pub enum Cmd {
 
     /// Validate a generated nros-plan.json
     Check(check::Args),
+
+    /// Render a generated nros-plan.json in human-readable form
+    Explain(explain::Args),
 
     /// Inspect or validate the current project's resolved configuration
     #[command(subcommand)]
