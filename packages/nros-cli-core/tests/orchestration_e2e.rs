@@ -8,7 +8,7 @@ use std::{
 };
 
 use nros_cli_core::{
-    cmd::{build, check, metadata, plan},
+    cmd::{build, check, deploy, metadata, plan},
     orchestration::{
         generate::{GenerateOptions, generate_package},
         plan::{NrosPlan, PlanComponent, PlanEntity, PlanParamPersistence},
@@ -1609,4 +1609,54 @@ fn temp_output(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("{name}-{}-{stamp}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     dir
+}
+
+/// Phase 172.V — the vendor-lib deploy template's `[deploy]` table resolves +
+/// the runner var-set (`{self}` / `{entry_lib}` / `{vendor.dir}`) substitutes
+/// end-to-end via `nros deploy --dry-run`: parse → resolve → vendor-pin assert
+/// → substitute the build/package steps. (The real link + the other platform
+/// templates are SDK/HW-bound; this validates the deploy wiring host-side.)
+#[test]
+fn deploy_vendor_lib_template_dry_run_resolves_and_substitutes() {
+    let root = temp_output("deploy_vendor_lib");
+    fs::create_dir_all(&root).expect("create deploy root");
+    // The vendor-pin assertion requires the vendor dir to exist.
+    let vendor = root.join("vendor-sdk");
+    fs::create_dir_all(vendor.join("lib")).expect("create fake vendor SDK");
+
+    let nros_toml = root.join("nros.toml");
+    fs::write(
+        &nros_toml,
+        format!(
+            r#"[workspace]
+default = "orin"
+
+[system]
+components = ["demo_pkg"]
+rmw = "zenoh"
+
+[deploy.orin]
+kind = "vendor-lib"
+target = "x86_64-unknown-linux-gnu"
+self = "deploy/orin"
+emit = "compiled"
+vendor.pin = "spe-fsp 36.3"
+vendor.dir.default = "{vendor}"
+build = [
+  "gcc {{self}}/startup.c {{entry_lib}} -L{{vendor.dir}}/lib -o build/orin.elf",
+]
+package = ["echo packaged {{target}}"]
+"#,
+            vendor = vendor.display(),
+        ),
+    )
+    .expect("write root nros.toml");
+
+    deploy::run(deploy::Args {
+        name: Some("orin".to_string()),
+        config: nros_toml,
+        nano_ros_workspace: None, // dry-run skips the entry-lib emit pipeline
+        dry_run: true,
+    })
+    .expect("vendor-lib deploy dry-run resolves + substitutes the var-set");
 }
