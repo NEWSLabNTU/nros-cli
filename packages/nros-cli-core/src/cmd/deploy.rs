@@ -16,7 +16,14 @@ use std::{
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, bail, eyre};
 
-use crate::orchestration::root_config::{DeployKind, DeployTarget, WorkspaceConfig};
+use crate::{
+    cmd::{metadata, plan},
+    orchestration::{
+        self,
+        generate::{GenerateOptions, generate_package},
+        root_config::{DeployTarget, EmitForm, SystemSection, WorkspaceConfig},
+    },
+};
 
 /// Tokens the runner substitutes in `build[]` / `package[]` steps. A `{token}`
 /// for one of these that the target can't resolve is an error; any other
@@ -40,7 +47,12 @@ pub struct Args {
     #[arg(long, default_value = "nros.toml")]
     pub config: PathBuf,
 
-    /// Resolve + print the steps without running them.
+    /// nano-ros workspace root (for the generated entry lib's path deps).
+    /// Falls back to the `NROS_WORKSPACE` env var.
+    #[arg(long)]
+    pub nano_ros_workspace: Option<PathBuf>,
+
+    /// Resolve + print the steps without generating/building or running them.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -54,7 +66,18 @@ pub fn run(args: Args) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let (name, deploy) = resolve(&cfg, args.name.as_deref())?;
-    deploy_target(&cfg, &root, &name, deploy, args.dry_run)
+    let nano_ros = args
+        .nano_ros_workspace
+        .clone()
+        .or_else(|| std::env::var_os("NROS_WORKSPACE").map(PathBuf::from));
+    deploy_target(
+        &cfg,
+        &root,
+        &name,
+        deploy,
+        nano_ros.as_deref(),
+        args.dry_run,
+    )
 }
 
 /// Resolve the target by name, or fall back to `[workspace].default`.
@@ -79,28 +102,28 @@ fn deploy_target(
     root: &Path,
     name: &str,
     deploy: &DeployTarget,
+    nano_ros: Option<&Path>,
     dry_run: bool,
 ) -> Result<()> {
-    cfg.system_for(deploy).ok_or_else(|| {
+    let sys = cfg.system_for(deploy).ok_or_else(|| {
         eyre!("deploy '{name}': no resolvable [system] (set `system = \"<name>\"`)")
     })?;
 
     assert_pin(root, name, deploy)?;
-    emit_entry_lib(name, deploy);
 
-    // The `self` auto-build (generate entry lib + cargo a startup shim) is
-    // WP-B. Until then a `self` target with no explicit steps can't produce a
-    // binary; vendor-* targets always carry their `build[]` (enforced by
-    // `validate`).
-    if matches!(deploy.kind, DeployKind::Self_) && deploy.build.is_empty() {
-        bail!(
-            "deploy '{name}' (kind=self): the self build path is pending WP-B \
-             (entry-lib emit + cargo). Provide explicit `build = [...]` steps, \
-             or use a vendor-* kind."
-        );
+    // Real run: drive metadata → plan → entry-lib emit (WP-B). `--dry-run`
+    // skips the heavy pipeline and just resolves + prints the steps.
+    if !dry_run {
+        let nano_ros = nano_ros.ok_or_else(|| {
+            eyre!(
+                "deploy '{name}': need the nano-ros workspace — pass \
+                 --nano-ros-workspace <path> or set NROS_WORKSPACE"
+            )
+        })?;
+        emit_entry_lib(root, name, sys, deploy, nano_ros)?;
     }
 
-    let vars = build_vars(root, name, deploy);
+    let vars = build_vars(root, name, deploy)?;
     run_phase("build", &deploy.build, &vars, root, dry_run)?;
     run_phase("package", &deploy.package, &vars, root, dry_run)?;
 
@@ -140,28 +163,168 @@ fn assert_pin(root: &Path, name: &str, deploy: &DeployTarget) -> Result<()> {
     Ok(())
 }
 
-/// WP-B emits the wiring library here (compiled `.a`+header, or source). Until
-/// that lands, announce the gap so build steps referencing `{entry_*}` are
-/// understood to point at not-yet-generated paths.
-fn emit_entry_lib(name: &str, deploy: &DeployTarget) {
-    let form = deploy.emit.unwrap_or_else(|| deploy.kind.default_emit());
-    eprintln!(
-        "nros deploy: {name} entry-lib emit (form={form:?}) is pending WP-B — \
-         steps using {{entry_lib}}/{{entry_src}}/{{entry_header}} reference \
-         build/{name}/ paths not yet generated"
-    );
+/// Generated-artifact layout for a deploy target. Pure path computation
+/// (deterministic from the target triple + name), so it works in `--dry-run`
+/// before anything is generated and matches what `emit_entry_lib` produces.
+struct EntryPaths {
+    /// Output root: `<root>/build/<name>/nros`.
+    out_root: PathBuf,
+    /// Generated entry crate (`{entry_src}`).
+    src_dir: PathBuf,
+    /// cbindgen C header (`{entry_header}`).
+    header: PathBuf,
+    /// Compiled staticlib (`{entry_lib}`); exists only after a compiled-form build.
+    lib: PathBuf,
+}
+
+fn entry_paths(root: &Path, name: &str, deploy: &DeployTarget) -> Result<EntryPaths> {
+    let triple = deploy.target.as_deref().ok_or_else(|| {
+        eyre!("deploy '{name}': set `target = \"<triple>\"` (needed for the entry lib)")
+    })?;
+    let out_root = root.join("build").join(name).join("nros");
+    let src_dir = out_root.join("generated");
+    let pkg = package_name(name);
+    Ok(EntryPaths {
+        header: src_dir
+            .join("include")
+            .join(format!("{}.h", system_ident(name))),
+        lib: out_root
+            .join("target")
+            .join(triple)
+            .join("debug")
+            .join(format!("lib{}.a", pkg.replace('-', "_"))),
+        src_dir,
+        out_root,
+    })
+}
+
+/// Generated package name → drives the staticlib name (`lib<pkg>.a`).
+fn package_name(name: &str) -> String {
+    format!("nros-{name}")
+}
+
+/// System identifier baked into the header name (the `nros plan` system pkg,
+/// which is the deploy name here).
+fn system_ident(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+/// Drive metadata → plan → entry-lib emission (WP-B). Compiled-form kinds
+/// (`self` / `vendor-lib`) build the staticlib (+ self-shim binary); the
+/// source form (`vendor-module`) only generates the crate + CMake fragment for
+/// the vendor toolchain to compile.
+fn emit_entry_lib(
+    root: &Path,
+    name: &str,
+    sys: &SystemSection,
+    deploy: &DeployTarget,
+    nano_ros: &Path,
+) -> Result<()> {
+    let launch = sys.launch.as_ref().ok_or_else(|| {
+        eyre!("deploy '{name}': [system].launch is required for a planned deploy")
+    })?;
+    let paths = entry_paths(root, name, deploy)?;
+    let system_pkg = name.to_string();
+
+    std::fs::create_dir_all(&paths.out_root)
+        .wrap_err_with(|| format!("create {}", paths.out_root.display()))?;
+    let overlay = synth_build_overlay(&paths.out_root, sys, deploy)?;
+
+    metadata::run(metadata::Args {
+        system_pkg: system_pkg.clone(),
+        workspace: Some(root.to_path_buf()),
+        out_dir: Some(paths.out_root.clone()),
+        metadata: Vec::new(),
+    })
+    .wrap_err("deploy: metadata step")?;
+
+    plan::run(plan::Args {
+        system_pkg: system_pkg.clone(),
+        launch_file: root.join(launch),
+        record: None,
+        workspace: Some(root.to_path_buf()),
+        out_dir: Some(paths.out_root.clone()),
+        metadata: Vec::new(),
+        manifests: Vec::new(),
+        nros_toml: vec![overlay],
+        launch_args: Vec::new(),
+    })
+    .wrap_err("deploy: plan step")?;
+
+    let plan_path = paths.out_root.join("nros-plan.json");
+    let emit = deploy.emit.unwrap_or_else(|| deploy.kind.default_emit());
+    match emit {
+        EmitForm::Source => {
+            generate_package(&GenerateOptions {
+                package_name: package_name(name),
+                output_dir: paths.src_dir.clone(),
+                plan_path,
+                nros_path: nano_ros.join("packages/core/nros"),
+                nros_orchestration_path: nano_ros.join("packages/core/nros-orchestration"),
+                component_workspace: Some(root.to_path_buf()),
+            })
+            .wrap_err("deploy: generate entry-lib source")?;
+            eprintln!(
+                "nros deploy: {name} entry-lib source at {}",
+                paths.src_dir.display()
+            );
+        }
+        EmitForm::Compiled => {
+            orchestration::build::build_generated_package(&orchestration::build::BuildOptions {
+                package_name: package_name(name),
+                output_dir: paths.src_dir.clone(),
+                plan_path,
+                workspace_root: nano_ros.to_path_buf(),
+                component_workspace: Some(root.to_path_buf()),
+                release: false,
+                target: deploy.target.clone(),
+                cargo_args: Vec::new(),
+                force: false,
+            })
+            .wrap_err("deploy: build entry lib")?;
+            eprintln!(
+                "nros deploy: {name} entry-lib staticlib at {}",
+                paths.lib.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Bridge the root `[system]`/`[deploy]` into the planner's `[build]` overlay
+/// (target/board/rmw) so the generated entry lib lowers the right RMW. Written
+/// into the deploy's build dir (ephemeral).
+fn synth_build_overlay(
+    out_root: &Path,
+    sys: &SystemSection,
+    deploy: &DeployTarget,
+) -> Result<PathBuf> {
+    let target = deploy
+        .target
+        .as_deref()
+        .unwrap_or("x86_64-unknown-linux-gnu");
+    let board = deploy.board.as_deref().unwrap_or("native");
+    let rmw = deploy
+        .rmw
+        .as_deref()
+        .or(sys.rmw.as_deref())
+        .unwrap_or("zenoh");
+    let body = format!("[build]\ntarget = \"{target}\"\nboard = \"{board}\"\nrmw = \"{rmw}\"\n");
+    let path = out_root.join("deploy-build-overlay.toml");
+    std::fs::write(&path, body).wrap_err_with(|| format!("write {}", path.display()))?;
+    Ok(path)
 }
 
 type Vars = BTreeMap<&'static str, String>;
 
-fn build_vars(root: &Path, name: &str, deploy: &DeployTarget) -> Vars {
+fn build_vars(root: &Path, name: &str, deploy: &DeployTarget) -> Result<Vars> {
     let mut v = Vars::new();
 
-    // Entry-lib artifact paths under the deploy's build dir (WP-B produces them).
-    let out = root.join("build").join(name);
-    v.insert("entry_lib", out.join("libentry.a").display().to_string());
-    v.insert("entry_src", out.join("entry").display().to_string());
-    v.insert("entry_header", out.join("entry.h").display().to_string());
+    // Real entry-lib artifact paths (match what `emit_entry_lib` produces).
+    let paths = entry_paths(root, name, deploy)?;
+    v.insert("entry_lib", paths.lib.display().to_string());
+    v.insert("entry_src", paths.src_dir.display().to_string());
+    v.insert("entry_header", paths.header.display().to_string());
 
     if let Some(self_dir) = &deploy.self_dir {
         v.insert("self", abs(root, Path::new(self_dir)).display().to_string());
@@ -177,7 +340,7 @@ fn build_vars(root: &Path, name: &str, deploy: &DeployTarget) -> Vars {
     {
         v.insert("vendor.dir", abs(root, &dir).display().to_string());
     }
-    v
+    Ok(v)
 }
 
 /// Substitute the known `{token}`s. A referenced-but-undefined known token is
@@ -277,12 +440,41 @@ build = ["west build -b {board} -d build/mcu {self}"]
     fn build_vars_resolves_self_board_target_and_entry_paths() {
         let c = cfg();
         let root = Path::new("/ws");
-        let v = build_vars(root, "mcu", &c.deploy["mcu"]);
+        let v = build_vars(root, "mcu", &c.deploy["mcu"]).expect("vars");
         assert_eq!(v["board"], "nucleo_h753zi");
         assert_eq!(v["target"], "zephyr");
         assert_eq!(v["self"], "/ws/deploy/mcu");
-        assert_eq!(v["entry_lib"], "/ws/build/mcu/libentry.a");
+        // Real entry-lib paths under build/<name>/nros (match emit_entry_lib).
+        assert_eq!(v["entry_src"], "/ws/build/mcu/nros/generated");
+        assert_eq!(
+            v["entry_header"],
+            "/ws/build/mcu/nros/generated/include/mcu.h"
+        );
+        assert_eq!(
+            v["entry_lib"],
+            "/ws/build/mcu/nros/target/zephyr/debug/libnros_mcu.a"
+        );
         assert!(!v.contains_key("vendor.dir")); // no vendor on this target
+    }
+
+    #[test]
+    fn build_vars_needs_a_target() {
+        let c: WorkspaceConfig =
+            toml::from_str("[system]\nrmw=\"zenoh\"\n[deploy.x]\nkind=\"self\"\n").unwrap();
+        assert!(build_vars(Path::new("/ws"), "x", &c.deploy["x"]).is_err());
+    }
+
+    #[test]
+    fn synth_build_overlay_carries_target_board_rmw_override() {
+        let c = cfg();
+        let dir = std::env::temp_dir();
+        let p = synth_build_overlay(&dir, c.system.as_ref().unwrap(), &c.deploy["mcu"]).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("target = \"zephyr\""));
+        assert!(body.contains("board = \"nucleo_h753zi\""));
+        // mcu has no rmw override → falls back to [system].rmw.
+        assert!(body.contains("rmw = \"zenoh\""));
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
@@ -315,18 +507,36 @@ build = ["west build -b {board} -d build/mcu {self}"]
     }
 
     #[test]
-    fn self_with_no_build_is_pending_wp_b() {
+    fn dry_run_skips_pipeline_and_needs_no_nano_ros() {
         let c = cfg();
-        let err = deploy_target(&c, Path::new("/ws"), "native", &c.deploy["native"], true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("pending WP-B"), "{err}");
+        // --dry-run resolves + substitutes; no metadata/plan/build, no shell,
+        // and no nano-ros workspace required.
+        deploy_target(
+            &c,
+            Path::new("/ws"),
+            "native",
+            &c.deploy["native"],
+            None,
+            true,
+        )
+        .expect("self dry-run ok");
+        deploy_target(&c, Path::new("/ws"), "mcu", &c.deploy["mcu"], None, true)
+            .expect("vendor-module dry-run ok");
     }
 
     #[test]
-    fn dry_run_vendor_module_substitutes_without_running() {
+    fn real_run_without_nano_ros_errors() {
         let c = cfg();
-        // dry-run resolves + substitutes; no shell spawned.
-        deploy_target(&c, Path::new("/ws"), "mcu", &c.deploy["mcu"], true).expect("dry-run ok");
+        let err = deploy_target(
+            &c,
+            Path::new("/ws"),
+            "native",
+            &c.deploy["native"],
+            None,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nano-ros workspace"), "{err}");
     }
 }

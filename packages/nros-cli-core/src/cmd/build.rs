@@ -246,6 +246,7 @@ pub fn run(args: Args) -> Result<()> {
                 return deploy::run(deploy::Args {
                     name: Some(name),
                     config: root_toml,
+                    nano_ros_workspace: args.nano_ros_workspace.clone(),
                     dry_run: false,
                 });
             }
