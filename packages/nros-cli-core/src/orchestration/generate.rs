@@ -304,6 +304,14 @@ fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
         if let Some(baud) = t.baudrate {
             calls.push(format!("    c.set_baudrate({baud});"));
         }
+        // Phase 172.K.4 — wifi credentials. `{:?}` quotes + escapes the string
+        // literal for the generated Rust.
+        if let Some(ssid) = t.ssid.as_deref() {
+            calls.push(format!("    c.set_ssid({ssid:?});"));
+        }
+        if let Some(password) = t.password.as_deref() {
+            calls.push(format!("    c.set_password({password:?});"));
+        }
     }
     calls
 }
@@ -2606,7 +2614,10 @@ mod net_fragment_tests {
     fn eth(ip: &str) -> PlanTransport {
         PlanTransport {
             kind: TransportKind::Ethernet,
+            id: None,
             ip: Some(ip.to_string()),
+            ssid: None,
+            password: None,
             mac: None,
             gateway: None,
             device: None,

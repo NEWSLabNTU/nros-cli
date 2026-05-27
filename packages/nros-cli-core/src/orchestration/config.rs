@@ -76,6 +76,12 @@ pub struct SystemComponent {
     pub package: String,
     pub component: String,
     pub config: String,
+    /// Phase 172.K.4 — transport `id` this component's nodes bind to (which
+    /// `[[transport]]` session their entities ride). `None` ⇒ the default /
+    /// single transport. Full per-node `create_node_on`-by-id binding is K.5;
+    /// this carries the binding through the system config + plan.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

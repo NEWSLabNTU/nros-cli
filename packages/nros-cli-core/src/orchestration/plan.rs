@@ -333,6 +333,7 @@ pub struct PlanSchedContext {
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     Ethernet,
+    Wifi,
     Serial,
     Can,
 }
@@ -342,6 +343,7 @@ impl TransportKind {
     pub fn cargo_feature(self) -> &'static str {
         match self {
             TransportKind::Ethernet => "ethernet",
+            TransportKind::Wifi => "wifi",
             TransportKind::Serial => "serial",
             TransportKind::Can => "can",
         }
@@ -361,8 +363,19 @@ impl TransportKind {
 #[serde(deny_unknown_fields)]
 pub struct PlanTransport {
     pub kind: TransportKind,
-    /// IPv4 CIDR (`"10.0.2.50/24"`) or `"dhcp"` — ethernet only.
+    /// Stable transport id used to bind a node/instance to this session
+    /// (`SystemComponent.transport`). `None` ⇒ defaults to `rmw` (works when
+    /// each transport has a distinct rmw). Phase 172.K.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// IPv4 CIDR (`"10.0.2.50/24"`) or `"dhcp"` — ethernet/wifi only.
     pub ip: Option<String>,
+    /// WiFi SSID — wifi only. Phase 172.K.
+    #[serde(default)]
+    pub ssid: Option<String>,
+    /// WiFi password — wifi only. Phase 172.K.
+    #[serde(default)]
+    pub password: Option<String>,
     /// Ethernet MAC (`"02:00:00:00:00:01"`) — ethernet only. `None` ⇒
     /// the board's fixed/fused MAC. (Phase 172.J — replaces
     /// `config.toml`'s `[network].mac`.)
@@ -421,16 +434,32 @@ impl PlanBuildOptions {
                     if t.device.is_some() || t.baudrate.is_some() {
                         problems.push(format!("{at}: `device`/`baudrate` are serial/can-only"));
                     }
+                    if t.ssid.is_some() || t.password.is_some() {
+                        problems.push(format!("{at}: `ssid`/`password` are wifi-only"));
+                    }
+                }
+                TransportKind::Wifi => {
+                    // wifi carries ssid/password (+ optional static ip/gateway);
+                    // mac is ethernet-only, device/baudrate are serial/can-only.
+                    if t.device.is_some() || t.baudrate.is_some() {
+                        problems.push(format!("{at}: `device`/`baudrate` are serial/can-only"));
+                    }
+                    if t.mac.is_some() {
+                        problems.push(format!("{at}: `mac` is ethernet-only"));
+                    }
                 }
                 TransportKind::Serial | TransportKind::Can => {
                     if t.ip.is_some() {
-                        problems.push(format!("{at}: `ip` is ethernet-only"));
+                        problems.push(format!("{at}: `ip` is ethernet/wifi-only"));
                     }
                     if t.mac.is_some() {
                         problems.push(format!("{at}: `mac` is ethernet-only"));
                     }
                     if t.gateway.is_some() {
-                        problems.push(format!("{at}: `gateway` is ethernet-only"));
+                        problems.push(format!("{at}: `gateway` is ethernet/wifi-only"));
+                    }
+                    if t.ssid.is_some() || t.password.is_some() {
+                        problems.push(format!("{at}: `ssid`/`password` are wifi-only"));
                     }
                 }
             }
@@ -544,6 +573,37 @@ mod transport_tests {
             2,
             "mac + gateway both rejected: {problems:?}"
         );
+    }
+
+    #[test]
+    fn wifi_transport_parses_with_ssid_password_and_id() {
+        // Phase 172.K.4 — wifi kind + ssid/password + transport id.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "wifi", "id": "wlan", "ssid": "Net", "password": "pw",
+                  "ip": "10.0.0.50/24", "rmw": "zenoh" }
+            ]"#,
+        );
+        assert_eq!(build.transports[0].kind, TransportKind::Wifi);
+        assert_eq!(build.transports[0].kind.cargo_feature(), "wifi");
+        assert_eq!(build.transports[0].id.as_deref(), Some("wlan"));
+        assert_eq!(build.transports[0].ssid.as_deref(), Some("Net"));
+        assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn ssid_password_are_wifi_only() {
+        // Phase 172.K.4 — ethernet + serial reject ssid/password.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "ethernet", "ssid": "Net" },
+                { "kind": "serial", "device": "UART0", "password": "pw" }
+            ]"#,
+        );
+        let problems = build.validate_transports();
+        assert_eq!(problems.len(), 2, "ssid + password rejected: {problems:?}");
     }
 
     #[test]
