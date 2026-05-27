@@ -473,15 +473,15 @@ fn metadata_paths(
 ) -> Vec<PathBuf> {
     let mut paths = options.metadata_files.clone();
     paths.extend(workspace.source_metadata_files());
-    if metadata_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(metadata_dir) {
-            paths.extend(
-                entries
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json")),
-            );
-        }
+    if metadata_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(metadata_dir)
+    {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json")),
+        );
     }
     unique_paths(paths)
 }

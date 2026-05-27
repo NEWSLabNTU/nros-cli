@@ -87,10 +87,10 @@ fn parse_scalar(value: &str) -> Value {
     if let Ok(parsed) = value.parse::<i64>() {
         return Value::Number(parsed.into());
     }
-    if let Ok(parsed) = value.parse::<f64>() {
-        if let Some(number) = serde_json::Number::from_f64(parsed) {
-            return Value::Number(number);
-        }
+    if let Ok(parsed) = value.parse::<f64>()
+        && let Some(number) = serde_json::Number::from_f64(parsed)
+    {
+        return Value::Number(number);
     }
     Value::String(value.to_string())
 }

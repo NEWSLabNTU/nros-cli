@@ -298,15 +298,14 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
     let mut calls = Vec::new();
     for t in &build.transports {
-        if let Some(ip) = t.ip.as_deref() {
-            if !ip.eq_ignore_ascii_case("dhcp") {
-                if let Some((o, prefix)) = parse_ipv4_cidr(ip) {
-                    calls.push(format!(
-                        "    c.set_ipv4([{}, {}, {}, {}], {prefix});",
-                        o[0], o[1], o[2], o[3]
-                    ));
-                }
-            }
+        if let Some(ip) = t.ip.as_deref()
+            && !ip.eq_ignore_ascii_case("dhcp")
+            && let Some((o, prefix)) = parse_ipv4_cidr(ip)
+        {
+            calls.push(format!(
+                "    c.set_ipv4([{}, {}, {}, {}], {prefix});",
+                o[0], o[1], o[2], o[3]
+            ));
         }
         if let Some(mac) = t.mac.as_deref().and_then(parse_mac) {
             calls.push(format!(
@@ -851,7 +850,7 @@ components = ["rust-src", "rustfmt"]
 }
 
 fn render_build_rs(options: &GenerateOptions, plan: &NrosPlan) -> String {
-    let generated_tables = render_generated_tables(&plan);
+    let generated_tables = render_generated_tables(plan);
     BUILD_TEMPLATE
         .replace("{{ plan_path }}", &path_for_template(&options.plan_path))
         .replace(
@@ -1410,10 +1409,10 @@ fn rmw_set(build: &PlanBuildOptions) -> Vec<&'static str> {
             .collect()
     };
     for r in raw {
-        if let Some(n) = normalize_rmw(r) {
-            if !set.contains(&n) {
-                set.push(n);
-            }
+        if let Some(n) = normalize_rmw(r)
+            && !set.contains(&n)
+        {
+            set.push(n);
         }
     }
     set
@@ -2897,12 +2896,12 @@ fn final_node_name(resolved_name: &str, namespace: &str) -> String {
         return "node".to_string();
     }
     let namespace = namespace.trim_matches('/');
-    if !namespace.is_empty() {
-        if let Some(stripped) = trimmed.strip_prefix(namespace) {
-            let stripped = stripped.trim_matches('/');
-            if !stripped.is_empty() {
-                return stripped.to_string();
-            }
+    if !namespace.is_empty()
+        && let Some(stripped) = trimmed.strip_prefix(namespace)
+    {
+        let stripped = stripped.trim_matches('/');
+        if !stripped.is_empty() {
+            return stripped.to_string();
         }
     }
     trimmed
