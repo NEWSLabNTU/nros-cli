@@ -8,6 +8,7 @@ pub mod build;
 pub mod config;
 pub mod generate;
 pub mod manifest;
+pub mod metadata_build;
 pub mod names;
 pub mod params;
 pub mod plan;

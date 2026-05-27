@@ -11,8 +11,10 @@ use nros_cli_core::{
     cmd::{build, check, deploy, metadata, plan},
     orchestration::{
         generate::{GenerateOptions, generate_package},
+        metadata_build::{MetadataBuildOptions, build_metadata},
         plan::{NrosPlan, PlanComponent, PlanEntity, PlanParamPersistence},
         schema::ParameterValue,
+        source_metadata::SourceMetadata,
     },
 };
 use serde_json::Value;
@@ -1101,6 +1103,41 @@ fn build_launch_one_shot_runs_metadata_plan_generate_and_cargo() {
         "one-shot binary exists at {}",
         binary.display()
     );
+}
+
+/// Phase 172.E driver — compile the `demo_pkg::talker` component in metadata
+/// mode, run it against the in-memory recorder, and assert the emitted JSON is
+/// valid source-metadata describing the node + publisher + timer it declares.
+#[test]
+fn metadata_mode_build_emits_source_metadata_for_component() {
+    let fixture = fixture_workspace();
+    let out = temp_output("metadata_build");
+    let output_path = out.join("talker.metadata.json");
+
+    build_metadata(&MetadataBuildOptions {
+        component_id: "demo_pkg::talker".to_string(),
+        package: "demo_pkg".to_string(),
+        component: "talker".to_string(),
+        executable: Some("talker".to_string()),
+        exported_symbol: Some("nros_component_talker".to_string()),
+        component_dir: fixture.join("src/demo_pkg"),
+        nano_ros_workspace: nano_ros_workspace(),
+        output_path: output_path.clone(),
+        harness_dir: out.join("probe"),
+    })
+    .expect("metadata-mode build produces source metadata");
+
+    let raw = fs::read_to_string(&output_path).expect("read produced metadata");
+    let meta: SourceMetadata = serde_json::from_str(&raw).expect("valid SourceMetadata JSON");
+    assert_eq!(meta.package, "demo_pkg");
+    assert_eq!(meta.component, "talker");
+    assert_eq!(meta.nodes.len(), 1);
+    let node = &meta.nodes[0];
+    assert_eq!(node.id, "node_talker");
+    assert_eq!(node.publishers.len(), 1);
+    assert_eq!(node.publishers[0].id, "pub_chatter");
+    assert_eq!(node.timers.len(), 1);
+    assert_eq!(node.timers[0].id, "timer_publish");
 }
 
 fn fixture_workspace() -> PathBuf {
