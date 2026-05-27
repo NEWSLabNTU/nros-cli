@@ -11,7 +11,7 @@ use super::{
 use eyre::{Context, Result, eyre};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -126,7 +126,14 @@ pub fn plan_system(options: PlanOptions) -> Result<PlanningOutput> {
         ));
     }
 
-    let plan = schema_plan_json(&options, &record_path, &instances, &metadata, build_json);
+    let plan = schema_plan_json(
+        &options,
+        &record_path,
+        &instances,
+        &metadata,
+        &overlays,
+        build_json,
+    );
 
     let plan_path = options.out_root.join("nros-plan.json");
     fs::write(&plan_path, serde_json::to_string_pretty(&plan)?)?;
@@ -462,13 +469,40 @@ fn schema_plan_json(
     record_path: &Path,
     instances: &[Value],
     metadata: &[JsonArtifact],
+    overlays: &[Value],
     build: Value,
 ) -> Value {
     let components = schema_components(metadata);
-    let plan_instances = instances.iter().map(schema_instance).collect::<Vec<_>>();
+    // Phase 172.G — scheduling tiers come from nros.toml `[[scheduling.contexts]]`
+    // (author-declared, not inferred); callbacks bind to them by `group` name.
+    let (declared_contexts, declared_by_id) = collect_sched_contexts(overlays);
+    let plan_instances = instances
+        .iter()
+        .map(|instance| schema_instance(instance, &declared_by_id))
+        .collect::<Vec<_>>();
     let interfaces = schema_interfaces(&plan_instances);
+    let callback_chains = infer_callback_chains(&plan_instances);
+    let callback_groups = infer_callback_groups(&plan_instances, &callback_chains);
+
+    // Emit the declared tiers; append the implicit `default_executor` when it is
+    // the catch-all for any unbound callback (or when no tiers were declared, so
+    // single-tier plans stay byte-identical to pre-172.G).
+    let uses_default = plan_instances.iter().any(|inst| {
+        inst.get("callbacks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|cb| cb.get("sched_context").and_then(Value::as_str) == Some("default_executor"))
+    });
+    let mut sched_contexts = declared_contexts;
+    if (sched_contexts.is_empty() || uses_default)
+        && !declared_by_id.contains_key("default_executor")
+    {
+        sched_contexts.push(default_sched_context());
+    }
+
     json!({
-        "version": 1,
+        "version": 2,
         "system": options.system_pkg,
         "trace": {
             "system_config": options.nros_toml_files.first().map(|p| p.display().to_string()).unwrap_or_else(|| "nros.toml".to_string()),
@@ -478,19 +512,9 @@ fn schema_plan_json(
         "components": components,
         "instances": plan_instances,
         "interfaces": interfaces,
-        "sched_contexts": [{
-            "id": "default_executor",
-            "executor": "single_threaded",
-            "class": "best_effort",
-            "priority": null,
-            "period_ms": null,
-            "budget_ms": null,
-            "deadline_ms": null,
-            "deadline_policy": "ignore",
-            "stack_size": null,
-            "core": null,
-            "task": null,
-        }],
+        "sched_contexts": sched_contexts,
+        "callback_chains": callback_chains,
+        "callback_groups": callback_groups,
         "build": build,
     })
 }
@@ -552,7 +576,7 @@ fn schema_components(metadata: &[JsonArtifact]) -> Vec<Value> {
         .collect()
 }
 
-fn schema_instance(instance: &Value) -> Value {
+fn schema_instance(instance: &Value, declared: &BTreeMap<String, Value>) -> Value {
     let id = instance
         .get("id")
         .and_then(Value::as_str)
@@ -590,8 +614,8 @@ fn schema_instance(instance: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
     let nodes = schema_nodes(id, &source_nodes, &raw_entities);
-    let callbacks = schema_callbacks(id, instance.get("callbacks"));
-    let sched_bindings = schema_sched_bindings(&callbacks);
+    let callbacks = schema_callbacks(id, instance.get("callbacks"), declared);
+    let sched_bindings = schema_sched_bindings(&callbacks, declared);
     let default_source_node = source_nodes
         .first()
         .and_then(|node| node.get("id"))
@@ -643,7 +667,94 @@ fn schema_nodes(instance_id: &str, source_nodes: &[Value], entities: &[Value]) -
         .collect()
 }
 
-fn schema_callbacks(instance_id: &str, value: Option<&Value>) -> Vec<Value> {
+/// Phase 172.G — the implicit single tier. Emitted when nros.toml declares no
+/// `[[scheduling.contexts]]`, or as the catch-all for callbacks whose `group`
+/// matches no declared tier. Byte-identical to the pre-172.G hardcoded context
+/// so single-tier systems keep their exact plan output.
+fn default_sched_context() -> Value {
+    json!({
+        "id": "default_executor",
+        "executor": "single_threaded",
+        "class": "best_effort",
+        "priority": null,
+        "period_ms": null,
+        "budget_ms": null,
+        "deadline_ms": null,
+        "deadline_policy": "ignore",
+        "stack_size": null,
+        "core": null,
+        "task": null,
+    })
+}
+
+/// Phase 172.G — normalise one nros.toml `[[scheduling.contexts]]` entry into a
+/// plan `sched_context` value, filling every optional key so the result
+/// round-trips through `PlanSchedContext` (which requires all keys present).
+/// The TOML field names + value encodings already match the plan schema
+/// (`config::SchedContextConfig` mirrors `PlanSchedContext`), so this only
+/// supplies defaults for absent keys.
+fn normalize_sched_context(ctx: &Value) -> Value {
+    let str_or = |key: &str, default: &str| {
+        ctx.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or(default)
+            .to_string()
+    };
+    let val_or_null = |key: &str| ctx.get(key).cloned().unwrap_or(Value::Null);
+    json!({
+        "id": str_or("id", ""),
+        "executor": str_or("executor", "single_threaded"),
+        "class": str_or("class", "best_effort"),
+        "priority": val_or_null("priority"),
+        "period_ms": val_or_null("period_ms"),
+        "budget_ms": val_or_null("budget_ms"),
+        "deadline_ms": val_or_null("deadline_ms"),
+        "deadline_policy": str_or("deadline_policy", "ignore"),
+        "stack_size": val_or_null("stack_size"),
+        "core": val_or_null("core"),
+        "task": val_or_null("task"),
+    })
+}
+
+/// Phase 172.G — collect the declared scheduling tiers from the nros.toml
+/// overlays. Each `[[scheduling.contexts]]` becomes a plan `sched_context`,
+/// keyed by id (declaration order preserved; a later overlay redeclaring an id
+/// overrides the earlier one — last-wins, mirroring `schema_build_json`).
+/// Returns the ordered context values plus an id→context map for binding
+/// lookups.
+fn collect_sched_contexts(overlays: &[Value]) -> (Vec<Value>, BTreeMap<String, Value>) {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
+    for overlay in overlays {
+        let Some(contexts) = overlay
+            .get("scheduling")
+            .and_then(|s| s.get("contexts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for ctx in contexts {
+            let Some(id) = ctx.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            if !by_id.contains_key(id) {
+                order.push(id.to_string());
+            }
+            by_id.insert(id.to_string(), normalize_sched_context(ctx));
+        }
+    }
+    let contexts = order.iter().map(|id| by_id[id].clone()).collect();
+    (contexts, by_id)
+}
+
+fn schema_callbacks(
+    instance_id: &str,
+    value: Option<&Value>,
+    declared: &BTreeMap<String, Value>,
+) -> Vec<Value> {
     let Some(Value::Array(callbacks)) = value else {
         return Vec::new();
     };
@@ -661,28 +772,57 @@ fn schema_callbacks(instance_id: &str, value: Option<&Value>) -> Vec<Value> {
                     "column": null,
                 })
             });
+            // Phase 172.G — a callback's `group` names its scheduling tier
+            // ("group name = tier id"). Bind to the declared context of that
+            // name when one exists; otherwise fall back to `default_executor`.
+            let group = callback
+                .get("group")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            let sched_context = if declared.contains_key(group) {
+                group
+            } else {
+                "default_executor"
+            };
             Some(json!({
                 "id": format!("{instance_id}/{source_callback}"),
                 "source_callback": source_callback,
-                "group": callback.get("group").and_then(Value::as_str).unwrap_or("default"),
-                "sched_context": "default_executor",
+                "group": group,
+                "sched_context": sched_context,
                 "source": source,
             }))
         })
         .collect()
 }
 
-fn schema_sched_bindings(callbacks: &[Value]) -> Vec<Value> {
+/// Phase 172.G — one `sched_binding` per callback, binding it to the tier its
+/// `group` resolved to in [`schema_callbacks`]. A binding onto a declared
+/// nros.toml tier carries that tier's priority + `source: "nros.toml"`; the
+/// `default_executor` fall-back keeps the pre-172.G `priority: null` +
+/// `source: "source_metadata"` so single-tier plans stay byte-identical.
+fn schema_sched_bindings(callbacks: &[Value], declared: &BTreeMap<String, Value>) -> Vec<Value> {
     callbacks
         .iter()
         .filter_map(|callback| {
             let id = callback.get("id").and_then(Value::as_str)?;
-            Some(json!({
-                "callback": id,
-                "context": "default_executor",
-                "priority": null,
-                "source": "source_metadata",
-            }))
+            let context = callback
+                .get("sched_context")
+                .and_then(Value::as_str)
+                .unwrap_or("default_executor");
+            match declared.get(context) {
+                Some(ctx) => Some(json!({
+                    "callback": id,
+                    "context": context,
+                    "priority": ctx.get("priority").cloned().unwrap_or(Value::Null),
+                    "source": "nros.toml",
+                })),
+                None => Some(json!({
+                    "callback": id,
+                    "context": context,
+                    "priority": null,
+                    "source": "source_metadata",
+                })),
+            }
         })
         .collect()
 }
@@ -892,6 +1032,252 @@ fn schema_interfaces(instances: &[Value]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Phase 172.B — infer callback execution chains from the topic dataflow graph.
+///
+/// An edge `K1 -> K2` (over topic `T`) exists when `K1`'s instance publishes `T`
+/// and `K2` is the subscriber callback bound to `T`. An instance's *producing*
+/// callbacks (its subscriber + timer callbacks — the things that run and may in
+/// turn publish) are the sources of edges out of that instance; the plan does
+/// not record which specific callback publishes which topic, so every producing
+/// callback of a publishing instance is linked to the downstream subscriber
+/// (the inference's known coarseness — overridable by an explicit `[[chain]]`).
+///
+/// Connected dataflow subgraphs become chains: callbacks are topologically
+/// ordered (head → tail) and `links` records the producing topic per edge.
+/// Pure pub/sub-less or unconnected callbacks yield no chain.
+fn infer_callback_chains(instances: &[Value]) -> Vec<Value> {
+    use std::collections::BTreeSet;
+
+    // Per instance: its producing callback ids + the topics it publishes.
+    let mut producing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut publishes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // topic -> subscriber callback ids (consumers).
+    let mut consumers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for instance in instances {
+        let iid = instance
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        for entity in instance
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|node| node.get("entities").and_then(Value::as_array))
+            .flatten()
+        {
+            let role = entity.get("role").and_then(Value::as_str).unwrap_or("");
+            let topic = entity.get("resolved_name").and_then(Value::as_str);
+            let callback = entity.get("callback").and_then(Value::as_str);
+            match role {
+                "publisher" => {
+                    if let Some(t) = topic {
+                        publishes
+                            .entry(iid.clone())
+                            .or_default()
+                            .insert(t.to_string());
+                    }
+                }
+                "subscriber" => {
+                    if let Some(cb) = callback {
+                        producing
+                            .entry(iid.clone())
+                            .or_default()
+                            .push(cb.to_string());
+                        if let Some(t) = topic {
+                            consumers
+                                .entry(t.to_string())
+                                .or_default()
+                                .push(cb.to_string());
+                        }
+                    }
+                }
+                "timer" => {
+                    if let Some(cb) = callback {
+                        producing
+                            .entry(iid.clone())
+                            .or_default()
+                            .push(cb.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Edges (from_cb, to_cb, topic), de-duplicated and deterministically ordered.
+    let mut edges: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for (iid, topics) in &publishes {
+        let Some(srcs) = producing.get(iid) else {
+            continue;
+        };
+        for topic in topics {
+            let Some(dsts) = consumers.get(topic) else {
+                continue;
+            };
+            for from in srcs {
+                for to in dsts {
+                    if from != to {
+                        edges.insert((from.clone(), to.clone(), topic.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Vec::new();
+    }
+
+    // Union-find over callbacks that participate in an edge → weakly-connected
+    // components, one chain each.
+    let mut parent: BTreeMap<String, String> = BTreeMap::new();
+    fn find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
+        let p = parent.get(x).cloned().unwrap_or_else(|| x.to_string());
+        if p == x {
+            return p;
+        }
+        let root = find(parent, &p);
+        parent.insert(x.to_string(), root.clone());
+        root
+    }
+    for (from, to, _) in &edges {
+        parent.entry(from.clone()).or_insert_with(|| from.clone());
+        parent.entry(to.clone()).or_insert_with(|| to.clone());
+        let ra = find(&mut parent, from);
+        let rb = find(&mut parent, to);
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    }
+
+    // Group edges by component root.
+    let mut comp_edges: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+    for e in &edges {
+        let root = find(&mut parent, &e.0);
+        comp_edges.entry(root).or_default().push(e.clone());
+    }
+
+    let mut chains: Vec<Value> = Vec::new();
+    for (_root, comp) in comp_edges {
+        // Kahn topological order over this component.
+        let mut indeg: BTreeMap<String, usize> = BTreeMap::new();
+        let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut nodes: BTreeSet<String> = BTreeSet::new();
+        for (from, to, _) in &comp {
+            nodes.insert(from.clone());
+            nodes.insert(to.clone());
+            adj.entry(from.clone()).or_default().push(to.clone());
+            *indeg.entry(to.clone()).or_insert(0) += 1;
+            indeg.entry(from.clone()).or_insert(0);
+        }
+        let mut queue: std::collections::VecDeque<String> = nodes
+            .iter()
+            .filter(|n| indeg.get(*n).copied().unwrap_or(0) == 0)
+            .cloned()
+            .collect();
+        let mut order: Vec<String> = Vec::new();
+        while let Some(n) = queue.pop_front() {
+            order.push(n.clone());
+            if let Some(succ) = adj.get(&n) {
+                for s in succ {
+                    let d = indeg.get_mut(s).unwrap();
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push_back(s.clone());
+                    }
+                }
+            }
+        }
+        // A cycle leaves some nodes unvisited — append them deterministically so
+        // the chain still lists every callback (links remain the source of truth).
+        for n in &nodes {
+            if !order.contains(n) {
+                order.push(n.clone());
+            }
+        }
+        let head = order.first().cloned().unwrap_or_default();
+        let links: Vec<Value> = comp
+            .iter()
+            .map(|(from, to, topic)| json!({ "from": from, "to": to, "topic": topic }))
+            .collect();
+        chains.push(json!({
+            "id": format!("chain/{head}"),
+            "callbacks": order,
+            "links": links,
+            "inferred": true,
+        }));
+    }
+    chains
+}
+
+/// Phase 172.C — derive callback groups from the 172.B chains. Each chain
+/// becomes one `mutually_exclusive` group (its dataflow-coupled stages
+/// serialize, preserving pipeline ordering + guarding shared state); each
+/// callback that appears in no chain becomes its own `reentrant` group (no
+/// coupling detected ⇒ concurrent-safe dispatch). Determinism: chain groups
+/// emit in `chains` order (already id-sorted by component root), then
+/// reentrant singletons in callback-id order. Overridable by an explicit
+/// `[[group]]`.
+fn infer_callback_groups(instances: &[Value], chains: &[Value]) -> Vec<Value> {
+    use std::collections::BTreeSet;
+
+    let mut grouped: BTreeSet<String> = BTreeSet::new();
+    let mut groups: Vec<Value> = Vec::new();
+
+    // One mutually-exclusive group per chain.
+    for chain in chains {
+        let cbs: Vec<String> = chain
+            .get("callbacks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.as_str().map(str::to_string))
+            .collect();
+        for c in &cbs {
+            grouped.insert(c.clone());
+        }
+        let head = cbs.first().cloned().unwrap_or_default();
+        groups.push(json!({
+            "id": format!("group/{head}"),
+            "kind": "mutually_exclusive",
+            "callbacks": cbs,
+            "inferred": true,
+        }));
+    }
+
+    // One reentrant singleton group per callback outside any chain.
+    let mut singles: Vec<String> = Vec::new();
+    for instance in instances {
+        for cb in instance
+            .get("callbacks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = cb.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !grouped.contains(id) {
+                singles.push(id.to_string());
+            }
+        }
+    }
+    singles.sort();
+    singles.dedup();
+    for id in singles {
+        groups.push(json!({
+            "id": format!("group/{id}"),
+            "kind": "reentrant",
+            "callbacks": [id],
+            "inferred": true,
+        }));
+    }
+
+    groups
 }
 
 fn build_instances(
@@ -2663,5 +3049,247 @@ topics:
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{name}-{}-{stamp}", std::process::id()))
+    }
+
+    // ---- Phase 172.B — callback-chain inference ----
+
+    #[test]
+    fn infer_callback_chains_links_publisher_instance_to_subscriber_callback() {
+        // Instance `a`: a timer callback `a/tick` and a publisher on /chatter.
+        // Instance `b`: a subscriber on /chatter bound to `b/on_msg`.
+        // The timer (a producing callback of the publishing instance) should
+        // chain into the downstream subscriber callback.
+        let instances = vec![
+            json!({
+                "id": "a",
+                "nodes": [{ "entities": [
+                    { "role": "timer", "id": "a/timer", "callback": "a/tick" },
+                    { "role": "publisher", "id": "a/pub", "resolved_name": "/chatter" },
+                ]}]
+            }),
+            json!({
+                "id": "b",
+                "nodes": [{ "entities": [
+                    { "role": "subscriber", "id": "b/sub", "resolved_name": "/chatter", "callback": "b/on_msg" },
+                ]}]
+            }),
+        ];
+        let chains = infer_callback_chains(&instances);
+        assert_eq!(chains.len(), 1, "expected one chain, got {chains:?}");
+        let chain = &chains[0];
+        assert_eq!(chain["id"], json!("chain/a/tick"));
+        assert_eq!(chain["callbacks"], json!(["a/tick", "b/on_msg"]));
+        assert_eq!(chain["inferred"], json!(true));
+        assert_eq!(
+            chain["links"],
+            json!([{ "from": "a/tick", "to": "b/on_msg", "topic": "/chatter" }])
+        );
+    }
+
+    #[test]
+    fn infer_callback_chains_chains_three_stages() {
+        // sensor(timer)->/raw->filter(sub)->/filtered->control(sub): one chain.
+        let instances = vec![
+            json!({ "id": "sensor", "nodes": [{ "entities": [
+                { "role": "timer", "id": "s/t", "callback": "sensor/sample" },
+                { "role": "publisher", "id": "s/p", "resolved_name": "/raw" },
+            ]}]}),
+            json!({ "id": "filter", "nodes": [{ "entities": [
+                { "role": "subscriber", "id": "f/s", "resolved_name": "/raw", "callback": "filter/on_raw" },
+                { "role": "publisher", "id": "f/p", "resolved_name": "/filtered" },
+            ]}]}),
+            json!({ "id": "control", "nodes": [{ "entities": [
+                { "role": "subscriber", "id": "c/s", "resolved_name": "/filtered", "callback": "control/on_filtered" },
+            ]}]}),
+        ];
+        let chains = infer_callback_chains(&instances);
+        assert_eq!(
+            chains.len(),
+            1,
+            "expected one connected chain, got {chains:?}"
+        );
+        assert_eq!(
+            chains[0]["callbacks"],
+            json!(["sensor/sample", "filter/on_raw", "control/on_filtered"])
+        );
+    }
+
+    #[test]
+    fn infer_callback_chains_empty_without_matching_pub_sub() {
+        // Publishes /chatter but nobody subscribes → no chain.
+        let instances = vec![json!({
+            "id": "a",
+            "nodes": [{ "entities": [
+                { "role": "timer", "id": "a/timer", "callback": "a/tick" },
+                { "role": "publisher", "id": "a/pub", "resolved_name": "/chatter" },
+            ]}]
+        })];
+        assert!(infer_callback_chains(&instances).is_empty());
+    }
+
+    #[test]
+    fn infer_callback_groups_chain_is_mutually_exclusive() {
+        // a/tick -> /chatter -> b/on_msg: a dataflow-coupled chain becomes one
+        // mutually-exclusive group spanning both callbacks.
+        let instances = vec![
+            json!({
+                "id": "a",
+                "callbacks": [{ "id": "a/tick" }],
+                "nodes": [{ "entities": [
+                    { "role": "timer", "id": "a/timer", "callback": "a/tick" },
+                    { "role": "publisher", "id": "a/pub", "resolved_name": "/chatter" },
+                ]}]
+            }),
+            json!({
+                "id": "b",
+                "callbacks": [{ "id": "b/on_msg" }],
+                "nodes": [{ "entities": [
+                    { "role": "subscriber", "id": "b/sub", "resolved_name": "/chatter", "callback": "b/on_msg" },
+                ]}]
+            }),
+        ];
+        let chains = infer_callback_chains(&instances);
+        let groups = infer_callback_groups(&instances, &chains);
+        assert_eq!(groups.len(), 1, "expected one chain group, got {groups:?}");
+        assert_eq!(groups[0]["id"], json!("group/a/tick"));
+        assert_eq!(groups[0]["kind"], json!("mutually_exclusive"));
+        assert_eq!(groups[0]["callbacks"], json!(["a/tick", "b/on_msg"]));
+        assert_eq!(groups[0]["inferred"], json!(true));
+    }
+
+    #[test]
+    fn infer_callback_groups_chainless_callback_is_reentrant() {
+        // A timer callback whose publish has no in-system subscriber → no chain
+        // → its own reentrant singleton group.
+        let instances = vec![json!({
+            "id": "a",
+            "callbacks": [{ "id": "a/tick" }],
+            "nodes": [{ "entities": [
+                { "role": "timer", "id": "a/timer", "callback": "a/tick" },
+                { "role": "publisher", "id": "a/pub", "resolved_name": "/chatter" },
+            ]}]
+        })];
+        let chains = infer_callback_chains(&instances);
+        assert!(chains.is_empty());
+        let groups = infer_callback_groups(&instances, &chains);
+        assert_eq!(groups.len(), 1, "got {groups:?}");
+        assert_eq!(groups[0]["id"], json!("group/a/tick"));
+        assert_eq!(groups[0]["kind"], json!("reentrant"));
+        assert_eq!(groups[0]["callbacks"], json!(["a/tick"]));
+        assert_eq!(groups[0]["inferred"], json!(true));
+    }
+
+    #[test]
+    fn infer_callback_groups_mixes_chain_and_reentrant() {
+        // a/tick -> b/on_msg chain plus an independent c/work timer.
+        let instances = vec![
+            json!({
+                "id": "a",
+                "callbacks": [{ "id": "a/tick" }],
+                "nodes": [{ "entities": [
+                    { "role": "timer", "id": "a/timer", "callback": "a/tick" },
+                    { "role": "publisher", "id": "a/pub", "resolved_name": "/chatter" },
+                ]}]
+            }),
+            json!({
+                "id": "b",
+                "callbacks": [{ "id": "b/on_msg" }],
+                "nodes": [{ "entities": [
+                    { "role": "subscriber", "id": "b/sub", "resolved_name": "/chatter", "callback": "b/on_msg" },
+                ]}]
+            }),
+            json!({
+                "id": "c",
+                "callbacks": [{ "id": "c/work" }],
+                "nodes": [{ "entities": [
+                    { "role": "timer", "id": "c/timer", "callback": "c/work" },
+                ]}]
+            }),
+        ];
+        let chains = infer_callback_chains(&instances);
+        let groups = infer_callback_groups(&instances, &chains);
+        assert_eq!(
+            groups.len(),
+            2,
+            "expected chain + reentrant group, got {groups:?}"
+        );
+        let me = groups
+            .iter()
+            .find(|g| g["kind"] == json!("mutually_exclusive"))
+            .expect("a mutually-exclusive chain group");
+        assert_eq!(me["callbacks"], json!(["a/tick", "b/on_msg"]));
+        let re = groups
+            .iter()
+            .find(|g| g["kind"] == json!("reentrant"))
+            .expect("a reentrant singleton group");
+        assert_eq!(re["id"], json!("group/c/work"));
+        assert_eq!(re["callbacks"], json!(["c/work"]));
+    }
+
+    #[test]
+    fn collect_sched_contexts_reads_dedups_and_normalizes_tiers() {
+        let overlays = vec![
+            json!({ "scheduling": { "contexts": [
+                { "id": "io", "class": "real_time", "priority": 10, "period_ms": 20 },
+            ]}}),
+            json!({ "scheduling": { "contexts": [
+                { "id": "io", "class": "real_time", "priority": 99 }, // last-wins override
+                { "id": "bg", "class": "best_effort" },
+            ]}}),
+        ];
+        let (contexts, by_id) = collect_sched_contexts(&overlays);
+        // Declaration order preserved: io (first declared), then bg.
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0]["id"], json!("io"));
+        assert_eq!(contexts[1]["id"], json!("bg"));
+        // Later overlay overrides the earlier `io`.
+        assert_eq!(by_id["io"]["priority"], json!(99));
+        // Absent keys normalised to defaults / null so the value round-trips.
+        assert_eq!(contexts[1]["executor"], json!("single_threaded"));
+        assert_eq!(contexts[1]["deadline_policy"], json!("ignore"));
+        assert_eq!(contexts[1]["priority"], json!(null));
+        assert_eq!(contexts[1]["period_ms"], json!(null));
+    }
+
+    #[test]
+    fn schema_callbacks_binds_group_to_declared_tier() {
+        let declared: std::collections::BTreeMap<String, Value> = [(
+            "io".to_string(),
+            normalize_sched_context(&json!({ "id": "io", "priority": 10 })),
+        )]
+        .into_iter()
+        .collect();
+        let callbacks = json!([
+            { "id": "cb_io",   "group": "io" },
+            { "id": "cb_main", "group": "main" },
+        ]);
+        let out = schema_callbacks("inst", Some(&callbacks), &declared);
+        // group "io" matches a declared tier → bound there.
+        assert_eq!(out[0]["sched_context"], json!("io"));
+        // group "main" has no tier → falls back to default_executor.
+        assert_eq!(out[1]["sched_context"], json!("default_executor"));
+    }
+
+    #[test]
+    fn schema_sched_bindings_tags_declared_tier_vs_fallback() {
+        let declared: std::collections::BTreeMap<String, Value> = [(
+            "io".to_string(),
+            normalize_sched_context(&json!({ "id": "io", "priority": 10 })),
+        )]
+        .into_iter()
+        .collect();
+        let callbacks = vec![
+            json!({ "id": "inst/cb_io",   "sched_context": "io" }),
+            json!({ "id": "inst/cb_main", "sched_context": "default_executor" }),
+        ];
+        let bindings = schema_sched_bindings(&callbacks, &declared);
+        // Bound to a declared tier: carries its priority + nros.toml source.
+        assert_eq!(bindings[0]["context"], json!("io"));
+        assert_eq!(bindings[0]["priority"], json!(10));
+        assert_eq!(bindings[0]["source"], json!("nros.toml"));
+        // Fallback: pre-172.G null priority + source_metadata (byte-compat).
+        assert_eq!(bindings[1]["context"], json!("default_executor"));
+        assert_eq!(bindings[1]["priority"], json!(null));
+        assert_eq!(bindings[1]["source"], json!("source_metadata"));
     }
 }

@@ -14,6 +14,18 @@ pub struct NrosPlan {
     pub instances: Vec<PlanInstance>,
     pub interfaces: Vec<PlanInterface>,
     pub sched_contexts: Vec<PlanSchedContext>,
+    /// Phase 172.B — callback execution chains inferred from the topic
+    /// dataflow graph (publisher topic → subscriber callback). Additive; old
+    /// plans (v1) omit it and deserialize to an empty vec. Omitted from output
+    /// when empty so chain-less plans stay byte-identical to v1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_chains: Vec<PlanCallbackChain>,
+    /// Phase 172.C — callback groups derived from the chains (one
+    /// mutually-exclusive group per chain; one reentrant singleton group per
+    /// chain-less callback). Additive; old plans omit it and deserialize to
+    /// an empty vec. Omitted from output when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_groups: Vec<PlanCallbackGroup>,
     pub build: PlanBuildOptions,
 }
 
@@ -84,7 +96,7 @@ pub enum PlanEntity {
     Subscriber {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         resolved_name: String,
         interface: InterfaceRef,
@@ -94,7 +106,7 @@ pub enum PlanEntity {
     Timer {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         period_ms: u64,
         trace: EntityTrace,
@@ -102,7 +114,7 @@ pub enum PlanEntity {
     ServiceServer {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         resolved_name: String,
         interface: InterfaceRef,
@@ -120,7 +132,7 @@ pub enum PlanEntity {
     ActionServer {
         id: String,
         source_entity: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         callback: Option<String>,
         resolved_name: String,
         interface: InterfaceRef,
@@ -152,6 +164,72 @@ pub struct PlanCallback {
     pub group: String,
     pub sched_context: String,
     pub source: SourceLocation,
+}
+
+/// Phase 172.B — an inferred (or overridden) callback execution chain: an
+/// ordered sequence of callbacks where each consumes the topic the previous
+/// produced. The head is a chain entry (a timer, or a subscriber whose topic
+/// has no in-system publisher); `links` records the producing topic for each
+/// edge so the chain is auditable. 172.C derives callback groups from these
+/// chains; 172.G assigns tiers per chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanCallbackChain {
+    /// Stable chain id, e.g. `chain/<head-callback-id>`.
+    pub id: String,
+    /// Ordered callback ids from head to tail.
+    pub callbacks: Vec<String>,
+    /// One entry per edge between consecutive `callbacks`.
+    pub links: Vec<PlanChainLink>,
+    /// `true` when the planner inferred this chain from the topic graph;
+    /// `false` when it came from an explicit `[[chain]]` override.
+    pub inferred: bool,
+}
+
+/// One dataflow edge in a [`PlanCallbackChain`]: `from` publishes `topic`,
+/// which `to` subscribes to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanChainLink {
+    pub from: String,
+    pub to: String,
+    pub topic: String,
+}
+
+/// Phase 172.C — dispatch concurrency class of a [`PlanCallbackGroup`],
+/// mirroring rclcpp's two callback-group kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallbackGroupKind {
+    /// Members never run concurrently with one another (serialized
+    /// dispatch) — the safe default for dataflow-coupled pipeline stages
+    /// that may share state.
+    MutuallyExclusive,
+    /// Members may run concurrently — inferred for callbacks with no
+    /// detected dataflow coupling.
+    Reentrant,
+}
+
+/// Phase 172.C — an inferred (or overridden) callback group. Each callback
+/// belongs to exactly one group; the group's [`CallbackGroupKind`] decides
+/// whether its members serialize or may run concurrently. Derived from the
+/// 172.B callback chains: every chain becomes one mutually-exclusive group
+/// (its stages serialize), and every callback outside any chain becomes its
+/// own reentrant group (no coupling detected → concurrent-safe). 172.G
+/// assigns scheduling tiers on top of this grouping.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanCallbackGroup {
+    /// Stable group id, e.g. `group/<chain-head>` or `group/<callback-id>`.
+    pub id: String,
+    /// Serialize vs concurrent dispatch.
+    pub kind: CallbackGroupKind,
+    /// Callback ids that belong to this group (chain order for chain
+    /// groups; a single callback for reentrant groups).
+    pub callbacks: Vec<String>,
+    /// `true` when the planner inferred this group from the chains;
+    /// `false` when it came from an explicit `[[group]]` override.
+    pub inferred: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -284,8 +362,10 @@ pub struct PlanBuildOptions {
     pub cfg: ParameterTable,
     /// Phase 173.5 — `nros.toml` `[[transport]]` entries. Empty ⇒
     /// zero-config single-transport build (board default transport +
-    /// the single linked RMW). Defaulted so pre-173.5 plans parse.
-    #[serde(default)]
+    /// the single linked RMW). Defaulted so pre-173.5 plans parse;
+    /// skip-when-empty so the stable pretty fixtures (zero-config
+    /// builds) round-trip without an empty `"transports": []`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<PlanTransport>,
 }
 

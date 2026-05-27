@@ -293,7 +293,7 @@ fn nested_unknown_fields_are_rejected() {
 #[test]
 fn version_fields_are_required() {
     let raw = include_str!("fixtures/orchestration/plan_pub_sub.json").replacen(
-        "  \"version\": 1,\n",
+        "  \"version\": 2,\n",
         "",
         1,
     );
