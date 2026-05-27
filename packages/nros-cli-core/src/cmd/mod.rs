@@ -14,6 +14,7 @@ pub mod build;
 pub mod check;
 pub mod completions;
 pub mod config;
+pub mod deploy;
 pub mod doctor;
 pub mod explain;
 pub mod generate;
@@ -57,6 +58,9 @@ pub enum Cmd {
 
     /// Build the current project (auto-detects cargo / cmake / west)
     Build(build::Args),
+
+    /// Run a [deploy.<name>] target from the root nros.toml (Phase 172 WP-A)
+    Deploy(deploy::Args),
 
     /// Build, flash, and monitor the current project on the selected target
     #[command(name = "run")]

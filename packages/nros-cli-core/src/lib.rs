@@ -24,6 +24,7 @@ pub fn run(cmd: cmd::Cmd) -> Result<()> {
         cmd::Cmd::Explain(args) => cmd::explain::run(args),
         cmd::Cmd::Config(args) => cmd::config::run(args),
         cmd::Cmd::Build(args) => cmd::build::run(args),
+        cmd::Cmd::Deploy(args) => cmd::deploy::run(args),
         cmd::Cmd::Run(args) => cmd::run_target::run(args),
         cmd::Cmd::Monitor(args) => cmd::monitor::run(args),
         cmd::Cmd::Doctor(args) => cmd::doctor::run(args),
