@@ -26,6 +26,11 @@ pub struct NrosPlan {
     /// an empty vec. Omitted from output when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callback_groups: Vec<PlanCallbackGroup>,
+    /// Phase 172.A — managed-lifecycle (REP-2002) spec for the generated
+    /// binary's node. Additive; absent ⇒ plain node (pre-172.A). Omitted from
+    /// output when absent so non-lifecycle plans stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<PlanLifecycle>,
     pub build: PlanBuildOptions,
 }
 
@@ -230,6 +235,34 @@ pub struct PlanCallbackGroup {
     /// `true` when the planner inferred this group from the chains;
     /// `false` when it came from an explicit `[[group]]` override.
     pub inferred: bool,
+}
+
+/// Phase 172.A — boot autostart policy for a managed-lifecycle (REP-2002) node.
+/// The generated runtime registers the five `~/change_state` / `~/get_state`
+/// services and then drives the node to this state at boot; `ros2 lifecycle`
+/// can drive it further at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAutostart {
+    /// Register the services but leave the node `Unconfigured` — every
+    /// transition is externally driven (`ros2 lifecycle set`).
+    None,
+    /// Auto-`configure` to `Inactive` at boot.
+    Configure,
+    /// Auto-`configure` then `activate` to `Active` at boot.
+    Active,
+}
+
+/// Phase 172.A — managed-lifecycle spec for the generated binary. Its presence
+/// marks the binary's node as managed; absence keeps the pre-172.A behaviour
+/// (a plain node brought up once at boot). The runtime models one lifecycle
+/// state machine per executor, so this is currently system-level; per-instance
+/// (multiple managed nodes in one binary) is a deferred runtime extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanLifecycle {
+    /// State the generated runtime drives the node to at boot.
+    pub autostart: LifecycleAutostart,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

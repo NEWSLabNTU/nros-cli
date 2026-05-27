@@ -501,7 +501,7 @@ fn schema_plan_json(
         sched_contexts.push(default_sched_context());
     }
 
-    json!({
+    let mut plan = json!({
         "version": 2,
         "system": options.system_pkg,
         "trace": {
@@ -515,8 +515,16 @@ fn schema_plan_json(
         "sched_contexts": sched_contexts,
         "callback_chains": callback_chains,
         "callback_groups": callback_groups,
-        "build": build,
-    })
+    });
+    // Phase 172.A — append the optional lifecycle block (before `build`, to
+    // match the NrosPlan field order) only when nros.toml declares [lifecycle];
+    // a non-lifecycle plan stays byte-identical to pre-172.A.
+    let obj = plan.as_object_mut().expect("plan is an object");
+    if let Some(lifecycle) = collect_lifecycle(overlays) {
+        obj.insert("lifecycle".to_string(), lifecycle);
+    }
+    obj.insert("build".to_string(), build);
+    plan
 }
 
 /// Phase 173.5 — assemble the plan `build` block from the nros.toml
@@ -748,6 +756,26 @@ fn collect_sched_contexts(overlays: &[Value]) -> (Vec<Value>, BTreeMap<String, V
     }
     let contexts = order.iter().map(|id| by_id[id].clone()).collect();
     (contexts, by_id)
+}
+
+/// Phase 172.A — read the nros.toml `[lifecycle]` block (last overlay wins).
+/// Returns the plan lifecycle value `{ "autostart": <policy> }` when the block
+/// is present; `None` keeps the binary's node a plain (unmanaged) node. The
+/// `autostart` policy defaults to `none` (register services, stay
+/// `Unconfigured`) when the key is omitted; an unknown value passes through and
+/// is rejected by `nros check` (NrosPlan parse).
+fn collect_lifecycle(overlays: &[Value]) -> Option<Value> {
+    let mut out = None;
+    for overlay in overlays {
+        if let Some(lc) = overlay.get("lifecycle") {
+            let autostart = lc
+                .get("autostart")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            out = Some(json!({ "autostart": autostart }));
+        }
+    }
+    out
 }
 
 fn schema_callbacks(
@@ -3291,5 +3319,24 @@ topics:
         assert_eq!(bindings[1]["context"], json!("default_executor"));
         assert_eq!(bindings[1]["priority"], json!(null));
         assert_eq!(bindings[1]["source"], json!("source_metadata"));
+    }
+
+    #[test]
+    fn collect_lifecycle_reads_block_defaults_and_last_wins() {
+        // No [lifecycle] → unmanaged.
+        assert!(collect_lifecycle(&[json!({})]).is_none());
+        // [lifecycle] with autostart.
+        let lc = collect_lifecycle(&[json!({ "lifecycle": { "autostart": "active" } })]).unwrap();
+        assert_eq!(lc["autostart"], json!("active"));
+        // [lifecycle] without autostart → defaults to "none" (managed, externally driven).
+        let lc = collect_lifecycle(&[json!({ "lifecycle": {} })]).unwrap();
+        assert_eq!(lc["autostart"], json!("none"));
+        // Last overlay wins.
+        let lc = collect_lifecycle(&[
+            json!({ "lifecycle": { "autostart": "configure" } }),
+            json!({ "lifecycle": { "autostart": "active" } }),
+        ])
+        .unwrap();
+        assert_eq!(lc["autostart"], json!("active"));
     }
 }

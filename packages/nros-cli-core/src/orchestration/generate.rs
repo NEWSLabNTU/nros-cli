@@ -13,7 +13,10 @@ use std::{
 
 use super::{
     ComponentConfig, NrosPlan,
-    plan::{PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext, TransportKind},
+    plan::{
+        LifecycleAutostart, PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext,
+        TransportKind,
+    },
     schema::{DeadlinePolicy, ParameterValue, SchedClass},
 };
 
@@ -111,7 +114,10 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
         .replace("{{ lib_section }}", &render_lib_section(plan))
         .replace(
             "{{ default_features }}",
-            &toml_string_array(&generated_default_features(&plan.build)),
+            &toml_string_array(&generated_default_features(
+                &plan.build,
+                plan.lifecycle.is_some(),
+            )),
         )
         .replace("{{ nros_path }}", &path_for_template(&options.nros_path))
         .replace(
@@ -199,6 +205,8 @@ fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeEr
             .ok_or(nros::NodeError::InvalidSchedContextBinding)?;
         executor.bind_handle_to_sched_context(handle, sched_context)?;
     }
+
+    nros_generated::apply_lifecycle(&mut executor)?;
 
     #[cfg(feature = \"std\")]
     return executor.spin_blocking(SpinOptions::default());
@@ -1259,10 +1267,15 @@ fn load_plan(path: &Path) -> Result<NrosPlan> {
     serde_json::from_str(&raw).wrap_err_with(|| format!("failed to parse {}", path.display()))
 }
 
-fn generated_default_features(build: &PlanBuildOptions) -> Vec<String> {
+fn generated_default_features(build: &PlanBuildOptions, managed_lifecycle: bool) -> Vec<String> {
     let mut features = Vec::new();
     if uses_std(build) {
         features.push("std".to_string());
+    }
+    // Phase 172.A — a `[lifecycle]` plan needs the REP-2002 services on the
+    // executor (`nros/lifecycle-services` → `nros-node/lifecycle-services`).
+    if managed_lifecycle {
+        features.push("nros/lifecycle-services".to_string());
     }
     // Phase 173.2 — `nros/<feature>` + the per-platform local aliases
     // (which gate the platform-specific Cargo deps + cfg) both come from
@@ -1882,6 +1895,7 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
         out.push_str("}\n\n");
     }
     render_backend_register_fn(&mut out, plan);
+    render_lifecycle_fn(&mut out, plan);
     render_native_component_ffi(&mut out, plan);
     render_components(&mut out, plan);
     render_instances(&mut out, plan);
@@ -2037,6 +2051,46 @@ fn render_backend_register_fn(out: &mut String, plan: &NrosPlan) {
             // registration happens through the C ABI at the CMake layer
             // (NANO_ROS_RMW=cyclonedds). No Rust call emitted.
             _ => {}
+        }
+    }
+    out.push_str("}\n\n");
+}
+
+/// Phase 172.A — emit `apply_lifecycle`, called from `run_executor` after the
+/// callbacks are bound. Unmanaged plans get a no-op (so the build needs no
+/// `lifecycle-services` feature and stays byte-equivalent in behaviour); a
+/// `[lifecycle]` plan registers the REP-2002 services on the executor and
+/// drives the node to its boot `autostart` state.
+fn render_lifecycle_fn(out: &mut String, plan: &NrosPlan) {
+    out.push_str(
+        "pub fn apply_lifecycle(executor: &mut nros::Executor) -> Result<(), nros::NodeError> {\n",
+    );
+    match &plan.lifecycle {
+        None => {
+            out.push_str("    let _ = executor;\n    Ok(())\n");
+        }
+        Some(lifecycle) => {
+            out.push_str("    executor.register_lifecycle_services()?;\n");
+            // Drive the boot autostart policy on the freshly-registered state
+            // machine. No transition callbacks are registered, so each
+            // transition takes the default-success path (REP-2002 skeleton);
+            // component-provided transition hooks are a later increment.
+            let transitions: &[&str] = match lifecycle.autostart {
+                LifecycleAutostart::None => &[],
+                LifecycleAutostart::Configure => &["Configure"],
+                LifecycleAutostart::Active => &["Configure", "Activate"],
+            };
+            if !transitions.is_empty() {
+                out.push_str("    if let Some(sm) = executor.lifecycle_state_machine_mut() {\n");
+                out.push_str("        unsafe {\n");
+                for t in transitions {
+                    out.push_str(&format!(
+                        "            let _ = sm.trigger_transition(nros::LifecycleTransition::{t});\n",
+                    ));
+                }
+                out.push_str("        }\n    }\n");
+            }
+            out.push_str("    Ok(())\n");
         }
     }
     out.push_str("}\n\n");

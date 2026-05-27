@@ -641,3 +641,62 @@ fn esp32s3_selects_esp_toolchain_and_xtensa_target() {
         "esp32-s3 entry runs through the S3 board:\n{main_rs}"
     );
 }
+
+/// Phase 172.A — a plan with no `[lifecycle]` block emits the `apply_lifecycle`
+/// hook as a no-op (so the build needs no `lifecycle-services` feature) and
+/// `run_executor` still calls it.
+#[test]
+fn generated_package_emits_noop_lifecycle_when_unmanaged() {
+    let output_dir = generate_fixture("lifecycle_unmanaged", "plan_pub_sub.json");
+
+    let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        !cargo_toml.contains("lifecycle-services"),
+        "unmanaged plan must not enable lifecycle-services:\n{cargo_toml}"
+    );
+
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    assert!(build_rs.contains("pub fn apply_lifecycle"));
+    assert!(
+        build_rs.contains("let _ = executor;"),
+        "unmanaged apply_lifecycle is a no-op:\n{build_rs}"
+    );
+    assert!(!build_rs.contains("register_lifecycle_services"));
+
+    let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
+    assert!(main_rs.contains("nros_generated::apply_lifecycle(&mut executor)?;"));
+}
+
+/// Phase 172.A — a `[lifecycle] autostart = "active"` plan registers the
+/// REP-2002 services + drives configure→activate at boot, and enables the
+/// `nros/lifecycle-services` feature on the generated crate.
+#[test]
+fn generated_package_wires_lifecycle_when_managed() {
+    use nros_cli_core::orchestration::plan::{LifecycleAutostart, NrosPlan, PlanLifecycle};
+
+    // Mark the pub/sub fixture plan lifecycle-managed (active) + write to temp.
+    let mut plan: NrosPlan =
+        serde_json::from_str(&fs::read_to_string(fixture("plan_pub_sub.json")).expect("read plan"))
+            .expect("parse plan");
+    plan.lifecycle = Some(PlanLifecycle {
+        autostart: LifecycleAutostart::Active,
+    });
+    let base = temp_output("lifecycle_managed");
+    fs::create_dir_all(&base).expect("create temp base");
+    let plan_path = base.join("nros-plan.json");
+    fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).expect("write plan");
+
+    let output_dir = base.join("out");
+    generate_plan("lifecycle_managed", plan_path, output_dir.clone());
+
+    let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        cargo_toml.contains("nros/lifecycle-services"),
+        "managed plan enables lifecycle-services:\n{cargo_toml}"
+    );
+
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    assert!(build_rs.contains("executor.register_lifecycle_services()?;"));
+    assert!(build_rs.contains("nros::LifecycleTransition::Configure"));
+    assert!(build_rs.contains("nros::LifecycleTransition::Activate"));
+}

@@ -192,6 +192,53 @@ deadline_policy = "warn"
     assert_eq!(binding.source, "nros.toml");
 }
 
+/// Phase 172.A — an nros.toml `[lifecycle]` block makes the generated binary's
+/// node managed; the plan carries the autostart policy and `nros check`
+/// validates it. End-to-end through `plan` + `check`.
+#[test]
+fn orchestration_plan_models_managed_lifecycle_from_nros_toml() {
+    use nros_cli_core::orchestration::plan::LifecycleAutostart;
+
+    let root = temp_workspace("plan_managed_lifecycle");
+    let out_dir = root.join("build/system_pkg/nros");
+    write_workspace_fixture(&root);
+    let nros_toml = root.join("nros.toml");
+    fs::write(&nros_toml, "[lifecycle]\nautostart = \"active\"\n").expect("write nros.toml");
+
+    metadata::run(metadata::Args {
+        system_pkg: "system_pkg".to_string(),
+        workspace: Some(root.clone()),
+        out_dir: Some(out_dir.clone()),
+        metadata: vec![root.join("talker.metadata.json")],
+    })
+    .expect("metadata command preserves source metadata");
+
+    plan::run(plan::Args {
+        system_pkg: "system_pkg".to_string(),
+        launch_file: root.join("system.launch.xml"),
+        record: Some(root.join("record.json")),
+        workspace: Some(root.clone()),
+        out_dir: Some(out_dir.clone()),
+        metadata: Vec::new(),
+        manifests: vec![root.join("manifest.launch.yaml")],
+        nros_toml: vec![nros_toml],
+        launch_args: Vec::new(),
+    })
+    .expect("plan command consumes the [lifecycle] block");
+
+    let plan_path = out_dir.join("nros-plan.json");
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check validates the lifecycle plan");
+
+    let plan: NrosPlan =
+        serde_json::from_str(&fs::read_to_string(plan_path).expect("read generated plan"))
+            .expect("generated plan has canonical schema");
+    let lifecycle = plan.lifecycle.expect("plan carries the lifecycle block");
+    assert_eq!(lifecycle.autostart, LifecycleAutostart::Active);
+}
+
 fn write_workspace_fixture(root: &Path) {
     fs::create_dir_all(root).expect("create workspace");
     fs::write(
