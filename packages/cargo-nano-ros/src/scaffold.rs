@@ -8,8 +8,10 @@
 //! "Next steps" output.
 
 use eyre::{Result, bail};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct ScaffoldConfig {
@@ -25,7 +27,10 @@ pub fn scaffold_package(cfg: &ScaffoldConfig) -> Result<()> {
     let dir = PathBuf::from(&cfg.name);
     if dir.exists() {
         if !cfg.force {
-            bail!("Directory '{}' already exists (use --force to overwrite)", cfg.name);
+            bail!(
+                "Directory '{}' already exists (use --force to overwrite)",
+                cfg.name
+            );
         }
         fs::remove_dir_all(&dir)?;
     }
@@ -64,12 +69,18 @@ pub fn scaffold_package(cfg: &ScaffoldConfig) -> Result<()> {
     println!("  Language : {}", cfg.lang);
     println!("  Platform : {}", cfg.platform);
     println!("  RMW      : {} (template diversification: TODO)", cfg.rmw);
-    println!("  Use case : {} (template diversification: TODO)", cfg.use_case);
+    println!(
+        "  Use case : {} (template diversification: TODO)",
+        cfg.use_case
+    );
     println!("  Build    : {build_type}");
     println!();
     println!("Next steps:");
     println!("  cd {}", cfg.name);
-    println!("  nros build           # or: colcon build --packages-select {}", cfg.name);
+    println!(
+        "  nros build           # or: colcon build --packages-select {}",
+        cfg.name
+    );
 
     Ok(())
 }
@@ -216,16 +227,21 @@ int main() {{
 }
 
 fn write_default_config_toml(dir: &Path) -> Result<()> {
-    let config_toml = r#"[network]
-ip = "10.0.2.20"
-mac = "02:00:00:00:00:00"
-gateway = "10.0.2.2"
-netmask = "255.255.255.0"
+    // Phase 172.K — scaffold the direct-mode nros.toml shape (one node + one
+    // ethernet transport), not the retired config.toml.
+    let nros_toml = r#"# nano-ros config (direct mode). See
+# docs/design/configuration-and-transports.md.
 
-[zenoh]
-locator = "tcp/10.0.2.2:7447"
+[node]
 domain_id = 0
+
+[[transport]]
+kind    = "ethernet"
+ip      = "10.0.2.20/24"
+mac     = "02:00:00:00:00:00"
+gateway = "10.0.2.2"
+locator = "tcp/10.0.2.2:7447"
 "#;
-    fs::write(dir.join("config.toml"), config_toml)?;
+    fs::write(dir.join("nros.toml"), nros_toml)?;
     Ok(())
 }
