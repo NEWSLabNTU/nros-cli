@@ -248,10 +248,26 @@ fn parse_ipv4_cidr(s: &str) -> Option<([u8; 4], u8)> {
     (n == 4).then_some((octets, prefix))
 }
 
-/// Phase 173.5 — the `TransportConfig` setter calls the generated
-/// `apply_transport_config` emits, derived from `[[transport]]`: a
-/// static ethernet `ip` → `set_ipv4`, a serial `baudrate` →
-/// `set_baudrate`. `dhcp` and missing values emit nothing.
+/// Parse `"02:00:00:00:00:01"` (colon- or dash-separated hex) into 6
+/// octets. `None` on malformed input.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut octets = [0u8; 6];
+    let mut n = 0;
+    for part in s.split([':', '-']) {
+        if n == 6 {
+            return None;
+        }
+        octets[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    (n == 6).then_some(octets)
+}
+
+/// Phase 173.5 / 172.J — the `BoardTransportConfig` setter calls the
+/// generated `apply_transport_config` emits, derived from `[[transport]]`:
+/// a static ethernet `ip` → `set_ipv4`, `mac` → `set_mac`, `gateway` →
+/// `set_gateway`, a serial `baudrate` → `set_baudrate`. `dhcp` and
+/// missing/malformed values emit nothing.
 fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
     let mut calls = Vec::new();
     for t in &build.transports {
@@ -264,6 +280,18 @@ fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
                     ));
                 }
             }
+        }
+        if let Some(mac) = t.mac.as_deref().and_then(parse_mac) {
+            calls.push(format!(
+                "    c.set_mac([0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}]);",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ));
+        }
+        if let Some((o, _)) = t.gateway.as_deref().and_then(parse_ipv4_cidr) {
+            calls.push(format!(
+                "    c.set_gateway([{}, {}, {}, {}]);",
+                o[0], o[1], o[2], o[3]
+            ));
         }
         if let Some(baud) = t.baudrate {
             calls.push(format!("    c.set_baudrate({baud});"));
@@ -2525,11 +2553,50 @@ mod net_fragment_tests {
         PlanTransport {
             kind: TransportKind::Ethernet,
             ip: Some(ip.to_string()),
+            mac: None,
+            gateway: None,
             device: None,
             baudrate: None,
             rmw: None,
             locator: None,
         }
+    }
+
+    #[test]
+    fn mac_and_gateway_emit_setter_calls() {
+        // Phase 172.J — ethernet mac + gateway → set_mac / set_gateway.
+        let mut t = eth("10.0.2.50/24");
+        t.mac = Some("02:00:00:00:00:01".to_string());
+        t.gateway = Some("10.0.2.2".to_string());
+        let calls = transport_config_setter_calls(&build_with(vec![t]));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("c.set_ipv4([10, 0, 2, 50], 24)")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("c.set_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("c.set_gateway([10, 0, 2, 2])")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_mac_emits_nothing() {
+        // Bad mac → no set_mac (the parser returns None; ip still emits).
+        let mut t = eth("10.0.2.50/24");
+        t.mac = Some("zz:zz".to_string());
+        let calls = transport_config_setter_calls(&build_with(vec![t]));
+        assert!(!calls.iter().any(|c| c.contains("set_mac")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("set_ipv4")), "{calls:?}");
     }
 
     #[test]

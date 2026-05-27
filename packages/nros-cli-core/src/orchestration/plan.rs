@@ -252,6 +252,16 @@ pub struct PlanTransport {
     pub kind: TransportKind,
     /// IPv4 CIDR (`"10.0.2.50/24"`) or `"dhcp"` — ethernet only.
     pub ip: Option<String>,
+    /// Ethernet MAC (`"02:00:00:00:00:01"`) — ethernet only. `None` ⇒
+    /// the board's fixed/fused MAC. (Phase 172.J — replaces
+    /// `config.toml`'s `[network].mac`.)
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// Default IPv4 gateway (`"10.0.2.2"`) — ethernet only. `None` ⇒ a
+    /// flat link with no gateway. (Phase 172.J — replaces
+    /// `config.toml`'s `[network].gateway`.)
+    #[serde(default)]
+    pub gateway: Option<String>,
     /// Device handle (`"UART0"`, `"CAN0"`) — serial / can only.
     pub device: Option<String>,
     /// Line rate (serial baud / CAN bitrate) — serial / can only.
@@ -302,6 +312,12 @@ impl PlanBuildOptions {
                 TransportKind::Serial | TransportKind::Can => {
                     if t.ip.is_some() {
                         problems.push(format!("{at}: `ip` is ethernet-only"));
+                    }
+                    if t.mac.is_some() {
+                        problems.push(format!("{at}: `mac` is ethernet-only"));
+                    }
+                    if t.gateway.is_some() {
+                        problems.push(format!("{at}: `gateway` is ethernet-only"));
                     }
                 }
             }
@@ -379,6 +395,42 @@ mod transport_tests {
         );
         let problems = build.validate_transports();
         assert_eq!(problems.len(), 2, "both mismatches reported: {problems:?}");
+    }
+
+    #[test]
+    fn ethernet_mac_and_gateway_parse_and_validate() {
+        // Phase 172.J — mac + gateway on an ethernet transport.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "ethernet", "ip": "10.0.2.50/24",
+                  "mac": "02:00:00:00:00:01", "gateway": "10.0.2.2" }
+            ]"#,
+        );
+        assert_eq!(
+            build.transports[0].mac.as_deref(),
+            Some("02:00:00:00:00:01")
+        );
+        assert_eq!(build.transports[0].gateway.as_deref(), Some("10.0.2.2"));
+        assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn mac_and_gateway_are_ethernet_only() {
+        // Phase 172.J — serial transport rejects mac + gateway.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "serial", "device": "UART0", "baudrate": 115200,
+                  "mac": "02:00:00:00:00:01", "gateway": "10.0.2.2" }
+            ]"#,
+        );
+        let problems = build.validate_transports();
+        assert_eq!(
+            problems.len(),
+            2,
+            "mac + gateway both rejected: {problems:?}"
+        );
     }
 
     #[test]
