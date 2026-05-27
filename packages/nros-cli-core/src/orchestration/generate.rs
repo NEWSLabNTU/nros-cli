@@ -77,32 +77,40 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         write_if_changed(&options.output_dir.join("CMakeLists.txt"), &cmake)?;
         write_if_changed(&options.output_dir.join("prj.conf"), &prj_conf)?;
     } else if emits_entry_lib(&plan) {
-        // Phase 172 WP-B — compiled-form entry lib: the wiring + C ABI live in
-        // `src/lib.rs` (a `lib` + `staticlib` crate), `src/main.rs` is a thin
-        // `self` shim, and `include/<sys>.h` declares the C ABI.
+        // Phase 172 entry lib: the wiring + Rust API live in `src/lib.rs`;
+        // `src/main.rs` is a thin `self` shim (hosted `fn main`, or a no_std
+        // board shim driven by the board rlib's `run()`).
         write_if_changed(&src_dir.join("lib.rs"), &render_entry_lib_rs(&plan))?;
-        write_if_changed(
-            &src_dir.join("main.rs"),
-            &render_hosted_shim_main(options, &plan),
-        )?;
-        let include_dir = options.output_dir.join("include");
-        fs::create_dir_all(&include_dir).wrap_err_with(|| {
-            format!(
-                "failed to create generated package include dir {}",
-                include_dir.display()
-            )
-        })?;
-        write_if_changed(
-            &include_dir.join(format!("{}.h", system_ident(&plan))),
-            &render_entry_header(&plan),
-        )?;
-        // Source form: a vendor-includable CMake fragment over the same crate
-        // (Corrosion compiles the staticlib in the vendor toolchain). Emitted
-        // alongside the compiled artifacts; the deploy runner picks per form.
-        write_if_changed(
-            &options.output_dir.join("CMakeLists.txt"),
-            &render_entry_cmake(options, &plan),
-        )?;
+        let board_shim = matches!(
+            profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
+            Some(EntryKind::BoardRun)
+        );
+        let shim = if board_shim {
+            render_board_shim_main(options, &plan)
+        } else {
+            render_hosted_shim_main(options, &plan)
+        };
+        write_if_changed(&src_dir.join("main.rs"), &shim)?;
+        // The C ABI + its cbindgen header + the vendor-includable CMake
+        // fragment ship only with the std-hosted (alloc) entry lib; a board
+        // `self` shim calls the Rust API directly and needs none of it.
+        if uses_std(&plan.build) {
+            let include_dir = options.output_dir.join("include");
+            fs::create_dir_all(&include_dir).wrap_err_with(|| {
+                format!(
+                    "failed to create generated package include dir {}",
+                    include_dir.display()
+                )
+            })?;
+            write_if_changed(
+                &include_dir.join(format!("{}.h", system_ident(&plan))),
+                &render_entry_header(&plan),
+            )?;
+            write_if_changed(
+                &options.output_dir.join("CMakeLists.txt"),
+                &render_entry_cmake(options, &plan),
+            )?;
+        }
     } else {
         write_if_changed(&src_dir.join("main.rs"), &render_main(&plan))?;
     }
@@ -179,11 +187,18 @@ fn render_lib_section(plan: &NrosPlan, package_name: &str) -> String {
     ) {
         return "\n[lib]\nname = \"rustapp\"\ncrate-type = [\"staticlib\"]\n".to_string();
     }
-    // Phase 172 WP-B — compiled-form entry lib: a `lib` (for the self shim bin
-    // to call) + `staticlib` (for vendor linking) crate.
+    // Phase 172 entry lib: a `lib` for the self shim bin to call. The hosted
+    // (alloc) lib also emits a `staticlib` for vendor linking; a board `self`
+    // lib stays `lib`-only — a no_std `staticlib` is a final artifact that
+    // would need its own panic handler (which lives in the bin shim).
     if emits_entry_lib(plan) {
+        let crate_types = if uses_std(&plan.build) {
+            "[\"lib\", \"staticlib\"]"
+        } else {
+            "[\"lib\"]"
+        };
         return format!(
-            "\n[lib]\nname = \"{}\"\ncrate-type = [\"lib\", \"staticlib\"]\n",
+            "\n[lib]\nname = \"{}\"\ncrate-type = {crate_types}\n",
             crate_ident(package_name)
         );
     }
@@ -448,11 +463,19 @@ fn system_ident(plan: &NrosPlan) -> String {
 /// boots. Board, Zephyr, no_std-hosted, and bridge entries keep their current
 /// emitter until later WP-B slices generalize the lib + add the source form.
 fn emits_entry_lib(plan: &NrosPlan) -> bool {
-    matches!(
-        profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
-        Some(EntryKind::HostedMain)
-    ) && uses_std(&plan.build)
-        && !plan.build.is_bridge()
+    if plan.build.is_bridge() {
+        return false;
+    }
+    match profile(&plan.build.board, &plan.build.target) {
+        // Hosted `self`: the std entry lib + a hosted shim.
+        Some(p) if p.entry_kind == EntryKind::HostedMain => uses_std(&plan.build),
+        // Board `self`: a no_std entry lib + a board shim (driven by the
+        // board rlib's `run()`). Requires a `board_entry` — NuttX/orin-spe
+        // (BoardRun, no board_entry) keep the legacy hosted-`main` path until
+        // they get one.
+        Some(p) if p.entry_kind == EntryKind::BoardRun => p.board_entry.is_some(),
+        _ => false,
+    }
 }
 
 /// Phase 172 WP-B — `src/lib.rs` for the compiled-form entry lib: hosts the
@@ -483,10 +506,19 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
         "    core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));\n",
     );
     out.push_str("}\n\n");
-    out.push_str("pub use nros_generated::{SYSTEM, build_executor, register_all};\n\n");
+    // Re-export the wiring the board `self` shim needs (`TRANSPORT_LOCATOR`
+    // for the baked locator; `apply_transport_config` when the board owns the
+    // net stack) alongside the core API.
+    let reexports = if emits_transport_config_override(plan) {
+        "SYSTEM, TRANSPORT_LOCATOR, apply_transport_config, build_executor, register_all"
+    } else {
+        "SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all"
+    };
+    out.push_str(&format!("pub use nros_generated::{{{reexports}}};\n\n"));
 
     if !c_abi {
-        // Board self: Rust API only; the shim calls `register_all`.
+        // Board self: Rust API only; the shim calls `build_executor` +
+        // `register_all`.
         return out;
     }
 
@@ -578,6 +610,64 @@ fn render_hosted_shim_main(options: &GenerateOptions, _plan: &NrosPlan) -> Strin
          \x20   executor.spin_blocking(SpinOptions::default())\n\
          }}\n"
     )
+}
+
+/// Generated board `self` startup shim: a `#![no_std]` `main` driven by the
+/// board rlib's `run()` (hardware + transport bring-up), whose closure builds,
+/// registers, and spins the system via the entry lib's Rust API. Mirrors the
+/// hosted shim on the board entry pattern, replacing the legacy inlined
+/// `run_system`. The board self shim needs no C ABI.
+fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String {
+    let krate = crate_ident(&options.package_name);
+    let entry = profile(&plan.build.board, &plan.build.target)
+        .and_then(|p| p.board_entry)
+        .expect("render_board_shim_main: board_entry present (gated by emits_entry_lib)");
+    let apply_config = emits_transport_config_override(plan);
+    let cfg_expr = if apply_config {
+        format!(
+            "{{\n            let mut cfg = {b}::Config::default();\n\
+             \x20           {krate}::apply_transport_config(&mut cfg);\n\
+             \x20           cfg\n        }}",
+            b = entry.crate_name,
+        )
+    } else {
+        format!("{b}::Config::default()", b = entry.crate_name)
+    };
+
+    let mut out = String::new();
+    out.push_str("#![no_std]\n#![no_main]\n\n");
+    out.push_str(
+        "//! Generated board `self` startup shim (Phase 172 entry-lib). The board\n\
+         //! rlib's `run()` boots hardware, then the closure builds + registers +\n\
+         //! spins via the entry lib (`lib.rs`).\n\n",
+    );
+    out.push_str("use nros::prelude::*;\n");
+    out.push_str(&format!(
+        "use {krate}::{{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all}};\n"
+    ));
+    if !entry.crate_root_extra.is_empty() {
+        out.push_str(entry.crate_root_extra);
+        out.push('\n');
+    }
+    out.push('\n');
+    if !entry.comment.is_empty() {
+        out.push_str(entry.comment);
+        out.push('\n');
+    }
+    out.push_str(entry.signature);
+    out.push_str(&format!(
+        " {{\n    {b}::run(\n        {cfg_expr},\n        |board_config| -> core::result::Result<(), nros::NodeError> {{\n\
+         \x20           let config = ExecutorConfig::new(TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n\
+         \x20               .domain_id(board_config.domain_id)\n\
+         \x20               .node_name(SYSTEM.default_node_name()){extra};\n\
+         \x20           let mut executor = build_executor(&config)?;\n\
+         \x20           register_all(&mut executor)?;\n\
+         \x20           executor.spin_default()\n\
+         \x20       }},\n    )\n}}\n",
+        b = entry.crate_name,
+        extra = entry.closure_extra,
+    ));
+    out
 }
 
 /// Phase 172 WP-B — the cbindgen-shaped C header for the compiled-form entry
@@ -3258,7 +3348,9 @@ mod net_fragment_tests {
             "board lib is no_std:\n{lib}"
         );
         assert!(
-            lib.contains("pub use nros_generated::{SYSTEM, build_executor, register_all};"),
+            lib.contains(
+                "pub use nros_generated::{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all};"
+            ),
             "board lib exposes the Rust API:\n{lib}"
         );
         assert!(
