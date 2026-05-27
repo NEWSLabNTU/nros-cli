@@ -18,6 +18,9 @@ pub fn run(args: Args) -> Result<()> {
     if args.plan.extension().is_some_and(|e| e == "toml") {
         let cfg = WorkspaceConfig::load(&args.plan)?;
         let systems = cfg.systems.len() + usize::from(cfg.system.is_some());
+        if let Some(warning) = pending_routing_warning(&cfg) {
+            eprintln!("nros check: warning: {warning}");
+        }
         eprintln!(
             "nros check: ok ({} system(s), {} deploy target(s), {})",
             systems,
@@ -39,4 +42,45 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Phase 172 WP-B — warn when a root `nros.toml` declares `[[bridge]]` /
+/// `[[domain]]` groups: those parse + validate, but the planner does not yet
+/// bind nodes to per-session/per-domain sessions (no per-instance transport
+/// binding flows into the plan). Multi-session *opening* works (SESSION_SPECS +
+/// `open_multi`); the per-node *routing* does not. `None` ⇒ no such config ⇒ no
+/// warning. Returns the message so it stays unit-testable (the caller prints).
+fn pending_routing_warning(cfg: &WorkspaceConfig) -> Option<String> {
+    let all_systems = || cfg.system.iter().chain(cfg.systems.values());
+    let bridges: usize = all_systems().map(|s| s.bridge.len()).sum();
+    let domains: usize = all_systems().map(|s| s.domain.len()).sum();
+    (bridges > 0 || domains > 0).then(|| {
+        format!(
+            "{bridges} [[bridge]] + {domains} [[domain]] group(s) declared, but per-node session \
+             routing is not yet emitted (Phase 172 WP-B). Nodes still bind to the primary \
+             session; in-binary bridge/multi-domain routing is pending the planner's \
+             per-instance transport binding."
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_routing_warns_on_bridge_or_domain_else_silent() {
+        let plain: WorkspaceConfig =
+            toml::from_str("[workspace]\n[system]\nrmw = \"zenoh\"\n").unwrap();
+        assert!(pending_routing_warning(&plain).is_none());
+
+        let bridged: WorkspaceConfig = toml::from_str(
+            "[workspace]\n[system]\nrmw = \"zenoh\"\n\
+             [[system.bridge]]\nname = \"gw\"\n\
+             connect = [{ rmw = \"zenoh\", domain = 0 }, { rmw = \"cyclonedds\", domain = 0 }]\n",
+        )
+        .unwrap();
+        let msg = pending_routing_warning(&bridged).expect("bridge ⇒ warning");
+        assert!(msg.contains("1 [[bridge]]") && msg.contains("routing is not yet emitted"));
+    }
 }
