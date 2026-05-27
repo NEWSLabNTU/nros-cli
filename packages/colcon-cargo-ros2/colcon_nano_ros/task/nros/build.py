@@ -36,6 +36,40 @@ PLATFORM_TOOLCHAINS = {
     "zephyr": None,  # Zephyr uses west build
 }
 
+# Platform (build_type token) → NANO_ROS_PLATFORM CMake cache value.
+# Falls back to the token itself when unmapped.
+PLATFORM_CMAKE = {
+    "native": "posix",
+    "freertos": "freertos_armcm3",
+    "baremetal": "baremetal",
+    "nuttx": "nuttx",
+    "threadx": "threadx",
+    "zephyr": "zephyr",
+}
+
+# Canonical RMW backends. The orchestration `nros build` path is the
+# single source of truth for RMW (it reads `system.target.rmw` from the
+# plan; see orchestration/generate.rs). The standalone per-package colcon
+# task has no system config in scope, so it takes the RMW from the
+# `NANO_ROS_RMW` env var (default `zenoh`) — Phase 172.M, replacing the
+# former hardcoded `zenoh`.
+RMW_BACKENDS = ("zenoh", "xrce", "cyclonedds")
+
+
+def resolve_rmw():
+    """Resolve the RMW backend for a standalone colcon package build.
+
+    Reads ``NANO_ROS_RMW`` (default ``zenoh``); validates against
+    :data:`RMW_BACKENDS`. The orchestration ``nros build`` path does not
+    use this — it threads ``system.target.rmw`` from the plan.
+    """
+    rmw = os.environ.get("NANO_ROS_RMW", "zenoh")
+    if rmw not in RMW_BACKENDS:
+        raise ValueError(
+            f"NANO_ROS_RMW={rmw!r} not one of {RMW_BACKENDS}"
+        )
+    return rmw
+
 # SDK environment variables forwarded to CMake and Cargo builds.
 SDK_ENV_VARS = (
     "FREERTOS_DIR",
@@ -192,6 +226,12 @@ class NrosBuildTask(TaskExtensionPoint):
         if target:
             cmd.extend(["--target", target])
 
+        # Select the RMW from the single source (NANO_ROS_RMW env; Phase
+        # 172.M). nano-ros example/component crates expose mutually-exclusive
+        # `rmw-{zenoh,xrce,cyclonedds}` features with `default = ["rmw-zenoh"]`,
+        # so `--no-default-features --features rmw-<rmw>` selects exactly one.
+        cmd.extend(["--no-default-features", "--features", f"rmw-{resolve_rmw()}"])
+
         # Forward SDK environment variables for embedded platforms.
         # The board crate's build.rs reads these to locate FreeRTOS/lwIP/etc.
         env = dict(os.environ)
@@ -279,12 +319,20 @@ class NrosBuildTask(TaskExtensionPoint):
             str(pkg_path),
         ]
 
-        # Pass CMAKE_PREFIX_PATH for find_package(NanoRos)
+        # CMAKE_PREFIX_PATH is for third-party SDK find_package(); nano-ros is
+        # add_subdirectory (no find_package(NanoRos) since Phase 140).
         prefix_paths = [str(install_base.parent)]
         env_prefix = os.environ.get("CMAKE_PREFIX_PATH", "")
         if env_prefix:
             prefix_paths.append(env_prefix)
-        cmd.extend(["--", f"-DCMAKE_PREFIX_PATH={';'.join(prefix_paths)}"])
+        west_defs = [f"-DCMAKE_PREFIX_PATH={';'.join(prefix_paths)}"]
+
+        # Select the RMW Kconfig overlay (Phase 172.M): base prj.conf + the
+        # per-RMW overlay, the same shape the `just zephyr` recipes use. RMW
+        # from the single source (NANO_ROS_RMW env).
+        west_defs.append(f'-DCONF_FILE=prj.conf;prj-{resolve_rmw()}.conf')
+
+        cmd.extend(["--", *west_defs])
 
         rc = await run(self.context, cmd)
         if rc and rc.returncode != 0:
@@ -417,13 +465,21 @@ class NrosBuildTask(TaskExtensionPoint):
             f"-DCMAKE_INSTALL_PREFIX={install_base}",
         ]
 
-        # Pass CMAKE_PREFIX_PATH so find_package(NanoRos) works.
-        # Include both the colcon install prefix and any existing prefix path.
+        # Pass CMAKE_PREFIX_PATH for third-party SDK find_package() (CycloneDDS,
+        # NetX Duo, FreeRTOS-Kernel). nano-ros itself is consumed via
+        # add_subdirectory — there is no find_package(NanoRos) since Phase 140.
         prefix_paths = [str(install_base.parent)]
         env_prefix = os.environ.get("CMAKE_PREFIX_PATH", "")
         if env_prefix:
             prefix_paths.append(env_prefix)
         cmd.append(f"-DCMAKE_PREFIX_PATH={';'.join(prefix_paths)}")
+
+        # RMW + platform for the NanoRos CMake config. RMW comes from the
+        # single source (NANO_ROS_RMW env; Phase 172.M) instead of a hardcoded
+        # `zenoh`; platform from the parsed build_type token instead of a
+        # hardcoded `freertos_armcm3`.
+        cmd.append(f"-DNANO_ROS_RMW={resolve_rmw()}")
+        cmd.append(f"-DNANO_ROS_PLATFORM={PLATFORM_CMAKE.get(platform, platform)}")
 
         # Cross-compilation: pass toolchain file for embedded platforms.
         # The toolchain file is resolved from NROS_TOOLCHAIN_DIR env var
@@ -437,10 +493,6 @@ class NrosBuildTask(TaskExtensionPoint):
                 logger.warning(
                     f"Toolchain file '{toolchain_name}' not found — cross-compilation may fail"
                 )
-
-            # Pass RMW and platform to the NanoRos CMake config
-            cmd.append("-DNANO_ROS_RMW=zenoh")
-            cmd.append("-DNANO_ROS_PLATFORM=freertos_armcm3")
 
         # Forward SDK environment variables as CMake -D flags.
         # The CMake platform support module reads these.
