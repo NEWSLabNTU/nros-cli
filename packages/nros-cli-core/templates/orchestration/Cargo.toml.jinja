@@ -3,6 +3,11 @@ name = "{{ package_name }}"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+# Standalone: detach from any parent Cargo workspace, so the generated package
+# builds wherever it is emitted (e.g. a deploy `build/<name>/nros/generated`
+# dir nested under a workspace), not only in an isolated temp dir.
+[workspace]
 {{ lib_section }}
 [features]
 default = {{ default_features }}

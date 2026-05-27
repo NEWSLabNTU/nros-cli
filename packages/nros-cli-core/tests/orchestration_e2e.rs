@@ -1692,21 +1692,35 @@ fn temp_output(name: &str) -> PathBuf {
 /// Phase 172.U — the config-unification half of the cutover: the whole `self`
 /// deployment resolves from ONE root `nros.toml` via `nros deploy native` (no
 /// flag-driven build, no per-package system config) — `[workspace].default` →
-/// `[deploy.native]` → `[system]`, pin assert, var-set. Dry-run because the
-/// real build is blocked on a known gap: `nros deploy` does not yet collect
-/// component source metadata (no `--metadata` input, no auto-extraction via the
-/// 172.E `build_metadata` driver), so the metadata→plan step fails
-/// `missing-source-metadata`. See the 172.U note in the phase doc.
+/// `[deploy.native]` → `[system]`, then metadata (auto-built via the 172.E
+/// driver, WP-A `6bdd945`) → plan → compiled entry lib → self-shim binary.
 #[test]
 fn deploy_native_self_from_root_nros_toml() {
     let fixture = fixture_workspace();
+    let build = fixture.join("build");
+    let _ = fs::remove_dir_all(&build);
+
     deploy::run(deploy::Args {
         name: None, // exercise [workspace].default = "native"
         config: fixture.join("nros.toml"),
         nano_ros_workspace: Some(nano_ros_workspace()),
-        dry_run: true,
+        dry_run: false,
     })
-    .expect("nros deploy (default) resolves the self deploy from one root nros.toml");
+    .expect("nros deploy (default) builds the self deploy from one root nros.toml");
+
+    let debug = build
+        .join("native/nros/target")
+        .join("x86_64-unknown-linux-gnu")
+        .join("debug");
+    assert!(
+        debug.join("nros-native").is_file(),
+        "self-shim binary built"
+    );
+    assert!(
+        debug.join("libnros_native.a").is_file(),
+        "entry-lib staticlib built"
+    );
+    let _ = fs::remove_dir_all(&build);
 }
 
 /// Phase 172.V — the vendor-lib deploy template's `[deploy]` table resolves +

@@ -627,21 +627,32 @@ fn schema_build_json(overlays: &[Value]) -> Value {
 }
 
 fn schema_components(metadata: &[JsonArtifact]) -> Vec<Value> {
+    // Phase 172.U — dedup by component id: the same component's source metadata
+    // can reach the planner from more than one place (e.g. a collected copy in
+    // the build metadata dir + the in-package `metadata/` file a
+    // `component_nros.toml` declares), and they describe one component. Keep
+    // the first; identical duplicates would otherwise trip
+    // `duplicate-component-id`.
+    let mut seen = HashSet::new();
     metadata
         .iter()
-        .map(|artifact| {
+        .filter_map(|artifact| {
             let package = string_field(&artifact.value, &["package"]).unwrap_or("unknown");
             let component =
                 string_field(&artifact.value, &["component", "executable"]).unwrap_or("unknown");
+            let id = format!("{package}::{component}");
+            if !seen.insert(id.clone()) {
+                return None;
+            }
             let language = string_field(&artifact.value, &["language"]).unwrap_or("rust");
-            json!({
-                "id": format!("{package}::{component}"),
+            Some(json!({
+                "id": id,
                 "package": package,
                 "component": component,
                 "language": language,
                 "source_metadata": artifact.path.display().to_string(),
                 "component_config": null,
-            })
+            }))
         })
         .collect()
 }

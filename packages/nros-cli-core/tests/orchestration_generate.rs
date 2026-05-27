@@ -108,24 +108,35 @@ fn generated_package_writes_manifest_build_script_and_main() {
     assert!(!build_rs.contains("serde_json"));
     assert!(!build_rs.contains("nros_cli_core"));
 
+    // Phase 172 WP-B — the wiring moved into the entry lib, so it lives in the
+    // generated `nros_generated` module (emitted into build.rs), not main.rs.
+    assert!(build_rs.contains("pub fn build_executor("));
+    assert!(build_rs.contains("pub fn register_all("));
+
+    // Phase 172 WP-B — native/posix `self` is now the compiled-form entry lib:
+    // a thin `src/main.rs` shim over the lib's `build_executor` + `register_all`.
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
-    assert!(main_rs.contains("nros_generated::register_backends();"));
-    assert!(main_rs.contains("Executor::open"));
-    assert!(main_rs.contains("#[cfg(feature = \"std\")]"));
-    assert!(main_rs.contains("ExecutorConfig::from_env()"));
-    assert!(main_rs.contains("#[cfg(not(feature = \"std\"))]"));
-    assert!(main_rs.contains("ExecutorConfig::default_const()"));
-    assert!(main_rs.contains("create_sched_context(spec.to_nros_node())"));
-    assert!(main_rs.contains("instantiate_components"));
-    assert!(main_rs.contains("bind_handle_to_sched_context"));
-    assert!(main_rs.contains("spin_blocking(SpinOptions::default())"));
-    assert!(main_rs.contains("spin_default()"));
-    // Phase 173.2b — native/posix is the hosted `HostedMain` shape: a
-    // plain `fn main() -> Result<..>`, no `#![no_std]` and no board
-    // `run()` entry leaking in from a bare-metal platform.
     assert!(main_rs.contains("fn main() -> core::result::Result<(), nros::NodeError> {"));
+    assert!(main_rs.contains("use nros_generated_test::{SYSTEM, build_executor, register_all};"));
+    assert!(main_rs.contains("ExecutorConfig::from_env()"));
+    assert!(main_rs.contains("build_executor(&config)?"));
+    assert!(main_rs.contains("register_all(&mut executor)?"));
+    assert!(main_rs.contains("spin_blocking(SpinOptions::default())"));
+    // The wiring lives in the lib now, not main.
+    assert!(!main_rs.contains("nros_generated::register_backends();"));
     assert!(!main_rs.contains("#![no_std]"));
     assert!(!main_rs.contains("::run("));
+
+    // Phase 172 WP-B — src/lib.rs hosts the wiring + the `nros_<sys>_*` C ABI;
+    // Cargo.toml is a standalone `lib` + `staticlib` crate.
+    let lib_rs = fs::read_to_string(output_dir.join("src/lib.rs")).expect("read lib.rs");
+    assert!(lib_rs.contains("pub use nros_generated::{SYSTEM, build_executor, register_all};"));
+    // C ABI symbol prefix is the system name (`demo_system`), not the crate.
+    assert!(lib_rs.contains("pub extern \"C\" fn nros_demo_system_build_executor("));
+    assert!(lib_rs.contains("pub extern \"C\" fn nros_demo_system_register_all("));
+    assert!(cargo_toml.contains("[workspace]"));
+    assert!(cargo_toml.contains("crate-type = [\"lib\", \"staticlib\"]"));
+    assert!(output_dir.join("include/demo_system.h").is_file());
 }
 
 #[test]
@@ -268,12 +279,18 @@ fn bridge_two_transports_emit_open_multi_and_session_specs() {
         "per-transport specs:\n{build_rs}"
     );
 
-    // The entry opens via open_multi.
+    // Phase 172 WP-B — open_multi moved into the entry lib's
+    // `build_executor_bridge`; main.rs calls `run_system_bridge`, which routes
+    // through it.
+    assert!(
+        build_rs.contains("Executor::open_multi(&SESSION_SPECS)"),
+        "build_executor_bridge opens via open_multi:\n{build_rs}"
+    );
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
     assert!(
-        main_rs.contains("Executor::open_multi(&nros_generated::SESSION_SPECS)")
-            && main_rs.contains("run_system_bridge()"),
-        "bridge entry uses open_multi:\n{main_rs}"
+        main_rs.contains("run_system_bridge()")
+            && main_rs.contains("nros_generated::build_executor_bridge()"),
+        "bridge entry routes through build_executor_bridge:\n{main_rs}"
     );
 }
 
@@ -662,9 +679,15 @@ fn generated_package_emits_noop_lifecycle_when_unmanaged() {
         "unmanaged apply_lifecycle is a no-op:\n{build_rs}"
     );
     assert!(!build_rs.contains("register_lifecycle_services"));
+    // Phase 172 WP-B — apply_lifecycle is now invoked from register_all (in the
+    // entry lib), which the self shim calls.
+    assert!(
+        build_rs.contains("apply_lifecycle(executor)?;"),
+        "register_all invokes apply_lifecycle:\n{build_rs}"
+    );
 
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
-    assert!(main_rs.contains("nros_generated::apply_lifecycle(&mut executor)?;"));
+    assert!(main_rs.contains("register_all(&mut executor)?"));
 }
 
 /// Phase 172.A — a `[lifecycle] autostart = "active"` plan registers the
