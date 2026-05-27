@@ -180,8 +180,7 @@ use nros::prelude::*;";
 /// and hands it to `run_system`.
 const RUN_SYSTEM: &str = "\
 fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::NodeError> {
-    nros_generated::register_backends();
-    run_executor(Executor::open(&config)?)
+    run_executor(nros_generated::build_executor(&config)?)
 }
 
 fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeError> {
@@ -202,8 +201,7 @@ fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeEr
 /// then runs the same post-open flow as `run_system`.
 const RUN_SYSTEM_BRIDGE: &str = "\
 fn run_system_bridge() -> core::result::Result<(), nros::NodeError> {
-    nros_generated::register_backends();
-    run_executor(Executor::open_multi(&nros_generated::SESSION_SPECS)?)
+    run_executor(nros_generated::build_executor_bridge()?)
 }";
 
 /// Phase 173.2b — render the generated `src/main.rs` from the resolved
@@ -1985,16 +1983,40 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     }
     out.push_str("    Ok(())\n");
     out.push_str("}\n");
-    render_register_all_fn(&mut out);
+    render_entry_lib_fns(&mut out, plan);
     out
 }
 
-/// Phase 172 WP-B — emit `nros_generated::register_all`, the system-registration
-/// entry the entry-lib C ABI wraps. It runs the full post-open flow on an
-/// already-opened executor: create the plan's sched contexts, instantiate every
-/// node component, bind callbacks to their contexts, then apply lifecycle +
-/// parameter persistence. The per-platform entry (and a future vendor C caller)
-/// only opens the executor and spins; all wiring lives here.
+/// Phase 172 WP-B — emit the generated entry lib's Rust-native API: the
+/// `build_executor` openers and `register_all`. These are the units the
+/// entry-lib C ABI wraps; the per-platform entry (and a future vendor C caller)
+/// only calls them + spins.
+///
+/// * `build_executor(config)` — register backends + `Executor::open(config)`.
+/// * `build_executor_bridge()` — backends + `Executor::open_multi(SESSION_SPECS)`
+///   (emitted only in bridge mode).
+/// * `register_all(executor)` — the full post-open wiring on an already-opened
+///   executor: sched contexts → instantiate components → bind callbacks →
+///   lifecycle → parameter persistence.
+fn render_entry_lib_fns(out: &mut String, plan: &NrosPlan) {
+    out.push_str(
+        "\npub fn build_executor(config: &nros::ExecutorConfig<'_>) -> Result<nros::Executor, nros::NodeError> {\n",
+    );
+    out.push_str("    register_backends();\n");
+    out.push_str("    nros::Executor::open(config)\n");
+    out.push_str("}\n");
+    if plan.build.is_bridge() {
+        out.push_str(
+            "\npub fn build_executor_bridge() -> Result<nros::Executor, nros::NodeError> {\n",
+        );
+        out.push_str("    register_backends();\n");
+        out.push_str("    nros::Executor::open_multi(&SESSION_SPECS)\n");
+        out.push_str("}\n");
+    }
+    render_register_all_fn(out);
+}
+
+/// Emit `register_all` (see [`render_entry_lib_fns`]).
 fn render_register_all_fn(out: &mut String) {
     out.push_str(
         "\npub fn register_all(executor: &mut nros::Executor) -> Result<(), nros::NodeError> {\n",
