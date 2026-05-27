@@ -467,6 +467,9 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
     out.push_str(&format!(
         "//! (`nros_{sys}_*`) over an opaque heap-owned executor handle.\n\n"
     ));
+    // The heap-owned C-ABI handle boxes through `alloc` (not `std`) so the
+    // entry lib stays no_std-capable for board targets with an allocator.
+    out.push_str("extern crate alloc;\n\n");
     out.push_str("mod nros_generated {\n");
     out.push_str(
         "    core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));\n",
@@ -508,7 +511,7 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
          \x20   }};\n\
          \x20   if let Some(locator) = locator_override {{ config.locator = locator; }}\n\
          \x20   match nros_generated::build_executor(&config) {{\n\
-         \x20       Ok(executor) => ::std::boxed::Box::into_raw(::std::boxed::Box::new(executor)),\n\
+         \x20       Ok(executor) => alloc::boxed::Box::into_raw(alloc::boxed::Box::new(executor)),\n\
          \x20       Err(_) => core::ptr::null_mut(),\n\
          \x20   }}\n\
          }}\n\n"
@@ -538,7 +541,7 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
          #[unsafe(no_mangle)]\n\
          pub extern \"C\" fn nros_{sys}_destroy(executor: *mut nros::Executor) {{\n\
          \x20   if !executor.is_null() {{\n\
-         \x20       drop(unsafe {{ ::std::boxed::Box::from_raw(executor) }});\n\
+         \x20       drop(unsafe {{ alloc::boxed::Box::from_raw(executor) }});\n\
          \x20   }}\n\
          }}\n"
     ));
