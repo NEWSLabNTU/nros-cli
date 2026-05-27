@@ -460,22 +460,35 @@ fn emits_entry_lib(plan: &NrosPlan) -> bool {
 /// `nros_<sys>_*` C ABI over an opaque heap-owned `Executor` handle.
 fn render_entry_lib_rs(plan: &NrosPlan) -> String {
     let sys = system_ident(plan);
+    // Board targets compile the entry lib `#![no_std]`. The C ABI (a
+    // heap-owned executor handle) needs an allocator + std-style boxing, so
+    // it rides the std-hosted path; a board `self` shim calls the Rust API
+    // (`register_all`) directly and doesn't need it.
+    let no_std = !uses_std(&plan.build);
+    let c_abi = uses_std(&plan.build);
+
     let mut out = String::new();
+    if no_std {
+        out.push_str("#![no_std]\n\n");
+    }
     out.push_str("//! Generated nano-ros entry library (Phase 172 WP-B, compiled form).\n");
     out.push_str("//!\n//! Hosts the system wiring tables + the Rust-native entry API\n");
-    out.push_str("//! (`build_executor` / `register_all`) plus a granular C ABI\n");
-    out.push_str(&format!(
-        "//! (`nros_{sys}_*`) over an opaque heap-owned executor handle.\n\n"
-    ));
-    // The heap-owned C-ABI handle boxes through `alloc` (not `std`) so the
-    // entry lib stays no_std-capable for board targets with an allocator.
-    out.push_str("extern crate alloc;\n\n");
+    out.push_str("//! (`build_executor` / `register_all`).\n\n");
+    if c_abi {
+        // The heap-owned C-ABI handle boxes through `alloc` (not `std`).
+        out.push_str("extern crate alloc;\n\n");
+    }
     out.push_str("mod nros_generated {\n");
     out.push_str(
         "    core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));\n",
     );
     out.push_str("}\n\n");
     out.push_str("pub use nros_generated::{SYSTEM, build_executor, register_all};\n\n");
+
+    if !c_abi {
+        // Board self: Rust API only; the shim calls `register_all`.
+        return out;
+    }
 
     out.push_str("// --- Entry-lib C ABI (Phase 172 WP-B) ---\n\n");
     // Phase 172 WP-B — config lowering: the optional runtime `Config` override.
@@ -3216,12 +3229,49 @@ mod net_fragment_tests {
                 && lib.contains("config.locator = locator"),
             "{lib}"
         );
-        // The std-hosted native plan emits the entry lib (lib + staticlib).
+        // The std-hosted native plan emits the entry lib (lib + staticlib),
+        // with the C ABI + its alloc box, and is NOT no_std.
         assert!(emits_entry_lib(&plan), "native std-hosted ⇒ entry lib");
+        assert!(!lib.starts_with("#![no_std]"), "hosted lib is std:\n{lib}");
+        assert!(
+            lib.contains("extern crate alloc;"),
+            "hosted C ABI boxes via alloc"
+        );
         assert!(
             render_lib_section(&plan, "nros-e2e-generated")
                 .contains("crate-type = [\"lib\", \"staticlib\"]"),
             "entry-lib crate-type"
+        );
+    }
+
+    #[test]
+    fn entry_lib_board_shape_is_no_std_without_c_abi() {
+        // A board (no_std, no allocator) entry lib is `#![no_std]`, exposes the
+        // Rust API (`register_all`), and omits the C ABI + alloc (the board
+        // `self` shim calls `register_all` directly).
+        let mut plan = plan_with_param_persistence(None);
+        plan.build.board = "baremetal".to_string();
+        plan.build.target = "thumbv7m-none-eabi".to_string();
+        let lib = render_entry_lib_rs(&plan);
+        assert!(
+            lib.starts_with("#![no_std]\n"),
+            "board lib is no_std:\n{lib}"
+        );
+        assert!(
+            lib.contains("pub use nros_generated::{SYSTEM, build_executor, register_all};"),
+            "board lib exposes the Rust API:\n{lib}"
+        );
+        assert!(
+            !lib.contains("extern crate alloc"),
+            "no alloc on bare-metal:\n{lib}"
+        );
+        assert!(
+            !lib.contains("pub struct NrosConfig"),
+            "no C ABI on board self:\n{lib}"
+        );
+        assert!(
+            !lib.contains("nros_demo_build_executor"),
+            "no C-ABI fns:\n{lib}"
         );
     }
 
