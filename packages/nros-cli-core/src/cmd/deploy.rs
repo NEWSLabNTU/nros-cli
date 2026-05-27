@@ -235,6 +235,10 @@ fn emit_entry_lib(
         workspace: Some(root.to_path_buf()),
         out_dir: Some(paths.out_root.clone()),
         metadata: Vec::new(),
+        // A real deploy produces any missing component source-metadata via the
+        // metadata-mode build (172.E driver), using the same nano-ros workspace.
+        build: true,
+        nano_ros_workspace: Some(nano_ros.to_path_buf()),
     })
     .wrap_err("deploy: metadata step")?;
 

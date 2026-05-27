@@ -32,6 +32,8 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         workspace: Some(fixture.clone()),
         out_dir: Some(out_dir.clone()),
         metadata: vec![fixture.join("artifacts/talker.metadata.json")],
+        build: false,
+        nano_ros_workspace: None,
     })
     .expect("metadata command preserves fixture source metadata");
 

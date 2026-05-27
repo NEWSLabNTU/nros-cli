@@ -160,6 +160,8 @@ pub fn run(args: Args) -> Result<()> {
             workspace: Some(root.clone()),
             out_dir: Some(out_root.clone()),
             metadata: args.metadata.clone(),
+            build: false,
+            nano_ros_workspace: None,
         })
         .wrap_err("metadata step (one-shot build) failed")?;
 

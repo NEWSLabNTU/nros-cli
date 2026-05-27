@@ -20,6 +20,8 @@ fn orchestration_metadata_plan_check_commands_share_artifacts() {
         workspace: Some(root.clone()),
         out_dir: Some(out_dir.clone()),
         metadata: vec![root.join("talker.metadata.json")],
+        build: false,
+        nano_ros_workspace: None,
     })
     .expect("metadata command preserves source metadata");
 
@@ -167,6 +169,8 @@ deadline_policy = "warn"
         workspace: Some(root.clone()),
         out_dir: Some(out_dir.clone()),
         metadata: vec![root.join("talker.metadata.json")],
+        build: false,
+        nano_ros_workspace: None,
     })
     .expect("metadata command preserves source metadata");
 
@@ -231,6 +235,8 @@ fn orchestration_plan_models_managed_lifecycle_from_nros_toml() {
         workspace: Some(root.clone()),
         out_dir: Some(out_dir.clone()),
         metadata: vec![root.join("talker.metadata.json")],
+        build: false,
+        nano_ros_workspace: None,
     })
     .expect("metadata command preserves source metadata");
 
@@ -385,6 +391,8 @@ remaps = []
         workspace: Some(root.clone()),
         out_dir: Some(out_dir),
         metadata: Vec::new(),
+        build: false,
+        nano_ros_workspace: None,
     })
     .expect_err("metadata command flags missing component export");
     let msg = format!("{err:?}");
