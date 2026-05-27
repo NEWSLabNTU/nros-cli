@@ -29,6 +29,9 @@ pub fn run(args: Args) -> Result<()> {
 
     let report = check_plan_file(&args.plan)?;
     if report.errors == 0 {
+        for message in &report.messages {
+            eprintln!("nros check: warning: {message}");
+        }
         eprintln!(
             "nros check: ok ({} warning(s), {})",
             report.warnings,

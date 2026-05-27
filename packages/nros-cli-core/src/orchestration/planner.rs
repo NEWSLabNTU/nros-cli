@@ -39,6 +39,8 @@ pub struct PlanningOutput {
 pub struct CheckReport {
     pub errors: usize,
     pub warnings: usize,
+    /// Phase 172 WP-B — the warning messages (len == `warnings`).
+    pub messages: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,10 +159,59 @@ pub fn check_plan_file(path: &Path) -> Result<CheckReport> {
             errors.join("; ")
         ));
     }
+    let messages = collect_plan_warnings(&plan);
     Ok(CheckReport {
         errors: 0,
-        warnings: 0,
+        warnings: messages.len(),
+        messages,
     })
+}
+
+/// Phase 172 WP-B (slice 4) — non-fatal plan warnings. Today: the in-binary
+/// RMW-set feasibility check. A bridge that links more than one RMW backend
+/// into a single binary (`build.rmw` is effectively a *set* across
+/// `[[transport]]` entries) is supported on hosted / gateway-Linux targets,
+/// but typically cannot link on an embedded target — warn rather than fail so
+/// the user can confirm the target really does provide every backend.
+fn collect_plan_warnings(plan: &NrosPlan) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let rmws = linked_rmw_set(&plan.build);
+    if rmws.len() > 1 && !plan_target_is_hosted(&plan.build) {
+        warnings.push(format!(
+            "target `{}` links {} RMW backends ({}) into one binary; cross-RMW \
+             in-binary bridging is supported on hosted/gateway targets but may not \
+             link on this embedded target",
+            plan.build.target,
+            rmws.len(),
+            rmws.iter().copied().collect::<Vec<_>>().join(", "),
+        ));
+    }
+    warnings
+}
+
+/// The distinct RMW backends linked into the binary: each `[[transport]]`'s
+/// `rmw` (falling back to `build.rmw`), or just `build.rmw` for a zero-config
+/// single-transport build.
+fn linked_rmw_set(build: &PlanBuildOptions) -> std::collections::BTreeSet<&str> {
+    let mut set = std::collections::BTreeSet::new();
+    if build.transports.is_empty() {
+        set.insert(build.rmw.as_str());
+    } else {
+        for transport in &build.transports {
+            set.insert(transport.rmw.as_deref().unwrap_or(build.rmw.as_str()));
+        }
+    }
+    set
+}
+
+/// Whether the build target is a hosted (OS-backed) target — where linking
+/// multiple RMW backends into one process is routine.
+fn plan_target_is_hosted(build: &PlanBuildOptions) -> bool {
+    matches!(build.board.as_str(), "native" | "posix")
+        || build.target.contains("linux")
+        || build.target.contains("darwin")
+        || build.target.contains("apple")
+        || build.target.contains("windows")
 }
 
 fn validate_plan(plan: &NrosPlan) -> Vec<String> {
@@ -2720,6 +2771,66 @@ topics:
 
         let err = check_plan_file(&plan_path).unwrap_err().to_string();
         assert!(err.contains("missing-sched-context"), "{err}");
+    }
+
+    #[test]
+    fn rmw_set_feasibility_warns_on_embedded_multi_rmw_only() {
+        // Phase 172 WP-B slice 4 — `nros check` warns when >1 RMW links into one
+        // embedded binary; hosted multi-RMW + single-RMW are silent.
+        let root = temp_workspace("nros-rmw-set-feasibility");
+        fs::create_dir_all(&root).unwrap();
+        let plan = |board: &str, target: &str, rmws: &[&str]| -> Value {
+            let transports: Vec<Value> = rmws
+                .iter()
+                .map(|r| json!({ "kind": "ethernet", "rmw": r }))
+                .collect();
+            json!({
+                "version": 2, "system": "s",
+                "trace": { "system_config": "nros.toml", "launch_record": "r", "generated_by": "t" },
+                "components": [], "instances": [], "interfaces": [], "sched_contexts": [],
+                "build": {
+                    "target": target, "board": board, "rmw": "zenoh",
+                    "profile": "release", "features": [], "cfg": {}, "transports": transports
+                }
+            })
+        };
+        let check = |value: Value, name: &str| -> CheckReport {
+            let path = root.join(name);
+            fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+            check_plan_file(&path).unwrap()
+        };
+
+        let embedded_multi = check(
+            plan("freertos", "thumbv7m-none-eabi", &["zenoh", "cyclonedds"]),
+            "embedded-multi.json",
+        );
+        assert_eq!(embedded_multi.warnings, 1, "{:?}", embedded_multi.messages);
+        assert!(
+            embedded_multi.messages[0].contains("RMW backends")
+                && embedded_multi.messages[0].contains("cyclonedds"),
+            "{:?}",
+            embedded_multi.messages
+        );
+
+        let hosted_multi = check(
+            plan(
+                "native",
+                "x86_64-unknown-linux-gnu",
+                &["zenoh", "cyclonedds"],
+            ),
+            "hosted-multi.json",
+        );
+        assert_eq!(hosted_multi.warnings, 0, "{:?}", hosted_multi.messages);
+
+        let embedded_single = check(
+            plan("freertos", "thumbv7m-none-eabi", &["zenoh"]),
+            "embedded-single.json",
+        );
+        assert_eq!(
+            embedded_single.warnings, 0,
+            "{:?}",
+            embedded_single.messages
+        );
     }
 
     #[cfg(feature = "play-launch-parser")]
