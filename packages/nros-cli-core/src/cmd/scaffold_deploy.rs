@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use eyre::{Result, WrapErr, bail};
+use eyre::{Result, WrapErr, bail, eyre};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::orchestration::root_config::{DeployKind, WorkspaceConfig};
@@ -20,6 +20,13 @@ pub struct DeployScaffold {
     pub kind: DeployKind,
     pub target: Option<String>,
     pub board: Option<String>,
+    /// `--from-launch <path>`: also set the root `[system].launch` (bootstrap
+    /// the system + deploy together).
+    pub from_launch: Option<String>,
+    /// `--from-profile <name>`: base the new target on an existing
+    /// `[deploy.<name>]` (fork its kind/target/vendor/build), under a fresh
+    /// `self` dir.
+    pub from_profile: Option<String>,
     /// Workspace root holding the root `nros.toml`.
     pub root: PathBuf,
     pub force: bool,
@@ -48,8 +55,29 @@ pub fn scaffold_deploy(s: &DeployScaffold) -> Result<()> {
             root_toml.display()
         );
     }
+    // `--from-launch`: bootstrap the root `[system].launch` alongside the deploy.
+    if let Some(launch) = &s.from_launch {
+        if doc.get("systems").is_some() {
+            bail!(
+                "--from-launch: this workspace uses [systems.<name>] — set each \
+                 system's `launch` manually"
+            );
+        }
+        doc["system"]["launch"] = value(launch.clone());
+    }
+
     let self_rel = format!("deploy/{}", s.name);
-    write_deploy_table(&mut doc, s, &self_rel);
+    // `--from-profile`: fork an existing target; else build a fresh table. The
+    // *effective* kind (which drives the code-dir scaffold) comes from the
+    // forked profile when cloning.
+    let effective_kind = match &s.from_profile {
+        Some(from) => clone_profile(&mut doc, s, from, &self_rel)?,
+        None => {
+            write_deploy_table(&mut doc, s, &self_rel);
+            s.kind
+        }
+    };
+
     // Validate the result before writing it back, so a scaffold never leaves an
     // invalid root file.
     let merged: WorkspaceConfig =
@@ -60,18 +88,18 @@ pub fn scaffold_deploy(s: &DeployScaffold) -> Result<()> {
     std::fs::write(&root_toml, doc.to_string())
         .wrap_err_with(|| format!("write {}", root_toml.display()))?;
 
-    // 2. Drop the deploy code dir (vendor kinds only; self is generated).
-    if s.kind != DeployKind::Self_ {
-        scaffold_dir(s, &self_rel)?;
+    // Drop the deploy code dir (vendor kinds only; self is generated).
+    if effective_kind != DeployKind::Self_ {
+        scaffold_dir(s, effective_kind, &self_rel)?;
     }
 
     eprintln!(
         "nros new --deploy: added [deploy.{}] (kind={}) to {}",
         s.name,
-        s.kind.as_str(),
+        effective_kind.as_str(),
         root_toml.display()
     );
-    if s.kind != DeployKind::Self_ {
+    if effective_kind != DeployKind::Self_ {
         eprintln!(
             "  scaffolded {}/ — fill the TODO vendor steps, then `nros deploy {}`",
             self_rel, s.name
@@ -80,6 +108,50 @@ pub fn scaffold_deploy(s: &DeployScaffold) -> Result<()> {
         eprintln!("  `nros deploy {}` (or `nros build {}`)", s.name, s.name);
     }
     Ok(())
+}
+
+/// Fork an existing `[deploy.<from>]` into `[deploy.<name>]`: clone its table,
+/// repoint `self` at the new code dir, and return the forked kind.
+fn clone_profile(
+    doc: &mut DocumentMut,
+    s: &DeployScaffold,
+    from: &str,
+    self_rel: &str,
+) -> Result<DeployKind> {
+    let base = doc
+        .get("deploy")
+        .and_then(|d| d.get(from))
+        .and_then(|i| i.as_table())
+        .ok_or_else(|| eyre!("--from-profile: no [deploy.{from}] to fork"))?
+        .clone();
+    let kind = base
+        .get("kind")
+        .and_then(|i| i.as_str())
+        .and_then(kind_from_str)
+        .unwrap_or(s.kind);
+
+    let mut forked = base;
+    // The fork owns its own code dir (build[] steps use {self}, so they carry over).
+    if kind != DeployKind::Self_ {
+        forked["self"] = value(self_rel);
+    }
+    let deploy = doc
+        .entry("deploy")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let deploy = deploy.as_table_mut().expect("[deploy] must be a table");
+    deploy.set_implicit(true);
+    deploy.remove(&s.name);
+    deploy.insert(&s.name, Item::Table(forked));
+    Ok(kind)
+}
+
+fn kind_from_str(s: &str) -> Option<DeployKind> {
+    match s {
+        "self" => Some(DeployKind::Self_),
+        "vendor-lib" => Some(DeployKind::VendorLib),
+        "vendor-module" => Some(DeployKind::VendorModule),
+        _ => None,
+    }
 }
 
 /// Build the `[deploy.<name>]` table programmatically (toml_edit preserves the
@@ -137,7 +209,7 @@ fn arr(items: &[&str]) -> Array {
     a
 }
 
-fn scaffold_dir(s: &DeployScaffold, self_rel: &str) -> Result<()> {
+fn scaffold_dir(s: &DeployScaffold, kind: DeployKind, self_rel: &str) -> Result<()> {
     let dir = s.root.join(self_rel);
     std::fs::create_dir_all(&dir).wrap_err_with(|| format!("create {}", dir.display()))?;
 
@@ -147,11 +219,11 @@ fn scaffold_dir(s: &DeployScaffold, self_rel: &str) -> Result<()> {
          nano-ros generates the wiring entry lib; this dir holds the vendor-side\n\
          glue. Fill the TODO `build`/`package` steps in the root `nros.toml`.\n",
         name = s.name,
-        kind = s.kind.as_str(),
+        kind = kind.as_str(),
     );
     write_if_absent(&dir.join("README.md"), &readme, s.force)?;
 
-    match s.kind {
+    match kind {
         DeployKind::VendorLib => {
             write_if_absent(&dir.join("startup.rs"), STARTUP_STUB, s.force)?;
         }
@@ -237,6 +309,8 @@ mod tests {
             kind: DeployKind::VendorModule,
             target: Some("zephyr".into()),
             board: Some("nucleo_h753zi".into()),
+            from_launch: None,
+            from_profile: None,
             root: root.clone(),
             force: false,
         })
@@ -262,6 +336,8 @@ mod tests {
             kind: DeployKind::Self_,
             target: Some("x86_64-unknown-linux-gnu".into()),
             board: None,
+            from_launch: None,
+            from_profile: None,
             root: root.clone(),
             force: false,
         })
@@ -282,6 +358,8 @@ mod tests {
             kind: DeployKind::Self_,
             target: Some("x86_64-unknown-linux-gnu".into()),
             board: None,
+            from_launch: None,
+            from_profile: None,
             root: root.clone(),
             force: false,
         })
@@ -291,6 +369,8 @@ mod tests {
             kind: DeployKind::VendorModule,
             target: Some("zephyr".into()),
             board: Some("brd".into()),
+            from_launch: None,
+            from_profile: None,
             root: root.clone(),
             force: false,
         })
@@ -313,12 +393,93 @@ mod tests {
             kind: DeployKind::Self_,
             target: Some("t".into()),
             board: None,
+            from_launch: None,
+            from_profile: None,
             root: root.clone(),
             force,
         };
         scaffold_deploy(&mk(false)).unwrap();
         assert!(scaffold_deploy(&mk(false)).is_err());
         scaffold_deploy(&mk(true)).expect("force overwrites");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn from_launch_sets_system_launch() {
+        let root = temp_ws("nros-scaffold-launch");
+        scaffold_deploy(&DeployScaffold {
+            name: "native".into(),
+            kind: DeployKind::Self_,
+            target: Some("x86_64-unknown-linux-gnu".into()),
+            board: None,
+            from_launch: Some("launch/sys.launch.xml".into()),
+            from_profile: None,
+            root: root.clone(),
+            force: false,
+        })
+        .expect("scaffold");
+
+        let cfg = reload(&root);
+        assert_eq!(
+            cfg.system.as_ref().unwrap().launch.as_deref(),
+            Some("launch/sys.launch.xml")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn from_profile_forks_an_existing_target() {
+        let root = temp_ws("nros-scaffold-fork");
+        // seed a vendor-module profile.
+        scaffold_deploy(&DeployScaffold {
+            name: "mcu".into(),
+            kind: DeployKind::VendorModule,
+            target: Some("zephyr".into()),
+            board: Some("brd".into()),
+            from_launch: None,
+            from_profile: None,
+            root: root.clone(),
+            force: false,
+        })
+        .unwrap();
+        // fork it.
+        scaffold_deploy(&DeployScaffold {
+            name: "mcu2".into(),
+            kind: DeployKind::Self_, // ignored — forked kind wins
+            target: None,
+            board: None,
+            from_launch: None,
+            from_profile: Some("mcu".into()),
+            root: root.clone(),
+            force: false,
+        })
+        .expect("fork");
+
+        let cfg = reload(&root);
+        let forked = &cfg.deploy["mcu2"];
+        assert_eq!(forked.kind, DeployKind::VendorModule); // inherited
+        assert_eq!(forked.board.as_deref(), Some("brd")); // inherited
+        assert_eq!(forked.self_dir.as_deref(), Some("deploy/mcu2")); // own dir
+        assert!(root.join("deploy/mcu2/CMakeLists.txt").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn from_profile_errors_on_missing_base() {
+        let root = temp_ws("nros-scaffold-fork-miss");
+        let err = scaffold_deploy(&DeployScaffold {
+            name: "x".into(),
+            kind: DeployKind::Self_,
+            target: Some("t".into()),
+            board: None,
+            from_launch: None,
+            from_profile: Some("ghost".into()),
+            root: root.clone(),
+            force: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no [deploy.ghost]"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -335,6 +496,8 @@ mod tests {
             kind: DeployKind::Self_,
             target: None,
             board: None,
+            from_launch: None,
+            from_profile: None,
             root: root.clone(),
             force: false,
         })

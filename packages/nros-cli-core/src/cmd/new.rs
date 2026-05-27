@@ -56,6 +56,14 @@ pub struct Args {
     #[arg(long)]
     pub board: Option<String>,
 
+    /// Deploy mode: also set the root `[system].launch` (bootstrap)
+    #[arg(long)]
+    pub from_launch: Option<String>,
+
+    /// Deploy mode: fork an existing `[deploy.<name>]` profile
+    #[arg(long)]
+    pub from_profile: Option<String>,
+
     /// Overwrite an existing directory / `[deploy.<name>]` table
     #[arg(long)]
     pub force: bool,
@@ -75,6 +83,8 @@ pub fn run(args: Args) -> Result<()> {
             kind,
             target: args.target,
             board: args.board,
+            from_launch: args.from_launch,
+            from_profile: args.from_profile,
             root: std::env::current_dir()?,
             force: args.force,
         });
