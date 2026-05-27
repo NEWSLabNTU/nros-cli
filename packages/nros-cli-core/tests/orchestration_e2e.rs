@@ -129,6 +129,27 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         binary.display()
     );
 
+    // Phase 172 WP-B — the compiled-form entry lib: a staticlib + C header
+    // ship alongside the self-shim binary, exporting the `nros_<sys>_*` C ABI.
+    let staticlib = out_dir
+        .join("target")
+        .join(&plan.build.target)
+        .join("debug")
+        .join("libnros_e2e_generated.a");
+    assert!(
+        staticlib.is_file(),
+        "entry-lib staticlib at {}",
+        staticlib.display()
+    );
+    let header = generated_dir.join("include/e2e_system.h");
+    let header_src = fs::read_to_string(&header)
+        .unwrap_or_else(|e| panic!("read entry header {}: {e}", header.display()));
+    assert!(
+        header_src.contains("NrosExecutor *nros_e2e_system_build_executor(const void *cfg);")
+            && header_src.contains("int32_t nros_e2e_system_register_all(NrosExecutor *executor);"),
+        "entry header declares the C ABI:\n{header_src}"
+    );
+
     let port = free_local_port();
     let _zenohd = start_zenohd(port);
     assert_generated_binary_spins(&binary, port);

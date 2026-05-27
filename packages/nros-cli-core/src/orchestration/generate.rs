@@ -76,6 +76,26 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         let prj_conf = render_zephyr_prj_conf(&plan);
         write_if_changed(&options.output_dir.join("CMakeLists.txt"), &cmake)?;
         write_if_changed(&options.output_dir.join("prj.conf"), &prj_conf)?;
+    } else if emits_entry_lib(&plan) {
+        // Phase 172 WP-B — compiled-form entry lib: the wiring + C ABI live in
+        // `src/lib.rs` (a `lib` + `staticlib` crate), `src/main.rs` is a thin
+        // `self` shim, and `include/<sys>.h` declares the C ABI.
+        write_if_changed(&src_dir.join("lib.rs"), &render_entry_lib_rs(&plan))?;
+        write_if_changed(
+            &src_dir.join("main.rs"),
+            &render_hosted_shim_main(options, &plan),
+        )?;
+        let include_dir = options.output_dir.join("include");
+        fs::create_dir_all(&include_dir).wrap_err_with(|| {
+            format!(
+                "failed to create generated package include dir {}",
+                include_dir.display()
+            )
+        })?;
+        write_if_changed(
+            &include_dir.join(format!("{}.h", system_ident(&plan))),
+            &render_entry_header(&plan),
+        )?;
     } else {
         write_if_changed(&src_dir.join("main.rs"), &render_main(&plan))?;
     }
@@ -111,7 +131,10 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
 fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
     CARGO_TEMPLATE
         .replace("{{ package_name }}", &options.package_name)
-        .replace("{{ lib_section }}", &render_lib_section(plan))
+        .replace(
+            "{{ lib_section }}",
+            &render_lib_section(plan, &options.package_name),
+        )
         .replace(
             "{{ default_features }}",
             &toml_string_array(&generated_default_features(
@@ -142,13 +165,22 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
 /// `rustapp` (its CMakeLists.txt hard-codes the link line against
 /// `libstaticlib.a → librustapp.a`). Every other platform stays a
 /// regular binary crate.
-fn render_lib_section(plan: &NrosPlan) -> String {
-    match profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind) {
-        Some(EntryKind::ZephyrStaticlib) => {
-            "\n[lib]\nname = \"rustapp\"\ncrate-type = [\"staticlib\"]\n".to_string()
-        }
-        _ => String::new(),
+fn render_lib_section(plan: &NrosPlan, package_name: &str) -> String {
+    if matches!(
+        profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
+        Some(EntryKind::ZephyrStaticlib)
+    ) {
+        return "\n[lib]\nname = \"rustapp\"\ncrate-type = [\"staticlib\"]\n".to_string();
     }
+    // Phase 172 WP-B — compiled-form entry lib: a `lib` (for the self shim bin
+    // to call) + `staticlib` (for vendor linking) crate.
+    if emits_entry_lib(plan) {
+        return format!(
+            "\n[lib]\nname = \"{}\"\ncrate-type = [\"lib\", \"staticlib\"]\n",
+            crate_ident(package_name)
+        );
+    }
+    String::new()
 }
 
 /// Phase 126.M5.zephyr — zephyr-lang-rust requires `zephyr-build`
@@ -381,6 +413,146 @@ const HOSTED_MAIN_BRIDGE: &str = "\
 fn main() -> core::result::Result<(), nros::NodeError> {
     run_system_bridge()
 }";
+
+/// Phase 172 WP-B — the generated package's Rust crate identifier (its `[lib]`
+/// name): the package name with every non-alphanumeric char folded to `_`.
+fn crate_ident(package_name: &str) -> String {
+    package_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Phase 172 WP-B — the system identifier in the entry-lib C ABI symbol prefix
+/// + header name: `plan.system` lowercased, non-alphanumeric → `_`.
+fn system_ident(plan: &NrosPlan) -> String {
+    plan.system
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Phase 172 WP-B — emit the two-form entry lib (compiled form) instead of a
+/// bare `main`: a `src/lib.rs` exposing the Rust-native API + the C ABI
+/// (`crate-type = ["lib", "staticlib"]`) plus a thin `src/main.rs` self shim.
+///
+/// Scoped this slice to **std-hosted, non-bridge `self`** targets
+/// (native/posix/linux) — the form the `orchestration_e2e` fixture builds +
+/// boots. Board, Zephyr, no_std-hosted, and bridge entries keep their current
+/// emitter until later WP-B slices generalize the lib + add the source form.
+fn emits_entry_lib(plan: &NrosPlan) -> bool {
+    matches!(
+        profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
+        Some(EntryKind::HostedMain)
+    ) && uses_std(&plan.build)
+        && !plan.build.is_bridge()
+}
+
+/// Phase 172 WP-B — `src/lib.rs` for the compiled-form entry lib: hosts the
+/// generated wiring tables, re-exports the Rust-native API, and defines the
+/// `nros_<sys>_*` C ABI over an opaque heap-owned `Executor` handle.
+fn render_entry_lib_rs(plan: &NrosPlan) -> String {
+    let sys = system_ident(plan);
+    let mut out = String::new();
+    out.push_str("//! Generated nano-ros entry library (Phase 172 WP-B, compiled form).\n");
+    out.push_str("//!\n//! Hosts the system wiring tables + the Rust-native entry API\n");
+    out.push_str("//! (`build_executor` / `register_all`) plus a granular C ABI\n");
+    out.push_str(&format!(
+        "//! (`nros_{sys}_*`) over an opaque heap-owned executor handle.\n\n"
+    ));
+    out.push_str("mod nros_generated {\n");
+    out.push_str(
+        "    core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));\n",
+    );
+    out.push_str("}\n\n");
+    out.push_str("pub use nros_generated::{SYSTEM, build_executor, register_all};\n\n");
+
+    out.push_str("// --- Entry-lib C ABI (Phase 172 WP-B) ---\n\n");
+    out.push_str(&format!(
+        "/// Build the system executor; `_cfg` override is reserved for config\n\
+         /// lowering (NULL ⇒ env/baked). Heap-owned — free with `nros_{sys}_destroy`;\n\
+         /// returns NULL on error.\n\
+         #[unsafe(no_mangle)]\n\
+         pub extern \"C\" fn nros_{sys}_build_executor(_cfg: *const core::ffi::c_void) -> *mut nros::Executor {{\n\
+         \x20   let config = nros::ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());\n\
+         \x20   match nros_generated::build_executor(&config) {{\n\
+         \x20       Ok(executor) => ::std::boxed::Box::into_raw(::std::boxed::Box::new(executor)),\n\
+         \x20       Err(_) => core::ptr::null_mut(),\n\
+         \x20   }}\n\
+         }}\n\n"
+    ));
+    out.push_str(&format!(
+        "/// Register sched contexts + every node + lifecycle + param persistence.\n\
+         #[unsafe(no_mangle)]\n\
+         pub extern \"C\" fn nros_{sys}_register_all(executor: *mut nros::Executor) -> i32 {{\n\
+         \x20   match unsafe {{ executor.as_mut() }} {{\n\
+         \x20       Some(executor) => match nros_generated::register_all(executor) {{ Ok(()) => 0, Err(_) => -1 }},\n\
+         \x20       None => -1,\n\
+         \x20   }}\n\
+         }}\n\n"
+    ));
+    out.push_str(&format!(
+        "/// Spin the executor (blocking) until shutdown.\n\
+         #[unsafe(no_mangle)]\n\
+         pub extern \"C\" fn nros_{sys}_spin(executor: *mut nros::Executor) -> i32 {{\n\
+         \x20   match unsafe {{ executor.as_mut() }} {{\n\
+         \x20       Some(executor) => match executor.spin_blocking(nros::SpinOptions::default()) {{ Ok(()) => 0, Err(_) => -1 }},\n\
+         \x20       None => -1,\n\
+         \x20   }}\n\
+         }}\n\n"
+    ));
+    out.push_str(&format!(
+        "/// Free an executor returned by `nros_{sys}_build_executor`.\n\
+         #[unsafe(no_mangle)]\n\
+         pub extern \"C\" fn nros_{sys}_destroy(executor: *mut nros::Executor) {{\n\
+         \x20   if !executor.is_null() {{\n\
+         \x20       drop(unsafe {{ ::std::boxed::Box::from_raw(executor) }});\n\
+         \x20   }}\n\
+         }}\n"
+    ));
+    out
+}
+
+/// Phase 172 WP-B — the thin `self` startup shim `src/main.rs`: opens +
+/// registers the system through the entry lib, then spins. All wiring lives in
+/// `lib.rs`; the shim only exists so a `self` deploy produces a runnable binary.
+fn render_hosted_shim_main(options: &GenerateOptions, _plan: &NrosPlan) -> String {
+    let krate = crate_ident(&options.package_name);
+    format!(
+        "//! Generated `self` startup shim (Phase 172 WP-B). All wiring lives in the\n\
+         //! entry lib (`lib.rs`); this only opens + registers + spins.\n\n\
+         use nros::prelude::*;\n\
+         use {krate}::{{SYSTEM, build_executor, register_all}};\n\n\
+         fn main() -> core::result::Result<(), nros::NodeError> {{\n\
+         \x20   let config = ExecutorConfig::from_env().node_name(SYSTEM.default_node_name());\n\
+         \x20   let mut executor = build_executor(&config)?;\n\
+         \x20   register_all(&mut executor)?;\n\
+         \x20   executor.spin_blocking(SpinOptions::default())\n\
+         }}\n"
+    )
+}
+
+/// Phase 172 WP-B — the cbindgen-shaped C header for the compiled-form entry
+/// lib. Emitted directly (the ABI is fixed + known at generation time, so no
+/// build-time cbindgen scan is needed); names the opaque handle `NrosExecutor`
+/// to match `nros-c`.
+fn render_entry_header(plan: &NrosPlan) -> String {
+    let sys = system_ident(plan);
+    let guard = format!("NROS_ENTRY_{}_H", sys.to_uppercase());
+    format!(
+        "/* Generated nano-ros entry-lib C ABI (Phase 172 WP-B). Do not edit. */\n\
+         #ifndef {guard}\n#define {guard}\n\n#include <stdint.h>\n\n\
+         #ifdef __cplusplus\nextern \"C\" {{\n#endif\n\n\
+         /* Opaque executor handle (as in nros-c). */\n\
+         typedef struct NrosExecutor NrosExecutor;\n\n\
+         NrosExecutor *nros_{sys}_build_executor(const void *cfg);\n\
+         int32_t nros_{sys}_register_all(NrosExecutor *executor);\n\
+         int32_t nros_{sys}_spin(NrosExecutor *executor);\n\
+         void nros_{sys}_destroy(NrosExecutor *executor);\n\n\
+         #ifdef __cplusplus\n}}\n#endif\n\n#endif /* {guard} */\n"
+    )
+}
 
 /// Render the `<board>::run(..)` entry for a board-driven platform. The
 /// `ExecutorConfig` builder chain is identical across boards apart from
