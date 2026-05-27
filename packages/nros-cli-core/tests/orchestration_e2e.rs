@@ -79,6 +79,7 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         system_package: Some("nros-e2e-generated".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: false,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -92,6 +93,12 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
 
     assert!(generated_dir.join("Cargo.toml").is_file());
     assert!(generated_dir.join("src/main.rs").is_file());
+    // Phase 172.D — a successful generation drops a staleness stamp so the
+    // next build with an unchanged plan + generator skips regeneration.
+    assert!(
+        generated_dir.join(".nros-build-stamp").is_file(),
+        "172.D build stamp written after generation"
+    );
     for lang in ["rust", "c", "cpp"] {
         let manifest_path = out_dir.join("interfaces").join(lang).join("manifest.json");
         let manifest: Value = serde_json::from_str(
@@ -145,6 +152,7 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
         system_package: Some("nros-e2e-generated-multi".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: false,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -194,6 +202,7 @@ fn fixture_workspace_builds_and_boots_generated_freertos_package() {
         system_package: Some("nros-e2e-generated-freertos".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: false,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -268,6 +277,7 @@ fn fixture_workspace_builds_generated_nuttx_package() {
         system_package: Some("nros-e2e-generated-nuttx".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: true,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -333,6 +343,7 @@ fn fixture_workspace_builds_generated_esp32_package() {
         system_package: Some("nros-e2e-generated-esp32".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: true,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -561,6 +572,7 @@ fn fixture_workspace_builds_generated_threadx_riscv64_package() {
         system_package: Some("nros-e2e-generated-threadx-riscv64".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: true,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -618,6 +630,7 @@ fn fixture_workspace_builds_generated_stm32f4_package() {
         system_package: Some("nros-e2e-generated-stm32f4".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: true,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -675,6 +688,7 @@ fn fixture_workspace_builds_generated_bare_metal_package() {
         system_package: Some("nros-e2e-generated-bare-metal".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: true,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -732,6 +746,7 @@ fn fixture_workspace_builds_generated_threadx_linux_package() {
         system_package: Some("nros-e2e-generated-threadx-linux".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: true,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -849,6 +864,7 @@ fn fixture_workspace_links_mixed_c_component_archive() {
         system_package: Some("nros-e2e-generated-mixed-c".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: false,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -907,6 +923,7 @@ fn fixture_workspace_builds_generated_service_action_package() {
         system_package: Some("nros-e2e-generated-service-action".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: false,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: None,
@@ -959,6 +976,7 @@ fn build_launch_one_shot_runs_metadata_plan_generate_and_cargo() {
         system_package: Some("nros-e2e-generated-one-shot".to_string()),
         nano_ros_workspace: Some(nano_ros_workspace()),
         release: false,
+        force: false,
         target: None,
         passthrough: Vec::new(),
         launch: Some(demo_pkg.join("launch/system.launch.xml")),

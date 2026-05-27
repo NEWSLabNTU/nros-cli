@@ -26,13 +26,17 @@
 //! cmake path. Heuristic: if `[lib].crate-type` in Cargo.toml contains
 //! `staticlib` AND CMakeLists.txt exists, prefer cmake.
 
-use crate::cmd::{metadata, plan};
-use crate::orchestration;
+use crate::{
+    cmd::{metadata, plan},
+    orchestration,
+};
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, bail, eyre};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -94,6 +98,12 @@ pub struct Args {
     #[arg(long)]
     pub release: bool,
 
+    /// Force regeneration of the generated package even when the plan +
+    /// generator are unchanged (Phase 172.D staleness gate). Also honored
+    /// via the `NROS_BUILD_FORCE` environment variable.
+    #[arg(long)]
+    pub force: bool,
+
     /// Cargo target triple for generated system package
     #[arg(long)]
     pub target: Option<String>,
@@ -108,6 +118,9 @@ pub fn run(args: Args) -> Result<()> {
         Some(p) => p,
         None => std::env::current_dir()?,
     };
+
+    // Phase 172.D — the env var is an escape hatch equivalent to `--force`.
+    let force = args.force || std::env::var_os("NROS_BUILD_FORCE").is_some();
 
     // Phase 126.M4 — one-shot orchestration mode.
     if let Some(launch_file) = args.launch.clone() {
@@ -126,7 +139,10 @@ pub fn run(args: Args) -> Result<()> {
             .system_output
             .clone()
             .unwrap_or_else(|| out_root.join("generated"));
-        let workspace_root = args.nano_ros_workspace.clone().unwrap_or_else(|| root.clone());
+        let workspace_root = args
+            .nano_ros_workspace
+            .clone()
+            .unwrap_or_else(|| root.clone());
         let package_name = args
             .system_package
             .clone()
@@ -170,6 +186,7 @@ pub fn run(args: Args) -> Result<()> {
             release: args.release,
             target: args.target,
             cargo_args: args.passthrough,
+            force,
         })?;
         return Ok(());
     }
@@ -193,6 +210,7 @@ pub fn run(args: Args) -> Result<()> {
             release: args.release,
             target: args.target,
             cargo_args: args.passthrough,
+            force,
         })?;
         return Ok(());
     }

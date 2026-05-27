@@ -1,12 +1,18 @@
 //! Build orchestration for generated system packages.
 
-use super::generate::{GenerateOptions, GeneratedPackage, generate_package};
-use super::{NrosPlan, plan::PlanBuildOptions};
+use super::{
+    NrosPlan,
+    generate::{GenerateOptions, GeneratedPackage, generate_package},
+    plan::PlanBuildOptions,
+};
 use eyre::{Context, Result, eyre};
 use serde::Serialize;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::{
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -18,21 +24,63 @@ pub struct BuildOptions {
     pub release: bool,
     pub target: Option<String>,
     pub cargo_args: Vec<String>,
+    /// Phase 172.D — bypass the staleness gate and always regenerate.
+    pub force: bool,
 }
 
+/// Schema tag baked into the staleness fingerprint so a future change to
+/// what the stamp covers invalidates every old stamp.
+const STAMP_SCHEMA: &str = "nano-ros/build-stamp/v1";
+/// Stamp file under the generated package root recording the last
+/// successful generation's input fingerprint.
+const STAMP_FILE: &str = ".nros-build-stamp";
+
 pub fn build_generated_package(options: &BuildOptions) -> Result<GeneratedPackage> {
-    let plan = load_plan(&options.plan_path)?;
-    write_interface_cache(&options.output_dir, &plan)?;
-    let generated = generate_package(&GenerateOptions {
-        package_name: options.package_name.clone(),
-        output_dir: options.output_dir.clone(),
-        plan_path: options.plan_path.clone(),
-        nros_path: options.workspace_root.join("packages/core/nros"),
-        nros_orchestration_path: options
-            .workspace_root
-            .join("packages/core/nros-orchestration"),
-        component_workspace: options.component_workspace.clone(),
-    })?;
+    // Read the plan once as bytes so the fingerprint sees exactly what the
+    // generator consumes (parse separately for the interface cache).
+    let plan_bytes = fs::read(&options.plan_path)
+        .wrap_err_with(|| format!("failed to read {}", options.plan_path.display()))?;
+    let plan: NrosPlan = serde_json::from_slice(&plan_bytes)
+        .wrap_err_with(|| format!("failed to parse {}", options.plan_path.display()))?;
+
+    // Phase 172.D — skip regeneration when the generation inputs are
+    // unchanged. The generated package's contents are a pure function of
+    // the plan, the baked-in paths, and the generator version; component
+    // *source* is deliberately NOT in the fingerprint — generation never
+    // reads it, and cargo's own incremental fingerprinting (below) owns
+    // recompilation staleness for component edits. So the stamp gates
+    // generation only; cargo always runs and is itself the recompile gate.
+    let fingerprint = generation_fingerprint(&plan_bytes, options);
+    let generated = if generation_is_fresh(&options.output_dir, &fingerprint, options.force) {
+        eprintln!(
+            "nros build: generated package up to date (plan + generator unchanged) \
+             — skipping regeneration"
+        );
+        GeneratedPackage {
+            root: options.output_dir.clone(),
+            manifest_path: options.output_dir.join("Cargo.toml"),
+            plan_path: options.plan_path.clone(),
+        }
+    } else {
+        write_interface_cache(&options.output_dir, &plan)?;
+        let generated = generate_package(&GenerateOptions {
+            package_name: options.package_name.clone(),
+            output_dir: options.output_dir.clone(),
+            plan_path: options.plan_path.clone(),
+            nros_path: options.workspace_root.join("packages/core/nros"),
+            nros_orchestration_path: options
+                .workspace_root
+                .join("packages/core/nros-orchestration"),
+            component_workspace: options.component_workspace.clone(),
+        })?;
+        // Record the fingerprint only after a clean generation. Written
+        // before cargo on purpose: the stamp tracks generation freshness,
+        // not build success — a failed cargo run still leaves a valid
+        // generated tree, and the next run re-runs cargo (which retries the
+        // compile) without needlessly regenerating.
+        write_stamp(&options.output_dir, &fingerprint)?;
+        generated
+    };
 
     let mut cmd = Command::new("cargo");
     cmd.args(generated_cargo_args(
@@ -107,10 +155,42 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
     fs::write(path, contents).wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
-fn load_plan(path: &Path) -> Result<NrosPlan> {
-    let raw =
-        fs::read_to_string(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).wrap_err_with(|| format!("failed to parse {}", path.display()))
+/// Fingerprint of every input that determines the *generated* package's
+/// contents: the generator version, the plan bytes, and the paths baked into
+/// the generated manifest/build script. Component source is intentionally
+/// excluded — generation never reads it, and cargo owns recompilation
+/// staleness for those edits (see `build_generated_package`).
+fn generation_fingerprint(plan_bytes: &[u8], options: &BuildOptions) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    STAMP_SCHEMA.hash(&mut h);
+    // A generator upgrade can change the templates even when the plan is
+    // byte-identical, so the CLI version is part of the key.
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    plan_bytes.hash(&mut h);
+    options.package_name.hash(&mut h);
+    options.workspace_root.hash(&mut h);
+    options.component_workspace.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// A generation is fresh when not forced, the generated crate is present, and
+/// the recorded stamp matches the current input fingerprint.
+fn generation_is_fresh(output_dir: &Path, fingerprint: &str, force: bool) -> bool {
+    !force
+        && output_dir.join("Cargo.toml").is_file()
+        && read_stamp(output_dir).as_deref() == Some(fingerprint)
+}
+
+fn read_stamp(output_dir: &Path) -> Option<String> {
+    fs::read_to_string(output_dir.join(STAMP_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+fn write_stamp(output_dir: &Path, fingerprint: &str) -> Result<()> {
+    let path = output_dir.join(STAMP_FILE);
+    fs::write(&path, fingerprint)
+        .wrap_err_with(|| format!("failed to write build stamp {}", path.display()))
 }
 
 fn generated_cargo_args(
@@ -161,11 +241,17 @@ fn generated_target_dir(generated_root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use crate::orchestration::NrosPlan;
 
-    use super::{generated_cargo_args, generated_target_dir};
+    use super::{
+        BuildOptions, generated_cargo_args, generated_target_dir, generation_fingerprint,
+        generation_is_fresh, write_stamp,
+    };
 
     fn fixture_plan(name: &str) -> NrosPlan {
         let raw = std::fs::read_to_string(
@@ -267,5 +353,77 @@ mod tests {
             generated_target_dir(PathBuf::from("/tmp/system/nros/generated").as_path()),
             PathBuf::from("/tmp/system/nros/target")
         );
+    }
+
+    fn opts(output_dir: PathBuf) -> BuildOptions {
+        BuildOptions {
+            package_name: "demo_system".to_string(),
+            output_dir,
+            plan_path: PathBuf::from("/tmp/nros-plan.json"),
+            workspace_root: PathBuf::from("/ws/nano-ros"),
+            component_workspace: Some(PathBuf::from("/ws/components")),
+            release: false,
+            target: None,
+            cargo_args: Vec::new(),
+            force: false,
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_input_sensitive() {
+        let o = opts(PathBuf::from("/out"));
+        let base = generation_fingerprint(b"plan-A", &o);
+
+        // Identical inputs → identical fingerprint.
+        assert_eq!(base, generation_fingerprint(b"plan-A", &o));
+        // Different plan bytes → different fingerprint.
+        assert_ne!(base, generation_fingerprint(b"plan-B", &o));
+
+        // Each baked-in path / name participates in the key.
+        let mut o2 = o.clone();
+        o2.package_name = "other".to_string();
+        assert_ne!(base, generation_fingerprint(b"plan-A", &o2));
+        let mut o3 = o.clone();
+        o3.workspace_root = PathBuf::from("/ws/other");
+        assert_ne!(base, generation_fingerprint(b"plan-A", &o3));
+        let mut o4 = o.clone();
+        o4.component_workspace = None;
+        assert_ne!(base, generation_fingerprint(b"plan-A", &o4));
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{name}-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn freshness_requires_crate_present_matching_stamp_and_not_forced() {
+        let dir = temp_dir("nros-staleness");
+        let fp = "deadbeefdeadbeef";
+
+        // No generated crate yet → not fresh (must generate).
+        assert!(!generation_is_fresh(&dir, fp, false));
+
+        // Crate present but no stamp → not fresh.
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(!generation_is_fresh(&dir, fp, false));
+
+        // Matching stamp → fresh (skip regeneration).
+        write_stamp(&dir, fp).unwrap();
+        assert!(generation_is_fresh(&dir, fp, false));
+
+        // `--force` defeats a matching stamp.
+        assert!(!generation_is_fresh(&dir, fp, true));
+
+        // A changed fingerprint (new plan / generator) → stale.
+        assert!(!generation_is_fresh(&dir, "feedfacefeedface", false));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
