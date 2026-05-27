@@ -31,7 +31,23 @@ pub struct NrosPlan {
     /// output when absent so non-lifecycle plans stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<PlanLifecycle>,
+    /// Phase 172.I — named shared-memory regions that co-located components in
+    /// one generated binary can read/write (a critical-section-guarded byte
+    /// blackboard; components own the typed view). Additive; absent ⇒ no shared
+    /// state. Omitted from output when empty so plans stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_state: Vec<PlanSharedRegion>,
     pub build: PlanBuildOptions,
+}
+
+/// Phase 172.I — one named shared-memory region. `bytes` sizes a
+/// critical-section-guarded byte region; a component reads/writes it through
+/// the generated accessor and overlays its own typed view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanSharedRegion {
+    pub id: String,
+    pub bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

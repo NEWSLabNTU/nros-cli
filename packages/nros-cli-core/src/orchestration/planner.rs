@@ -523,6 +523,12 @@ fn schema_plan_json(
     if let Some(lifecycle) = collect_lifecycle(overlays) {
         obj.insert("lifecycle".to_string(), lifecycle);
     }
+    // Phase 172.I — optional shared-state regions, before `build` (NrosPlan
+    // field order); absent ⇒ omitted, plan stays byte-identical.
+    let shared_state = collect_shared_state(overlays);
+    if !shared_state.is_empty() {
+        obj.insert("shared_state".to_string(), json!(shared_state));
+    }
     obj.insert("build".to_string(), build);
     plan
 }
@@ -773,6 +779,25 @@ fn collect_lifecycle(overlays: &[Value]) -> Option<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or("none");
             out = Some(json!({ "autostart": autostart }));
+        }
+    }
+    out
+}
+
+/// Phase 172.I — collect `nros.toml` `[[shared_state]]` entries (array key
+/// `shared_state`) into the plan's `shared_state`. Entries with an empty id or
+/// zero bytes are dropped. Empty ⇒ no shared state (byte-identical plan).
+fn collect_shared_state(overlays: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for overlay in overlays {
+        if let Some(Value::Array(regions)) = overlay.get("shared_state") {
+            for region in regions {
+                let id = region.get("id").and_then(Value::as_str).unwrap_or("");
+                let bytes = region.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                if !id.is_empty() && bytes > 0 {
+                    out.push(json!({ "id": id, "bytes": bytes }));
+                }
+            }
         }
     }
     out
@@ -3338,5 +3363,32 @@ topics:
         ])
         .unwrap();
         assert_eq!(lc["autostart"], json!("active"));
+    }
+
+    #[test]
+    fn collect_shared_state_filters_and_merges_overlays() {
+        // No [[shared_state]] → empty.
+        assert!(collect_shared_state(&[json!({})]).is_empty());
+        // Valid entries pass; bad id / zero bytes drop.
+        let regions = collect_shared_state(&[json!({
+            "shared_state": [
+                { "id": "blackboard", "bytes": 256 },
+                { "id": "", "bytes": 8 },
+                { "id": "zero", "bytes": 0 }
+            ]
+        })]);
+        assert_eq!(regions, vec![json!({ "id": "blackboard", "bytes": 256 })]);
+        // Multiple overlays concatenate in order.
+        let regions = collect_shared_state(&[
+            json!({ "shared_state": [{ "id": "a", "bytes": 4 }] }),
+            json!({ "shared_state": [{ "id": "b", "bytes": 8 }] }),
+        ]);
+        assert_eq!(
+            regions,
+            vec![
+                json!({ "id": "a", "bytes": 4 }),
+                json!({ "id": "b", "bytes": 8 })
+            ]
+        );
     }
 }
