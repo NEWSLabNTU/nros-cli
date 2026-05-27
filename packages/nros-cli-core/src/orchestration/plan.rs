@@ -426,6 +426,13 @@ pub struct PlanTransport {
     /// Zenoh/DDS locator seeding this transport's session. `None` ⇒
     /// platform / env default.
     pub locator: Option<String>,
+    /// Phase 172 WP-B — ROS domain this transport's session joins. `None` ⇒
+    /// the build/system default (0). Lets a bridge open same-rmw sessions on
+    /// distinct domains (multi-domain in-binary); the session = (rmw, locator,
+    /// domain). Additive; skip-when-absent so single-domain plans round-trip
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

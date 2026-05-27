@@ -2117,8 +2117,14 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
             let rmw = t.rmw.as_deref().unwrap_or(plan.build.rmw.as_str());
             let canonical = normalize_rmw(rmw).unwrap_or(rmw);
             let locator = t.locator.as_deref().unwrap_or("");
+            // Phase 172 WP-B — a transport's `domain` joins its session to a
+            // distinct ROS domain (multi-domain in-binary); absent ⇒ default 0.
+            let domain = match t.domain {
+                Some(d) => format!(".domain_id({d})"),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "    nros::SessionSpec::new({canonical:?}, {locator:?}),\n"
+                "    nros::SessionSpec::new({canonical:?}, {locator:?}){domain},\n"
             ));
         }
         out.push_str("];\n\n");
@@ -2991,6 +2997,7 @@ mod net_fragment_tests {
             baudrate: None,
             rmw: None,
             locator: None,
+            domain: None,
         }
     }
 
@@ -3213,6 +3220,38 @@ mod net_fragment_tests {
             render_lib_section(&plan, "nros-e2e-generated")
                 .contains("crate-type = [\"lib\", \"staticlib\"]"),
             "entry-lib crate-type"
+        );
+    }
+
+    #[test]
+    fn session_specs_emit_per_transport_domain() {
+        // 172 WP-B — a bridge's SESSION_SPECS carry each transport's domain
+        // (multi-domain in-binary); a transport without `domain` stays default.
+        use crate::orchestration::schema::PLAN_VERSION;
+        let plan: NrosPlan = serde_json::from_value(serde_json::json!({
+            "version": PLAN_VERSION, "system": "s",
+            "trace": { "system_config": "nros.toml", "launch_record": "r", "generated_by": "t" },
+            "components": [], "instances": [], "interfaces": [], "sched_contexts": [],
+            "build": {
+                "target": "x86_64-unknown-linux-gnu", "board": "native", "rmw": "zenoh",
+                "profile": "release", "features": [], "cfg": {},
+                "transports": [
+                    { "kind": "ethernet", "rmw": "zenoh", "locator": "tcp/a:7447" },
+                    { "kind": "ethernet", "rmw": "zenoh", "locator": "tcp/b:7447", "domain": 5 }
+                ]
+            }
+        }))
+        .expect("bridge plan parses");
+        assert!(plan.build.is_bridge());
+        let tables = render_generated_tables(&plan);
+        assert!(tables.contains("pub static SESSION_SPECS"), "{tables}");
+        assert!(
+            tables.contains("nros::SessionSpec::new(\"zenoh\", \"tcp/a:7447\"),"),
+            "default-domain transport has no .domain_id:\n{tables}"
+        );
+        assert!(
+            tables.contains("nros::SessionSpec::new(\"zenoh\", \"tcp/b:7447\").domain_id(5)"),
+            "domain-5 transport emits .domain_id(5):\n{tables}"
         );
     }
 
