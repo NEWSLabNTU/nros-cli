@@ -27,8 +27,9 @@
 //! `staticlib` AND CMakeLists.txt exists, prefer cmake.
 
 use crate::{
-    cmd::{metadata, plan},
+    cmd::{deploy, metadata, plan},
     orchestration,
+    orchestration::root_config::WorkspaceConfig,
 };
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, bail, eyre};
@@ -107,6 +108,12 @@ pub struct Args {
     /// Cargo target triple for generated system package
     #[arg(long)]
     pub target: Option<String>,
+
+    /// Deploy target from the root nros.toml (Phase 172 WP-A): `nros build
+    /// <name>` is an alias for `nros deploy <name>`; bare `nros build` (in a
+    /// workspace root) builds `[workspace].default`. Ignored under
+    /// `--launch` / `--system-plan`.
+    pub deploy_name: Option<String>,
 
     /// Trailing arguments forwarded verbatim to the underlying tool
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -213,6 +220,47 @@ pub fn run(args: Args) -> Result<()> {
             force,
         })?;
         return Ok(());
+    }
+
+    // Phase 172 WP-A — root nros.toml deploy dispatch. `nros build <name>`
+    // aliases `nros deploy <name>`; bare `nros build` in a workspace root
+    // builds `[workspace].default`. The gate is a *loadable* root nros.toml:
+    // `WorkspaceConfig` is `deny_unknown_fields`, so a component nros.toml
+    // (`[node]`/`[[transport]]`, direct mode) fails to load and falls through
+    // to the project-flavor autodetect below — unchanged.
+    let root_toml = root.join("nros.toml");
+    if root_toml.is_file() {
+        match WorkspaceConfig::load(&root_toml) {
+            Ok(cfg) => {
+                let name = args
+                    .deploy_name
+                    .clone()
+                    .or_else(|| cfg.workspace.default.clone())
+                    .ok_or_else(|| {
+                        eyre!(
+                            "nros build: no deploy name given and no [workspace].default \
+                             in {} — pass `nros build <name>`",
+                            root_toml.display()
+                        )
+                    })?;
+                return deploy::run(deploy::Args {
+                    name: Some(name),
+                    config: root_toml,
+                    dry_run: false,
+                });
+            }
+            Err(e) if args.deploy_name.is_some() => {
+                return Err(e)
+                    .wrap_err("nros build <name>: ./nros.toml is not a valid workspace root");
+            }
+            Err(_) => { /* component nros.toml / not a root → project flavor */ }
+        }
+    } else if let Some(name) = &args.deploy_name {
+        bail!(
+            "nros build {name}: no root nros.toml in {} (deploy targets live in the \
+             workspace-root nros.toml)",
+            root.display()
+        );
     }
 
     let flavor = detect_flavor(&root)?;
