@@ -149,6 +149,16 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
             && header_src.contains("int32_t nros_e2e_system_register_all(NrosExecutor *executor);"),
         "entry header declares the C ABI:\n{header_src}"
     );
+    // Source form: the vendor-includable CMake fragment over the same crate.
+    let entry_cmake = generated_dir.join("CMakeLists.txt");
+    let cmake_src = fs::read_to_string(&entry_cmake)
+        .unwrap_or_else(|e| panic!("read entry CMakeLists {}: {e}", entry_cmake.display()));
+    assert!(
+        cmake_src.contains("corrosion_import_crate")
+            && cmake_src.contains("CRATES nros_e2e_generated")
+            && cmake_src.contains("add_library(e2e_system_entry INTERFACE)"),
+        "source-form CMake fragment imports the crate + exposes the entry target:\n{cmake_src}"
+    );
 
     let port = free_local_port();
     let _zenohd = start_zenohd(port);

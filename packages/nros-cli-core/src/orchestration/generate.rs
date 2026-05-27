@@ -96,6 +96,13 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
             &include_dir.join(format!("{}.h", system_ident(&plan))),
             &render_entry_header(&plan),
         )?;
+        // Source form: a vendor-includable CMake fragment over the same crate
+        // (Corrosion compiles the staticlib in the vendor toolchain). Emitted
+        // alongside the compiled artifacts; the deploy runner picks per form.
+        write_if_changed(
+            &options.output_dir.join("CMakeLists.txt"),
+            &render_entry_cmake(options, &plan),
+        )?;
     } else {
         write_if_changed(&src_dir.join("main.rs"), &render_main(&plan))?;
     }
@@ -551,6 +558,39 @@ fn render_entry_header(plan: &NrosPlan) -> String {
          int32_t nros_{sys}_spin(NrosExecutor *executor);\n\
          void nros_{sys}_destroy(NrosExecutor *executor);\n\n\
          #ifdef __cplusplus\n}}\n#endif\n\n#endif /* {guard} */\n"
+    )
+}
+
+/// Phase 172 WP-B — the entry lib's **source-form** CMake fragment. A
+/// vendor-owns-toolchain deploy (`emit = "source"`) `add_subdirectory()`s the
+/// generated package; Corrosion (loaded by the vendor project) compiles the
+/// crate's `staticlib` in the vendor's toolchain, and the fragment exposes it
+/// as `<sys>_entry` with the C ABI header on the include path. Emitted
+/// alongside the compiled artifacts so one generated package serves both forms;
+/// the `nros deploy` runner picks per `[deploy].emit`.
+fn render_entry_cmake(options: &GenerateOptions, plan: &NrosPlan) -> String {
+    let sys = system_ident(plan);
+    let krate = crate_ident(&options.package_name);
+    format!(
+        "# Generated nano-ros entry lib — source form (Phase 172 WP-B). Do not edit.\n\
+         #\n\
+         # A vendor CMake project that has Corrosion loaded consumes this with:\n\
+         #   add_subdirectory(<this_dir> {sys}_entry)\n\
+         #   target_link_libraries(<app> PRIVATE {sys}_entry)\n\
+         # Corrosion compiles the generated crate's staticlib in the vendor\n\
+         # toolchain; the `nros_{sys}_*` C ABI header is on the include path.\n\
+         cmake_minimum_required(VERSION 3.22)\n\n\
+         if(NOT COMMAND corrosion_import_crate)\n\
+         \x20   message(FATAL_ERROR\n\
+         \x20       \"nano-ros entry lib (source form) needs Corrosion — load it before add_subdirectory()\")\n\
+         endif()\n\n\
+         corrosion_import_crate(\n\
+         \x20   MANIFEST_PATH \"${{CMAKE_CURRENT_LIST_DIR}}/Cargo.toml\"\n\
+         \x20   CRATES {krate}\n\
+         \x20   CRATE_TYPES staticlib)\n\n\
+         add_library({sys}_entry INTERFACE)\n\
+         target_link_libraries({sys}_entry INTERFACE {krate})\n\
+         target_include_directories({sys}_entry INTERFACE \"${{CMAKE_CURRENT_LIST_DIR}}/include\")\n"
     )
 }
 
@@ -3107,6 +3147,33 @@ mod net_fragment_tests {
         assert!(
             feats.iter().any(|f| f == "nros/param-services"),
             "{feats:?}"
+        );
+    }
+
+    #[test]
+    fn entry_lib_idents_and_c_abi_header() {
+        // 172 WP-B — sanitizers + the directly-emitted C ABI header.
+        assert_eq!(crate_ident("nros-e2e-generated"), "nros_e2e_generated");
+        assert_eq!(crate_ident("a.b-c"), "a_b_c");
+        let plan = plan_with_param_persistence(None); // system = "demo"
+        assert_eq!(system_ident(&plan), "demo");
+        let header = render_entry_header(&plan);
+        assert!(
+            header.contains("typedef struct NrosExecutor NrosExecutor;"),
+            "{header}"
+        );
+        assert!(
+            header.contains("NrosExecutor *nros_demo_build_executor(const void *cfg);")
+                && header.contains("int32_t nros_demo_register_all(NrosExecutor *executor);")
+                && header.contains("void nros_demo_destroy(NrosExecutor *executor);"),
+            "{header}"
+        );
+        // The std-hosted native plan emits the entry lib (lib + staticlib).
+        assert!(emits_entry_lib(&plan), "native std-hosted ⇒ entry lib");
+        assert!(
+            render_lib_section(&plan, "nros-e2e-generated")
+                .contains("crate-type = [\"lib\", \"staticlib\"]"),
+            "entry-lib crate-type"
         );
     }
 
