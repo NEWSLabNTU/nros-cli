@@ -117,6 +117,7 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
             &toml_string_array(&generated_default_features(
                 &plan.build,
                 plan.lifecycle.is_some(),
+                plan.param_persistence.is_some(),
             )),
         )
         .replace("{{ nros_path }}", &path_for_template(&options.nros_path))
@@ -207,6 +208,7 @@ fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeEr
     }
 
     nros_generated::apply_lifecycle(&mut executor)?;
+    nros_generated::apply_param_persistence(&mut executor)?;
 
     #[cfg(feature = \"std\")]
     return executor.spin_blocking(SpinOptions::default());
@@ -1275,7 +1277,11 @@ fn load_plan(path: &Path) -> Result<NrosPlan> {
     serde_json::from_str(&raw).wrap_err_with(|| format!("failed to parse {}", path.display()))
 }
 
-fn generated_default_features(build: &PlanBuildOptions, managed_lifecycle: bool) -> Vec<String> {
+fn generated_default_features(
+    build: &PlanBuildOptions,
+    managed_lifecycle: bool,
+    param_persistence: bool,
+) -> Vec<String> {
     let mut features = Vec::new();
     if uses_std(build) {
         features.push("std".to_string());
@@ -1284,6 +1290,12 @@ fn generated_default_features(build: &PlanBuildOptions, managed_lifecycle: bool)
     // executor (`nros/lifecycle-services` → `nros-node/lifecycle-services`).
     if managed_lifecycle {
         features.push("nros/lifecycle-services".to_string());
+    }
+    // Phase 172.H — a `[param_persistence]` plan needs the parameter services
+    // (`nros/param-services`); the generated runtime declares params, registers
+    // the services, and attaches the persistence backend.
+    if param_persistence {
+        features.push("nros/param-services".to_string());
     }
     // Phase 173.2 — `nros/<feature>` + the per-platform local aliases
     // (which gate the platform-specific Cargo deps + cfg) both come from
@@ -1905,6 +1917,7 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     }
     render_backend_register_fn(&mut out, plan);
     render_lifecycle_fn(&mut out, plan);
+    render_param_persistence_fn(&mut out, plan);
     render_native_component_ffi(&mut out, plan);
     render_components(&mut out, plan);
     render_instances(&mut out, plan);
@@ -2100,6 +2113,56 @@ fn render_lifecycle_fn(out: &mut String, plan: &NrosPlan) {
                 out.push_str("        }\n    }\n");
             }
             out.push_str("    Ok(())\n");
+        }
+    }
+    out.push_str("}\n\n");
+}
+
+/// Phase 172.H — emit `apply_param_persistence`, called from `run_executor`
+/// after `apply_lifecycle`. Plans without `[param_persistence]` get a no-op (no
+/// param services, byte-equivalent). A `[param_persistence]` plan registers the
+/// parameter services, declares the plan's parameters as defaults, then attaches
+/// the persistence backend (which overlays any persisted overrides at boot and
+/// flushes runtime `set_parameters` changes from the spin loop).
+fn render_param_persistence_fn(out: &mut String, plan: &NrosPlan) {
+    out.push_str(
+        "pub fn apply_param_persistence(executor: &mut nros::Executor) -> Result<(), nros::NodeError> {\n",
+    );
+    match &plan.param_persistence {
+        None => {
+            out.push_str("    let _ = executor;\n    Ok(())\n");
+        }
+        Some(pp) if pp.backend == "file" => {
+            out.push_str("    executor.register_parameter_services()?;\n");
+            out.push_str("    for spec in PARAMETERS.iter() {\n");
+            out.push_str("        let value = match spec.value {\n");
+            out.push_str("            ParameterValue::Bool(b) => nros::ParameterValue::Bool(b),\n");
+            out.push_str(
+                "            ParameterValue::I64(i) => nros::ParameterValue::Integer(i),\n",
+            );
+            out.push_str(
+                "            ParameterValue::F64(f) => nros::ParameterValue::Double(f),\n",
+            );
+            out.push_str(
+                "            ParameterValue::Str(s) => nros::ParameterValue::from_string(s).unwrap_or_default(),\n",
+            );
+            out.push_str("        };\n");
+            out.push_str("        executor.declare_parameter(spec.name, value);\n");
+            out.push_str("    }\n");
+            out.push_str(&format!(
+                "    executor.enable_parameter_persistence_with(nros::FileParamStore::new({:?}))?;\n",
+                pp.path
+            ));
+            out.push_str("    Ok(())\n");
+        }
+        Some(pp) => {
+            // Only the hosted file backend exists today; an unknown backend is
+            // a config error surfaced at build time rather than silently
+            // dropping persistence.
+            out.push_str(&format!(
+                "    let _ = executor;\n    compile_error!(\"unsupported param_persistence backend: {}\");\n    #[allow(unreachable_code)] Ok(())\n",
+                pp.backend.escape_default()
+            ));
         }
     }
     out.push_str("}\n\n");
@@ -2762,6 +2825,79 @@ mod net_fragment_tests {
         let mut out = String::new();
         render_shared_state(&mut out, &plan_with_shared_state(serde_json::json!([])));
         assert!(out.is_empty(), "{out}");
+    }
+
+    fn plan_with_param_persistence(pp: Option<serde_json::Value>) -> NrosPlan {
+        use crate::orchestration::schema::PLAN_VERSION;
+        let mut plan = serde_json::json!({
+            "version": PLAN_VERSION,
+            "system": "demo",
+            "trace": {
+                "system_config": "nros.toml",
+                "launch_record": "r.json",
+                "generated_by": "test"
+            },
+            "components": [], "instances": [], "interfaces": [], "sched_contexts": [],
+            "build": {
+                "target": "x86_64-unknown-linux-gnu", "board": "native", "rmw": "zenoh",
+                "profile": "release", "features": [], "cfg": {}
+            }
+        });
+        if let Some(pp) = pp {
+            plan.as_object_mut()
+                .unwrap()
+                .insert("param_persistence".into(), pp);
+        }
+        serde_json::from_value(plan).expect("plan parses")
+    }
+
+    #[test]
+    fn param_persistence_none_renders_noop() {
+        // 172.H — no [param_persistence] ⇒ no-op fn, no param services.
+        let mut out = String::new();
+        render_param_persistence_fn(&mut out, &plan_with_param_persistence(None));
+        assert!(out.contains("pub fn apply_param_persistence"), "{out}");
+        assert!(out.contains("let _ = executor;"), "{out}");
+        assert!(!out.contains("register_parameter_services"), "{out}");
+        // And a None plan must not pull the param-services feature.
+        let feats =
+            generated_default_features(&plan_with_param_persistence(None).build, false, false);
+        assert!(
+            !feats.iter().any(|f| f == "nros/param-services"),
+            "{feats:?}"
+        );
+    }
+
+    #[test]
+    fn param_persistence_file_renders_declare_and_enable() {
+        // 172.H — a file backend registers services, declares params, attaches
+        // the FileParamStore at the configured path, and pulls param-services.
+        let plan = plan_with_param_persistence(Some(serde_json::json!({
+            "backend": "file", "path": "/var/lib/nros/params.store"
+        })));
+        let mut out = String::new();
+        render_param_persistence_fn(&mut out, &plan);
+        assert!(
+            out.contains("executor.register_parameter_services()?;"),
+            "{out}"
+        );
+        assert!(
+            out.contains("executor.declare_parameter(spec.name, value);"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "executor.enable_parameter_persistence_with(nros::FileParamStore::new(\"/var/lib/nros/params.store\"))?;"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("nros::ParameterValue::Integer(i)"), "{out}");
+
+        let feats = generated_default_features(&plan.build, false, true);
+        assert!(
+            feats.iter().any(|f| f == "nros/param-services"),
+            "{feats:?}"
+        );
     }
 
     #[test]

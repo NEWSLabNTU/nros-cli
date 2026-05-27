@@ -37,7 +37,22 @@ pub struct NrosPlan {
     /// state. Omitted from output when empty so plans stay byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_state: Vec<PlanSharedRegion>,
+    /// Phase 172.H — runtime parameter-override persistence backend. Additive;
+    /// absent ⇒ no persistence (generated runtime keeps no param services).
+    /// Omitted from output when absent so plans stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param_persistence: Option<PlanParamPersistence>,
     pub build: PlanBuildOptions,
+}
+
+/// Phase 172.H — where the generated runtime persists parameter overrides set
+/// after boot, so they survive a restart. `backend` selects the store kind
+/// (only `"file"`, a hosted text file, today); `path` is its location.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanParamPersistence {
+    pub backend: String,
+    pub path: String,
 }
 
 /// Phase 172.I — one named shared-memory region. `bytes` sizes a

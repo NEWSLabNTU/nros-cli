@@ -529,6 +529,11 @@ fn schema_plan_json(
     if !shared_state.is_empty() {
         obj.insert("shared_state".to_string(), json!(shared_state));
     }
+    // Phase 172.H — optional parameter-override persistence, before `build`
+    // (NrosPlan field order); absent ⇒ omitted, plan stays byte-identical.
+    if let Some(pp) = collect_param_persistence(overlays) {
+        obj.insert("param_persistence".to_string(), pp);
+    }
     obj.insert("build".to_string(), build);
     plan
 }
@@ -779,6 +784,28 @@ fn collect_lifecycle(overlays: &[Value]) -> Option<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or("none");
             out = Some(json!({ "autostart": autostart }));
+        }
+    }
+    out
+}
+
+/// Phase 172.H — read the nros.toml `[param_persistence]` block (last overlay
+/// wins). Returns `{ "backend": <kind>, "path": <loc> }` when a non-empty
+/// `path` is present (`backend` defaults to `"file"`); `None` keeps the binary
+/// free of parameter services. An unknown backend passes through and is the
+/// generator's concern.
+fn collect_param_persistence(overlays: &[Value]) -> Option<Value> {
+    let mut out = None;
+    for overlay in overlays {
+        if let Some(table) = overlay.get("param_persistence").and_then(Value::as_object) {
+            let backend = table
+                .get("backend")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let path = table.get("path").and_then(Value::as_str).unwrap_or("");
+            if !path.is_empty() {
+                out = Some(json!({ "backend": backend, "path": path }));
+            }
         }
     }
     out
@@ -3363,6 +3390,31 @@ topics:
         ])
         .unwrap();
         assert_eq!(lc["autostart"], json!("active"));
+    }
+
+    #[test]
+    fn collect_param_persistence_reads_block_defaults_and_last_wins() {
+        // No [param_persistence] → no persistence.
+        assert!(collect_param_persistence(&[json!({})]).is_none());
+        // Empty / missing path → dropped (nothing to persist to).
+        assert!(
+            collect_param_persistence(&[json!({ "param_persistence": { "backend": "file" } })])
+                .is_none()
+        );
+        // backend defaults to "file".
+        let pp = collect_param_persistence(&[json!({
+            "param_persistence": { "path": "/var/lib/nros/params" }
+        })])
+        .unwrap();
+        assert_eq!(pp["backend"], json!("file"));
+        assert_eq!(pp["path"], json!("/var/lib/nros/params"));
+        // Last overlay wins.
+        let pp = collect_param_persistence(&[
+            json!({ "param_persistence": { "path": "/a" } }),
+            json!({ "param_persistence": { "backend": "file", "path": "/b" } }),
+        ])
+        .unwrap();
+        assert_eq!(pp["path"], json!("/b"));
     }
 
     #[test]

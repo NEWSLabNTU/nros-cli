@@ -11,7 +11,7 @@ use nros_cli_core::{
     cmd::{build, check, metadata, plan},
     orchestration::{
         generate::{GenerateOptions, generate_package},
-        plan::{NrosPlan, PlanComponent, PlanEntity},
+        plan::{NrosPlan, PlanComponent, PlanEntity, PlanParamPersistence},
         schema::ParameterValue,
     },
 };
@@ -170,6 +170,53 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
             .join("debug")
             .join("nros-e2e-generated-multi")
             .is_file()
+    );
+
+    // Phase 172.H — a `param_persistence` plan must produce a package whose
+    // generated `apply_param_persistence` (register services + declare params +
+    // attach FileParamStore) actually compiles and links.
+    let persist_plan_path = out_dir.join("nros-plan-persist.json");
+    let mut persist_plan = plan.clone();
+    persist_plan.param_persistence = Some(PlanParamPersistence {
+        backend: "file".to_string(),
+        path: out_dir.join("params.store").to_string_lossy().into_owned(),
+    });
+    fs::write(
+        &persist_plan_path,
+        serde_json::to_string_pretty(&persist_plan).expect("serialize persistence plan"),
+    )
+    .expect("write persistence plan");
+    check::run(check::Args {
+        plan: persist_plan_path.clone(),
+    })
+    .expect("check command validates persistence plan");
+    let persist_generated_dir = out_dir.join("generated-persist");
+    build::run(build::Args {
+        project: Some(fixture_workspace()),
+        system_plan: Some(persist_plan_path),
+        system_output: Some(persist_generated_dir.clone()),
+        system_package: Some("nros-e2e-generated-persist".to_string()),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        release: false,
+        force: false,
+        target: None,
+        passthrough: Vec::new(),
+        launch: None,
+        system_pkg: None,
+        metadata: Vec::new(),
+        manifest: Vec::new(),
+        launch_arg: Vec::new(),
+        out_dir: None,
+    })
+    .expect("build command compiles generated persistence package");
+    assert!(
+        persist_generated_dir
+            .join("../target")
+            .join(&persist_plan.build.target)
+            .join("debug")
+            .join("nros-e2e-generated-persist")
+            .is_file(),
+        "generated persistence binary compiled + linked"
     );
 }
 
