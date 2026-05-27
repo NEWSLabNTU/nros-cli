@@ -12,11 +12,13 @@ pub mod names;
 pub mod params;
 pub mod plan;
 pub mod planner;
+pub mod root_config;
 pub mod schema;
 pub mod source_metadata;
 pub mod workspace;
 
 pub use config::{ComponentConfig, SystemConfig};
 pub use plan::NrosPlan;
+pub use root_config::WorkspaceConfig;
 pub use source_metadata::SourceMetadata;
 pub use workspace::{ComponentDeclaration, Package, Workspace};
