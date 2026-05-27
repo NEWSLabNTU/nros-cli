@@ -172,8 +172,7 @@ mod nros_generated {
     core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));
 }
 
-use nros::prelude::*;
-use nros_orchestration::CallbackHandleTable;";
+use nros::prelude::*;";
 
 /// Phase 173.2b — the `run_system` helper, emitted verbatim into every
 /// non-Zephyr `src/main.rs` (formerly `main.rs.jinja` lines 49-78). It is
@@ -186,29 +185,10 @@ fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::Node
 }
 
 fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeError> {
-    let mut callback_handles = CallbackHandleTable::<{ nros_generated::CALLBACK_COUNT }>::new();
-
-    let mut sched_context_ids =
-        [executor.default_sched_context_id(); nros_generated::SCHED_CONTEXT_COUNT + 1];
-    for (index, spec) in nros_generated::SCHED_CONTEXTS.iter().copied().enumerate() {
-        sched_context_ids[index + 1] = executor.create_sched_context(spec.to_nros_node())?;
-    }
-
-    nros_generated::instantiate_components(&mut executor, &mut callback_handles)?;
-
-    for binding in nros_generated::CALLBACK_BINDINGS.iter().copied() {
-        let handle = callback_handles
-            .get(binding.callback_index)
-            .ok_or(nros::NodeError::NotInitialized)?;
-        let sched_context = sched_context_ids
-            .get(binding.sched_context_index)
-            .copied()
-            .ok_or(nros::NodeError::InvalidSchedContextBinding)?;
-        executor.bind_handle_to_sched_context(handle, sched_context)?;
-    }
-
-    nros_generated::apply_lifecycle(&mut executor)?;
-    nros_generated::apply_param_persistence(&mut executor)?;
+    // Phase 172 WP-B — registration moved into the entry lib
+    // (`nros_generated::register_all`), the unit the entry-lib C ABI wraps;
+    // the per-platform entry now only opens + spins.
+    nros_generated::register_all(&mut executor)?;
 
     #[cfg(feature = \"std\")]
     return executor.spin_blocking(SpinOptions::default());
@@ -2005,7 +1985,43 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     }
     out.push_str("    Ok(())\n");
     out.push_str("}\n");
+    render_register_all_fn(&mut out);
     out
+}
+
+/// Phase 172 WP-B — emit `nros_generated::register_all`, the system-registration
+/// entry the entry-lib C ABI wraps. It runs the full post-open flow on an
+/// already-opened executor: create the plan's sched contexts, instantiate every
+/// node component, bind callbacks to their contexts, then apply lifecycle +
+/// parameter persistence. The per-platform entry (and a future vendor C caller)
+/// only opens the executor and spins; all wiring lives here.
+fn render_register_all_fn(out: &mut String) {
+    out.push_str(
+        "\npub fn register_all(executor: &mut nros::Executor) -> Result<(), nros::NodeError> {\n",
+    );
+    out.push_str("    let mut callback_handles = CallbackHandleTable::<CALLBACK_COUNT>::new();\n");
+    out.push_str(
+        "    let mut sched_context_ids = [executor.default_sched_context_id(); SCHED_CONTEXT_COUNT + 1];\n",
+    );
+    out.push_str("    for (index, spec) in SCHED_CONTEXTS.iter().copied().enumerate() {\n");
+    out.push_str(
+        "        sched_context_ids[index + 1] = executor.create_sched_context(spec.to_nros_node())?;\n",
+    );
+    out.push_str("    }\n");
+    out.push_str("    instantiate_components(executor, &mut callback_handles)?;\n");
+    out.push_str("    for binding in CALLBACK_BINDINGS.iter().copied() {\n");
+    out.push_str(
+        "        let handle = callback_handles.get(binding.callback_index).ok_or(nros::NodeError::NotInitialized)?;\n",
+    );
+    out.push_str(
+        "        let sched_context = sched_context_ids.get(binding.sched_context_index).copied().ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n",
+    );
+    out.push_str("        executor.bind_handle_to_sched_context(handle, sched_context)?;\n");
+    out.push_str("    }\n");
+    out.push_str("    apply_lifecycle(executor)?;\n");
+    out.push_str("    apply_param_persistence(executor)?;\n");
+    out.push_str("    Ok(())\n");
+    out.push_str("}\n");
 }
 
 fn render_native_component_ffi(out: &mut String, plan: &NrosPlan) {
