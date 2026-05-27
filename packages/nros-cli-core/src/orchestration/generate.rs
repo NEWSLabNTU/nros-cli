@@ -476,13 +476,38 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
     out.push_str("pub use nros_generated::{SYSTEM, build_executor, register_all};\n\n");
 
     out.push_str("// --- Entry-lib C ABI (Phase 172 WP-B) ---\n\n");
+    // Phase 172 WP-B — config lowering: the optional runtime `Config` override.
+    // Precedence is param > env > baked — a non-NULL `NrosConfig` overrides the
+    // env/baked defaults `build_executor` would otherwise use.
+    out.push_str(
+        "/// Optional runtime config override passed to `build_executor`\n\
+         /// (precedence: param > env > baked). Unset fields fall through.\n\
+         #[repr(C)]\n\
+         pub struct NrosConfig {\n\
+         \x20   /// ROS 2 domain ID; negative ⇒ unset (env/baked).\n\
+         \x20   pub domain_id: i32,\n\
+         \x20   /// Middleware locator (NUL-terminated); NULL ⇒ unset.\n\
+         \x20   pub locator: *const core::ffi::c_char,\n\
+         }\n\n",
+    );
     out.push_str(&format!(
-        "/// Build the system executor; `_cfg` override is reserved for config\n\
-         /// lowering (NULL ⇒ env/baked). Heap-owned — free with `nros_{sys}_destroy`;\n\
-         /// returns NULL on error.\n\
+        "/// Build the system executor. `cfg` overrides env/baked config\n\
+         /// (precedence param > env > baked); NULL ⇒ env/baked. Heap-owned — free\n\
+         /// with `nros_{sys}_destroy`; returns NULL on error.\n\
          #[unsafe(no_mangle)]\n\
-         pub extern \"C\" fn nros_{sys}_build_executor(_cfg: *const core::ffi::c_void) -> *mut nros::Executor {{\n\
-         \x20   let config = nros::ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());\n\
+         pub extern \"C\" fn nros_{sys}_build_executor(cfg: *const NrosConfig) -> *mut nros::Executor {{\n\
+         \x20   let mut config: nros::ExecutorConfig<'_> =\n\
+         \x20       nros::ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());\n\
+         \x20   // Apply the param override (highest precedence). The locator borrow\n\
+         \x20   // lives only across the immediate `build_executor` open below.\n\
+         \x20   let locator_override: Option<&str> = match unsafe {{ cfg.as_ref() }} {{\n\
+         \x20       Some(cfg) => {{\n\
+         \x20           if cfg.domain_id >= 0 {{ config = config.domain_id(cfg.domain_id as u32); }}\n\
+         \x20           if cfg.locator.is_null() {{ None }} else {{ unsafe {{ core::ffi::CStr::from_ptr(cfg.locator) }}.to_str().ok() }}\n\
+         \x20       }}\n\
+         \x20       None => None,\n\
+         \x20   }};\n\
+         \x20   if let Some(locator) = locator_override {{ config.locator = locator; }}\n\
          \x20   match nros_generated::build_executor(&config) {{\n\
          \x20       Ok(executor) => ::std::boxed::Box::into_raw(::std::boxed::Box::new(executor)),\n\
          \x20       Err(_) => core::ptr::null_mut(),\n\
@@ -553,7 +578,12 @@ fn render_entry_header(plan: &NrosPlan) -> String {
          #ifdef __cplusplus\nextern \"C\" {{\n#endif\n\n\
          /* Opaque executor handle (as in nros-c). */\n\
          typedef struct NrosExecutor NrosExecutor;\n\n\
-         NrosExecutor *nros_{sys}_build_executor(const void *cfg);\n\
+         /* Optional runtime config override (precedence: param > env > baked). */\n\
+         typedef struct NrosConfig {{\n\
+         \x20   int32_t domain_id;     /* < 0 => unset (env/baked) */\n\
+         \x20   const char *locator;   /* NULL => unset */\n\
+         }} NrosConfig;\n\n\
+         NrosExecutor *nros_{sys}_build_executor(const NrosConfig *cfg);\n\
          int32_t nros_{sys}_register_all(NrosExecutor *executor);\n\
          int32_t nros_{sys}_spin(NrosExecutor *executor);\n\
          void nros_{sys}_destroy(NrosExecutor *executor);\n\n\
@@ -3159,14 +3189,23 @@ mod net_fragment_tests {
         assert_eq!(system_ident(&plan), "demo");
         let header = render_entry_header(&plan);
         assert!(
-            header.contains("typedef struct NrosExecutor NrosExecutor;"),
+            header.contains("typedef struct NrosExecutor NrosExecutor;")
+                && header.contains("} NrosConfig;"),
             "{header}"
         );
         assert!(
-            header.contains("NrosExecutor *nros_demo_build_executor(const void *cfg);")
+            header.contains("NrosExecutor *nros_demo_build_executor(const NrosConfig *cfg);")
                 && header.contains("int32_t nros_demo_register_all(NrosExecutor *executor);")
                 && header.contains("void nros_demo_destroy(NrosExecutor *executor);"),
             "{header}"
+        );
+        // Config lowering: the lib applies the param override (param > env > baked).
+        let lib = render_entry_lib_rs(&plan);
+        assert!(
+            lib.contains("pub struct NrosConfig")
+                && lib.contains("config = config.domain_id(cfg.domain_id as u32)")
+                && lib.contains("config.locator = locator"),
+            "{lib}"
         );
         // The std-hosted native plan emits the entry lib (lib + staticlib).
         assert!(emits_entry_lib(&plan), "native std-hosted ⇒ entry lib");

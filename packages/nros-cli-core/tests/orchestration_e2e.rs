@@ -145,9 +145,10 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
     let header_src = fs::read_to_string(&header)
         .unwrap_or_else(|e| panic!("read entry header {}: {e}", header.display()));
     assert!(
-        header_src.contains("NrosExecutor *nros_e2e_system_build_executor(const void *cfg);")
-            && header_src.contains("int32_t nros_e2e_system_register_all(NrosExecutor *executor);"),
-        "entry header declares the C ABI:\n{header_src}"
+        header_src.contains("NrosExecutor *nros_e2e_system_build_executor(const NrosConfig *cfg);")
+            && header_src.contains("int32_t nros_e2e_system_register_all(NrosExecutor *executor);")
+            && header_src.contains("} NrosConfig;"),
+        "entry header declares the C ABI + config override:\n{header_src}"
     );
     // Source form: the vendor-includable CMake fragment over the same crate.
     let entry_cmake = generated_dir.join("CMakeLists.txt");
