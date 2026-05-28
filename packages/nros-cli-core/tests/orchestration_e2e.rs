@@ -1559,7 +1559,9 @@ fn temp_output(name: &str) -> PathBuf {
 #[test]
 fn deploy_native_self_from_root_nros_toml() {
     let fixture = fixture_workspace();
-    let build = fixture.join("build");
+    // Scope to this deploy's own subdir — a sibling deploy (e.g. zephyr-mod)
+    // may build into `build/<name>` concurrently.
+    let build = fixture.join("build/native");
     let _ = fs::remove_dir_all(&build);
 
     deploy::run(deploy::Args {
@@ -1571,7 +1573,7 @@ fn deploy_native_self_from_root_nros_toml() {
     .expect("nros deploy (default) builds the self deploy from one root nros.toml");
 
     let debug = build
-        .join("native/nros/target")
+        .join("nros/target")
         .join("x86_64-unknown-linux-gnu")
         .join("debug");
     assert!(
@@ -1650,4 +1652,40 @@ fn deploy_zephyr_vendor_module_dry_run_resolves_and_substitutes() {
         dry_run: true,
     })
     .expect("zephyr vendor-module deploy dry-run resolves + substitutes the var-set");
+}
+
+/// Phase 172 W.4 (step 2/3) — the *real* Zephyr vendor-module build: `nros
+/// deploy zephyr-mod` generates the Zephyr entry app + runs `west build -b
+/// native_sim/native/64 {entry_src}`, producing `zephyr.exe`. Gated on
+/// `ZEPHYR_BASE` (`just zephyr setup` + export it) since west + the Zephyr
+/// workspace are external; skips cleanly otherwise (the dry-run test above
+/// always covers the deploy wiring). Boot + full data-plane (publish→zenohd)
+/// additionally needs host TAP networking (native_sim `zeth`), out of scope here.
+#[test]
+fn deploy_zephyr_vendor_module_real_west_build() {
+    if std::env::var_os("ZEPHYR_BASE").is_none() {
+        eprintln!(
+            "[SKIPPED] ZEPHYR_BASE not set — run `just zephyr setup` and export \
+             ZEPHYR_BASE=<workspace>/zephyr to enable the real west build"
+        );
+        return;
+    }
+    let fixture = fixture_workspace();
+    let build = fixture.join("build/zephyr-mod");
+    let _ = fs::remove_dir_all(&build);
+
+    deploy::run(deploy::Args {
+        name: Some("zephyr-mod".to_string()),
+        config: fixture.join("nros.toml"),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        dry_run: false,
+    })
+    .expect("nros deploy zephyr-mod runs the real west build to a native_sim image");
+
+    assert!(
+        build.join("zephyr/zephyr.exe").is_file(),
+        "native_sim zephyr.exe built at {}",
+        build.join("zephyr/zephyr.exe").display()
+    );
+    let _ = fs::remove_dir_all(&build);
 }

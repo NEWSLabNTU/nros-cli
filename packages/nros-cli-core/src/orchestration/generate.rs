@@ -530,6 +530,14 @@ fn render_zephyr_entry_lib_rs(plan: &NrosPlan) -> String {
     out.push_str(
         "#[unsafe(no_mangle)]\n\
          pub extern \"C\" fn rust_main() {\n\
+         \x20   // Referencing the `zephyr` crate links zephyr-lang-rust's\n\
+         \x20   // #[global_allocator] + #[panic_handler] into the staticlib, and\n\
+         \x20   // brings up logging; then wait for the net stack before the\n\
+         \x20   // transport connects (mirrors examples/zephyr/rust/talker).\n\
+         \x20   unsafe {\n\
+         \x20       zephyr::set_logger().ok();\n\
+         \x20   }\n\
+         \x20   let _ = nros::platform::zephyr::wait_for_network(2000);\n\
          \x20   let config = ExecutorConfig::default_const().node_name(SYSTEM.default_node_name());\n\
          \x20   let mut executor = match build_executor(&config) {\n\
          \x20       Ok(executor) => executor,\n\
@@ -684,15 +692,76 @@ fn render_zephyr_cmake(options: &GenerateOptions) -> String {
 }
 
 fn render_zephyr_prj_conf(plan: &NrosPlan) -> String {
-    // Phase 173.7 — append the net config derived from nros.toml
-    // `[[transport]]` as an additive fragment. The base prj.conf
-    // (kernel + generic networking) is the board's; nano-ros only adds
-    // the *net knobs* (static IP / DHCP). No transport ⇒ no fragment ⇒
-    // byte-identical base.
+    // Phase 172 W.4 — the per-RMW config is baked in (not left to a manual
+    // `-DCONF_FILE` overlay) so a vendor-module `west build {entry_src}` is
+    // self-contained. Phase 173.7 — the net config derived from nros.toml
+    // `[[transport]]` is an additive fragment on top.
     format!(
-        "{}{}",
+        "{}{}{}",
         ZEPHYR_PRJ_CONF_TEMPLATE,
-        zephyr_net_fragment(&plan.build)
+        zephyr_rmw_fragment(&plan.build),
+        zephyr_net_fragment(&plan.build),
+    )
+}
+
+/// Phase 172 W.4 — the per-RMW Zephyr Kconfig the generated app needs to build
+/// + link the chosen transport. Mirrors `examples/zephyr/rust/talker/
+/// prj-<rmw>.conf` (the source of truth for the knobs); `CONFIG_POSIX_API=y` in
+/// particular is what reconciles Zephyr's POSIX/net headers for the zenoh-pico
+/// / Cyclone C builds. Later assignments override the base prj.conf (Kconfig
+/// fragment semantics). Board-specific tuning (e.g. native_sim NSOS offload)
+/// belongs in a `[deploy].config` hook overlay, not here.
+fn zephyr_rmw_fragment(build: &PlanBuildOptions) -> String {
+    let body = match build.rmw.as_str() {
+        "zenoh" | "rmw-zenoh" => {
+            "CONFIG_NROS_RMW_ZENOH=y\n\
+             CONFIG_NET_TCP=y\n\
+             CONFIG_POSIX_API=y\n\
+             CONFIG_POSIX_THREAD_THREADS_MAX=16\n\
+             CONFIG_MAIN_STACK_SIZE=16384\n\
+             CONFIG_HEAP_MEM_POOL_SIZE=65536\n\
+             CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=4096\n\
+             CONFIG_NET_PKT_RX_COUNT=32\n\
+             CONFIG_NET_PKT_TX_COUNT=32\n\
+             CONFIG_NET_BUF_RX_COUNT=64\n\
+             CONFIG_NET_BUF_TX_COUNT=64\n\
+             CONFIG_NET_CONNECTION_MANAGER=y\n"
+        }
+        "xrce" | "rmw-xrce" => {
+            "CONFIG_NROS_RMW_XRCE=y\n\
+             CONFIG_NROS_XRCE_AGENT_ADDR=\"127.0.0.1\"\n\
+             CONFIG_NROS_XRCE_AGENT_PORT=2018\n\
+             CONFIG_NET_TCP=y\n\
+             CONFIG_MAIN_STACK_SIZE=16384\n\
+             CONFIG_HEAP_MEM_POOL_SIZE=65536\n\
+             CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=4096\n\
+             CONFIG_NET_PKT_RX_COUNT=32\n\
+             CONFIG_NET_PKT_TX_COUNT=32\n\
+             CONFIG_NET_BUF_RX_COUNT=64\n\
+             CONFIG_NET_BUF_TX_COUNT=64\n\
+             CONFIG_NET_CONNECTION_MANAGER=y\n"
+        }
+        "cyclonedds" | "rmw-cyclonedds" => {
+            "CONFIG_NROS_RMW_CYCLONEDDS=y\n\
+             CONFIG_CPP=y\n\
+             CONFIG_NROS_CYCLONE_DOMAIN_ID=0\n\
+             CONFIG_NET_IPV4_IGMP=y\n\
+             CONFIG_POSIX_API=y\n\
+             CONFIG_MAX_PTHREAD_MUTEX_COUNT=256\n\
+             CONFIG_MAX_PTHREAD_COND_COUNT=256\n\
+             CONFIG_POSIX_THREAD_THREADS_MAX=16\n\
+             CONFIG_MAIN_STACK_SIZE=524288\n\
+             CONFIG_HEAP_MEM_POOL_SIZE=4194304\n\
+             CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=8192\n\
+             CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE=16777216\n\
+             CONFIG_NET_TCP=y\n"
+        }
+        _ => return String::new(),
+    };
+    format!(
+        "\n# Phase 172 W.4 — per-RMW config (rmw = {}); mirrors \
+         examples/zephyr/rust/talker/prj-<rmw>.conf.\n{body}",
+        build.rmw
     )
 }
 
