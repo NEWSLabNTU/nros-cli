@@ -22,7 +22,6 @@ use super::{
 
 const CARGO_TEMPLATE: &str = include_str!("../../templates/orchestration/Cargo.toml.jinja");
 const BUILD_TEMPLATE: &str = include_str!("../../templates/orchestration/build.rs.jinja");
-const LIB_TEMPLATE: &str = include_str!("../../templates/orchestration/lib.rs.jinja");
 const ZEPHYR_CMAKE_TEMPLATE: &str =
     include_str!("../../templates/orchestration/zephyr/CMakeLists.txt.jinja");
 const ZEPHYR_PRJ_CONF_TEMPLATE: &str =
@@ -71,7 +70,10 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
         Some(EntryKind::ZephyrStaticlib)
     ) {
-        write_if_changed(&src_dir.join("lib.rs"), LIB_TEMPLATE)?;
+        // Phase 172 entry-lib fold: Zephyr now uses the same entry-lib base
+        // (build_executor + register_all) as every other platform, with a
+        // `rust_main` extern "C" appended for zephyr-lang-rust to jump into.
+        write_if_changed(&src_dir.join("lib.rs"), &render_zephyr_entry_lib_rs(&plan))?;
         let cmake = render_zephyr_cmake(options);
         let prj_conf = render_zephyr_prj_conf(&plan);
         write_if_changed(&options.output_dir.join("CMakeLists.txt"), &cmake)?;
@@ -81,10 +83,12 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         // `src/main.rs` is a thin `self` shim (hosted `fn main`, or a no_std
         // board shim driven by the board rlib's `run()`).
         write_if_changed(&src_dir.join("lib.rs"), &render_entry_lib_rs(&plan))?;
-        let board_shim = matches!(
-            profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
-            Some(EntryKind::BoardRun)
-        );
+        // BoardRun-with-board_entry → no_std board shim driven by the rlib's
+        // `run()`. Everything else (HostedMain, BoardRun without a
+        // board_entry like NuttX/orin-spe) → cfg-gated hosted shim.
+        let prof = profile(&plan.build.board, &plan.build.target);
+        let board_shim = matches!(prof.map(|p| p.entry_kind), Some(EntryKind::BoardRun))
+            && prof.and_then(|p| p.board_entry).is_some();
         let shim = if board_shim {
             render_board_shim_main(options, &plan)
         } else {
@@ -469,11 +473,12 @@ fn emits_entry_lib(plan: &NrosPlan) -> bool {
     match profile(&plan.build.board, &plan.build.target) {
         // Hosted `self`: the std entry lib + a hosted shim.
         Some(p) if p.entry_kind == EntryKind::HostedMain => uses_std(&plan.build),
-        // Board `self`: a no_std entry lib + a board shim (driven by the
-        // board rlib's `run()`). Requires a `board_entry` — NuttX/orin-spe
-        // (BoardRun, no board_entry) keep the legacy hosted-`main` path until
-        // they get one.
-        Some(p) if p.entry_kind == EntryKind::BoardRun => p.board_entry.is_some(),
+        // Board `self`: every BoardRun routes through the entry lib. Targets
+        // with a `board_entry` get a no_std board shim driven by the rlib's
+        // `run()`; targets without one (NuttX, orin-spe — they boot via libc
+        // `main`) get the cfg-gated hosted shim (std/no_std picked at compile
+        // time by the `std` feature, matching the legacy `HOSTED_MAIN`).
+        Some(p) if p.entry_kind == EntryKind::BoardRun => true,
         _ => false,
     }
 }
@@ -598,18 +603,55 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
 /// `lib.rs`; the shim only exists so a `self` deploy produces a runnable binary.
 fn render_hosted_shim_main(options: &GenerateOptions, _plan: &NrosPlan) -> String {
     let krate = crate_ident(&options.package_name);
+    // The std / no_std splits are cfg-gated like the legacy `HOSTED_MAIN`, so
+    // a single shim covers std-hosted (native/posix), BoardRun-with-no-board-
+    // entry (nuttx, orin-spe — they boot via libc `main` but compile no_std at
+    // the runtime layer), and any future cfg-flexible target.
     format!(
-        "//! Generated `self` startup shim (Phase 172 WP-B). All wiring lives in the\n\
-         //! entry lib (`lib.rs`); this only opens + registers + spins.\n\n\
+        "//! Generated `self` startup shim (Phase 172 entry-lib). All wiring lives in\n\
+         //! the entry lib (`lib.rs`); this only opens + registers + spins.\n\n\
          use nros::prelude::*;\n\
          use {krate}::{{SYSTEM, build_executor, register_all}};\n\n\
          fn main() -> core::result::Result<(), nros::NodeError> {{\n\
+         \x20   #[cfg(feature = \"std\")]\n\
          \x20   let config = ExecutorConfig::from_env().node_name(SYSTEM.default_node_name());\n\
+         \x20   #[cfg(not(feature = \"std\"))]\n\
+         \x20   let config = ExecutorConfig::default_const().node_name(SYSTEM.default_node_name());\n\
          \x20   let mut executor = build_executor(&config)?;\n\
          \x20   register_all(&mut executor)?;\n\
-         \x20   executor.spin_blocking(SpinOptions::default())\n\
+         \x20   #[cfg(feature = \"std\")]\n\
+         \x20   return executor.spin_blocking(SpinOptions::default());\n\
+         \x20   #[cfg(not(feature = \"std\"))]\n\
+         \x20   executor.spin_default()\n\
          }}\n"
     )
+}
+
+/// Generated Zephyr entry library: the same no_std entry-lib base (Rust API,
+/// no C ABI) plus a `#[unsafe(no_mangle)] extern "C" fn rust_main()` that
+/// zephyr-lang-rust's `rust_cargo_application()` jumps to from the Zephyr
+/// kernel `main`. Replaces the legacy stub `LIB_TEMPLATE` that built the
+/// executor by hand — Zephyr now reuses the universal `build_executor` +
+/// `register_all` like every other platform.
+fn render_zephyr_entry_lib_rs(plan: &NrosPlan) -> String {
+    let mut out = render_entry_lib_rs(plan);
+    out.push_str("\n// --- Zephyr entry (Phase 172) ---\n");
+    out.push_str("use nros::prelude::*;\n\n");
+    out.push_str(
+        "#[unsafe(no_mangle)]\n\
+         pub extern \"C\" fn rust_main() {\n\
+         \x20   let config = ExecutorConfig::default_const().node_name(SYSTEM.default_node_name());\n\
+         \x20   let mut executor = match build_executor(&config) {\n\
+         \x20       Ok(executor) => executor,\n\
+         \x20       Err(_) => return,\n\
+         \x20   };\n\
+         \x20   if register_all(&mut executor).is_err() {\n\
+         \x20       return;\n\
+         \x20   }\n\
+         \x20   let _ = executor.spin_default();\n\
+         }\n",
+    );
+    out
 }
 
 /// Generated board `self` startup shim: a `#![no_std]` `main` driven by the
