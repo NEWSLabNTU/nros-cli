@@ -453,6 +453,15 @@ pub struct PlanTransport {
     /// `config.toml`'s `[network].gateway`.)
     #[serde(default)]
     pub gateway: Option<String>,
+    /// NIC name(s) this transport multi-homes over (`["eth0", "eth1"]`) —
+    /// ethernet / wifi only. One session folds every listed interface into a
+    /// *single* discovery graph (Phase 172.K.7); this is the opposite intent
+    /// from declaring multiple `[[transport]]` entries (which open *separate*
+    /// sessions). Empty ⇒ the backend's default (all / any interface). The
+    /// generator maps the list per backend — zenoh listen/connect per NIC +
+    /// `scouting.multicast.interface`; Cyclone `<General><Interfaces>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
     /// Device handle (`"UART0"`, `"CAN0"`) — serial / can only.
     pub device: Option<String>,
     /// Line rate (serial baud / CAN bitrate) — serial / can only.
@@ -531,6 +540,9 @@ impl PlanBuildOptions {
                     }
                     if t.gateway.is_some() {
                         problems.push(format!("{at}: `gateway` is ethernet/wifi-only"));
+                    }
+                    if !t.interfaces.is_empty() {
+                        problems.push(format!("{at}: `interfaces` is ethernet/wifi-only"));
                     }
                     if t.ssid.is_some() || t.password.is_some() {
                         problems.push(format!("{at}: `ssid`/`password` are wifi-only"));
@@ -678,6 +690,54 @@ mod transport_tests {
         );
         let problems = build.validate_transports();
         assert_eq!(problems.len(), 2, "ssid + password rejected: {problems:?}");
+    }
+
+    #[test]
+    fn multi_homed_interfaces_parse_and_validate() {
+        // Phase 172.K.7 — an ethernet transport multi-homed over a NIC list.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "ethernet", "ip": "10.0.2.50/24", "rmw": "zenoh",
+                  "interfaces": ["eth0", "eth1"] }
+            ]"#,
+        );
+        assert_eq!(build.transports[0].interfaces, vec!["eth0", "eth1"]);
+        assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn interfaces_absent_round_trips_empty_and_skips_serialization() {
+        // Defaulted + skip-when-empty: a transport without `interfaces` parses
+        // to an empty list and serializes without the key (stable fixtures).
+        let build = build_with(
+            r#",
+            "transports": [ { "kind": "ethernet", "ip": "dhcp" } ]"#,
+        );
+        assert!(build.transports[0].interfaces.is_empty());
+        let json = serde_json::to_string(&build.transports[0]).unwrap();
+        assert!(
+            !json.contains("interfaces"),
+            "empty interfaces skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn interfaces_are_ethernet_wifi_only() {
+        // Phase 172.K.7 — serial + can reject an `interfaces` list.
+        let build = build_with(
+            r#",
+            "transports": [
+                { "kind": "serial", "device": "UART0", "interfaces": ["eth0"] },
+                { "kind": "can", "device": "CAN0", "interfaces": ["can0"] }
+            ]"#,
+        );
+        let problems = build.validate_transports();
+        assert_eq!(
+            problems.len(),
+            2,
+            "interfaces rejected on serial + can: {problems:?}"
+        );
     }
 
     #[test]

@@ -277,6 +277,19 @@ fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
         if let Some(password) = t.password.as_deref() {
             calls.push(format!("    c.set_password({password:?});"));
         }
+        // Phase 172.K.7 — multi-homing NIC list. Boards with a single fixed NIC
+        // (every embedded target today) take the default no-op; the setter is
+        // the seam a multi-homed hosted board / Cyclone `<Interfaces>` build
+        // reads. Emitted only when the list is non-empty.
+        if !t.interfaces.is_empty() {
+            let items = t
+                .interfaces
+                .iter()
+                .map(|i| format!("{i:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            calls.push(format!("    c.set_interfaces(&[{items}]);"));
+        }
     }
     calls
 }
@@ -3329,6 +3342,7 @@ mod net_fragment_tests {
             password: None,
             mac: None,
             gateway: None,
+            interfaces: Vec::new(),
             device: None,
             baudrate: None,
             rmw: None,

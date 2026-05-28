@@ -247,6 +247,41 @@ fn declared_serial_transport_selects_board_feature() {
 }
 
 #[test]
+fn multi_homed_interfaces_emit_set_interfaces_call() {
+    // Phase 172.K.7 — an ethernet `[[transport]]` with an `interfaces` list
+    // bakes a `set_interfaces(&["eth0", "eth1"])` call into the board Config
+    // override (the seam a multi-homed board / Cyclone `<Interfaces>` reads).
+    let root = temp_output("multi_homed_interfaces_emit_set_interfaces_call");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let plan_path = root.join("nros-plan.json");
+    let plan = include_str!("fixtures/orchestration/plan_pub_sub.json")
+        .replace(
+            "\"target\": \"x86_64-unknown-linux-gnu\"",
+            "\"target\": \"thumbv7m-none-eabi\"",
+        )
+        .replace("\"board\": \"native\"", "\"board\": \"baremetal\"")
+        .replace(
+            "\"cfg\": {}",
+            "\"cfg\": {}, \"transports\": [{ \"kind\": \"ethernet\", \"ip\": \"10.0.2.50/24\", \"interfaces\": [\"eth0\", \"eth1\"] }]",
+        );
+    fs::write(&plan_path, plan).expect("write transport plan");
+
+    let output_dir = root.join("generated");
+    generate_plan(
+        "multi_homed_interfaces_emit_set_interfaces_call",
+        plan_path,
+        output_dir.clone(),
+    );
+
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    assert!(
+        build_rs.contains("apply_transport_config")
+            && build_rs.contains("set_interfaces(&[\\\"eth0\\\", \\\"eth1\\\"])"),
+        "interfaces list written into board Config:\n{build_rs}"
+    );
+}
+
+#[test]
 fn bridge_two_transports_emit_open_multi_and_session_specs() {
     // Phase 173.5 — two `[[transport]]` entries (each with its own rmw)
     // put the build in bridge mode: both RMW deps are emitted, a
@@ -430,9 +465,7 @@ fn generated_package_registers_service_and_action_callbacks() {
     assert!(build_rs.contains("noop_raw_accepted"));
     assert!(build_rs.contains("register_service_raw_sized_on::<1024, 1024>"));
     assert!(build_rs.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>"));
-    assert!(build_rs.contains(
-        "nros::RawActionServerSpec { node_id: Some(node_handle_1)"
-    ));
+    assert!(build_rs.contains("nros::RawActionServerSpec { node_id: Some(node_handle_1)"));
     assert!(build_rs.contains("qos: nros::QosSettings::services_default()"));
     assert!(build_rs.contains("action_1.handle_id()"));
     assert!(!build_rs.contains("unsupported generated callback"));
