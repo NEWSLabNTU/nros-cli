@@ -9,12 +9,16 @@ use crate::types::{
     annotation_value_to_constant_value, escape_keyword, idl_constant_value_to_rust,
     idl_primitive_to_primitive, rust_type_for_idl, rust_type_for_idl_constant, to_snake_case,
 };
-use rosidl_parser::ast::{FieldType, Message};
-use rosidl_parser::idl::ast::{
-    Annotation, AnnotationValue, ConstantModule, EnumDef, IdlFile, IdlModule, IdlStruct,
-    StructMember,
+use rosidl_parser::{
+    ast::{FieldType, Message},
+    idl::{
+        ast::{
+            Annotation, AnnotationValue, ConstantModule, EnumDef, IdlFile, IdlModule, IdlStruct,
+            StructMember,
+        },
+        types::IdlType,
+    },
 };
-use rosidl_parser::idl::types::IdlType;
 use std::collections::HashSet;
 
 /// Generate Rust code for an IDL file.
@@ -364,11 +368,13 @@ fn idl_type_to_field_type(idl_type: &IdlType, package_name: &str) -> FieldType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rosidl_parser::idl::ast::{
-        AnnotationValue, ConstantModule, ConstantValue as IdlConstantValue, EnumDef, EnumVariant,
-        IdlConstant, IdlStruct, StructMember,
+    use rosidl_parser::idl::{
+        ast::{
+            AnnotationValue, ConstantModule, ConstantValue as IdlConstantValue, EnumDef,
+            EnumVariant, IdlConstant, IdlStruct, StructMember,
+        },
+        types::{IdlPrimitiveType, IdlType},
     };
-    use rosidl_parser::idl::types::{IdlPrimitiveType, IdlType};
 
     #[test]
     fn test_generate_constant_module() {

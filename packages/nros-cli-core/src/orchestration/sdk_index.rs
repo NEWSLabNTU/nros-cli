@@ -244,16 +244,12 @@ installer = "nvidia-sdk-manager"
     #[test]
     fn validate_rejects_board_referencing_undefined_package() {
         // qemu defined; board references it (ok) + a typo'd one (rejected).
-        let ok = SdkIndex::parse(
-            "[tool.qemu]\nversion=\"1\"\n[board.x]\npackages=[\"qemu\"]\n",
-        )
-        .unwrap();
+        let ok = SdkIndex::parse("[tool.qemu]\nversion=\"1\"\n[board.x]\npackages=[\"qemu\"]\n")
+            .unwrap();
         assert!(ok.validate().is_ok());
 
-        let bad = SdkIndex::parse(
-            "[tool.qemu]\nversion=\"1\"\n[board.x]\npackages=[\"qemoo\"]\n",
-        )
-        .unwrap();
+        let bad = SdkIndex::parse("[tool.qemu]\nversion=\"1\"\n[board.x]\npackages=[\"qemoo\"]\n")
+            .unwrap();
         let err = bad.validate().unwrap_err().to_string();
         assert!(err.contains("undefined package 'qemoo'"), "{err}");
 

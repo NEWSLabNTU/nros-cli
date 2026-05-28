@@ -8,15 +8,19 @@
 //! 5. Patch .cargo/config.toml
 //! 6. Invoke cargo build
 
-use crate::cache::{self, CACHE_FILE_NAME, Cache, CacheEntry};
-use crate::config_patcher::ConfigPatcher;
-use crate::dependency_parser::{DependencyParser, RosDependency};
+use crate::{
+    cache::{self, CACHE_FILE_NAME, Cache, CacheEntry},
+    config_patcher::ConfigPatcher,
+    dependency_parser::{DependencyParser, RosDependency},
+};
 use eyre::{Result, WrapErr, eyre};
 use rosidl_bindgen::ament::AmentIndex;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// Workflow context
 pub struct WorkflowContext {

@@ -1,9 +1,7 @@
 // Comparison tests - verify our codegen matches rosidl_generator_rs output
 use rosidl_codegen::{GeneratorError, generate_message_package};
 use rosidl_parser::parse_message;
-use std::collections::HashSet;
-use std::fs;
-use std::path::PathBuf;
+use std::{collections::HashSet, fs, path::PathBuf};
 
 mod parity_helpers;
 use parity_helpers::{normalize_code, print_diff};

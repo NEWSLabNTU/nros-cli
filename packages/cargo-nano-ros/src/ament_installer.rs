@@ -5,8 +5,10 @@
 //! source files, binaries, and metadata.
 
 use eyre::{Result, WrapErr};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Ament installer for creating ament-compatible installations
 pub struct AmentInstaller {

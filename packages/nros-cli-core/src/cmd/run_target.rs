@@ -12,8 +12,10 @@
 
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, eyre};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {

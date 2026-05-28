@@ -6,9 +6,11 @@
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Cache file name
 pub const CACHE_FILE_NAME: &str = ".ros2_bindgen_cache";

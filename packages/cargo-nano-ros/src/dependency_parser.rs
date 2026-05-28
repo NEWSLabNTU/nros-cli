@@ -5,8 +5,10 @@
 
 use cargo_metadata::MetadataCommand;
 use eyre::{Result, WrapErr, eyre};
-use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::{
+    collections::{HashSet, VecDeque},
+    path::Path,
+};
 
 /// Information about a ROS 2 dependency
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -1,12 +1,14 @@
 use super::common::{GeneratorError, build_cpp_ffi_field, build_cpp_field};
-use crate::templates::{
-    ActionCppHeaderTemplate, CConstant, CppFfiField, CppField, MessageCppFfiTemplate,
-    MessageCppHeaderTemplate, SequenceStructDef, ServiceCppHeaderTemplate,
+use crate::{
+    templates::{
+        ActionCppHeaderTemplate, CConstant, CppFfiField, CppField, MessageCppFfiTemplate,
+        MessageCppHeaderTemplate, SequenceStructDef, ServiceCppHeaderTemplate,
+    },
+    types::{
+        c_type_for_constant, compute_serialized_size_max, constant_value_to_rust, to_c_package_name,
+    },
+    utils::to_snake_case,
 };
-use crate::types::{
-    c_type_for_constant, compute_serialized_size_max, constant_value_to_rust, to_c_package_name,
-};
-use crate::utils::to_snake_case;
 use askama::Template;
 use rosidl_parser::{Action, FieldType, Message, Service};
 
@@ -135,7 +137,12 @@ fn extract_intra_package_includes(
     let c_pkg = to_c_package_name(package_name);
     let mut includes = Vec::new();
     for field in fields {
-        collect_field_type_intra_pkg_includes(&field.field_type, package_name, &c_pkg, &mut includes);
+        collect_field_type_intra_pkg_includes(
+            &field.field_type,
+            package_name,
+            &c_pkg,
+            &mut includes,
+        );
     }
     includes.sort();
     includes

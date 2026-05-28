@@ -1,5 +1,7 @@
-use crate::ast::*;
-use crate::lexer::{Token, TokenKind};
+use crate::{
+    ast::*,
+    lexer::{Token, TokenKind},
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]

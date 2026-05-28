@@ -4,10 +4,8 @@
 //! (std_msgs, geometry_msgs, etc.) that need bindings generated.
 
 use eyre::{Result, WrapErr, eyre};
-use quick_xml::Reader;
-use quick_xml::events::Event;
-use std::collections::HashSet;
-use std::path::Path;
+use quick_xml::{Reader, events::Event};
+use std::{collections::HashSet, path::Path};
 
 /// Parsed package.xml metadata
 #[derive(Debug, Clone)]

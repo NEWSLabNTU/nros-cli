@@ -6,8 +6,10 @@
 //! - Locate interface files (.msg, .srv, .action) within packages
 
 use eyre::{Result, WrapErr, eyre};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 /// Represents a ROS 2 package discovered in the ament index
 #[derive(Debug, Clone)]

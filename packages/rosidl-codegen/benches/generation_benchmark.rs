@@ -1,8 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rosidl_codegen::{generate_action_package, generate_message_package, generate_service_package};
 use rosidl_parser::{parse_action, parse_message, parse_service};
-use std::collections::HashSet;
-use std::hint::black_box;
+use std::{collections::HashSet, hint::black_box};
 
 fn benchmark_simple_message(c: &mut Criterion) {
     let msg_def = "int32 x\nfloat64 y\nstring name\n";

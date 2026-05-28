@@ -2,16 +2,19 @@ use super::common::{
     GeneratorError, build_c_field, determine_field_kind, field_to_nros_field,
     field_to_nros_field_with_mode,
 };
-use crate::templates::{
-    BuildRsTemplate, CConstant, CField, CargoNrosTomlTemplate, CargoTomlTemplate, IdiomaticField,
-    LibNrosRsTemplate, LibRsTemplate, MessageConstant, NrosField, RmwField, ServiceCHeaderTemplate,
-    ServiceCSourceTemplate, ServiceIdiomaticTemplate, ServiceNrosTemplate, ServiceRmwTemplate,
+use crate::{
+    templates::{
+        BuildRsTemplate, CConstant, CField, CargoNrosTomlTemplate, CargoTomlTemplate,
+        IdiomaticField, LibNrosRsTemplate, LibRsTemplate, MessageConstant, NrosField, RmwField,
+        ServiceCHeaderTemplate, ServiceCSourceTemplate, ServiceIdiomaticTemplate,
+        ServiceNrosTemplate, ServiceRmwTemplate,
+    },
+    types::{
+        NrosCodegenMode, RosEdition, c_type_for_constant, constant_value_to_rust, escape_keyword,
+        nros_type_for_constant, rust_type_for_constant, rust_type_for_field, to_c_package_name,
+    },
+    utils::{extract_dependencies, needs_big_array, to_snake_case},
 };
-use crate::types::{
-    NrosCodegenMode, RosEdition, c_type_for_constant, constant_value_to_rust, escape_keyword,
-    nros_type_for_constant, rust_type_for_constant, rust_type_for_field, to_c_package_name,
-};
-use crate::utils::{extract_dependencies, needs_big_array, to_snake_case};
 use askama::Template;
 use rosidl_parser::{FieldType, Message, Service};
 use std::collections::HashSet;

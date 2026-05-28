@@ -65,10 +65,9 @@ def resolve_rmw():
     """
     rmw = os.environ.get("NANO_ROS_RMW", "zenoh")
     if rmw not in RMW_BACKENDS:
-        raise ValueError(
-            f"NANO_ROS_RMW={rmw!r} not one of {RMW_BACKENDS}"
-        )
+        raise ValueError(f"NANO_ROS_RMW={rmw!r} not one of {RMW_BACKENDS}")
     return rmw
+
 
 # SDK environment variables forwarded to CMake and Cargo builds.
 SDK_ENV_VARS = (
@@ -330,7 +329,7 @@ class NrosBuildTask(TaskExtensionPoint):
         # Select the RMW Kconfig overlay (Phase 172.M): base prj.conf + the
         # per-RMW overlay, the same shape the `just zephyr` recipes use. RMW
         # from the single source (NANO_ROS_RMW env).
-        west_defs.append(f'-DCONF_FILE=prj.conf;prj-{resolve_rmw()}.conf')
+        west_defs.append(f"-DCONF_FILE=prj.conf;prj-{resolve_rmw()}.conf")
 
         cmd.extend(["--", *west_defs])
 

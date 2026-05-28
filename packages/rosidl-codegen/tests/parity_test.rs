@@ -3,9 +3,7 @@ use rosidl_codegen::{
     GeneratorError, generate_action_package, generate_message_package, generate_service_package,
 };
 use rosidl_parser::{parse_action, parse_message, parse_service};
-use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
+use std::{collections::HashSet, fs, path::Path};
 use walkdir::WalkDir;
 
 /// Helper to read a .msg file and parse it

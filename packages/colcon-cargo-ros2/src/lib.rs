@@ -5,8 +5,7 @@
 #![allow(clippy::useless_conversion)] // False positive with PyO3 macros
 #![allow(unsafe_op_in_unsafe_fn)] // PyO3 macros generate unsafe ops without blocks
 
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use std::path::PathBuf;
 
 /// Python wrapper for BindgenConfig

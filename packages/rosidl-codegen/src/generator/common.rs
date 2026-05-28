@@ -1,11 +1,13 @@
-use crate::templates::{CField, CppFfiField, CppField, FieldKind, NrosField, SequenceStructDef};
-use crate::types::{
-    C_DEFAULT_SEQUENCE_CAPACITY, CPP_DEFAULT_SEQUENCE_CAPACITY, CPP_DEFAULT_STRING_CAPACITY,
-    NrosCodegenMode, c_array_suffix_for_field, c_cdr_read_method, c_cdr_write_method,
-    c_type_for_field, cpp_array_suffix_for_field, cpp_type_for_field, escape_keyword,
-    nros_type_for_field_with_mode, repr_c_type_for_field, to_c_package_name,
+use crate::{
+    templates::{CField, CppFfiField, CppField, FieldKind, NrosField, SequenceStructDef},
+    types::{
+        C_DEFAULT_SEQUENCE_CAPACITY, CPP_DEFAULT_SEQUENCE_CAPACITY, CPP_DEFAULT_STRING_CAPACITY,
+        NrosCodegenMode, c_array_suffix_for_field, c_cdr_read_method, c_cdr_write_method,
+        c_type_for_field, cpp_array_suffix_for_field, cpp_type_for_field, escape_keyword,
+        nros_type_for_field_with_mode, repr_c_type_for_field, to_c_package_name,
+    },
+    utils::to_snake_case,
 };
-use crate::utils::to_snake_case;
 use rosidl_parser::FieldType;
 use thiserror::Error;
 

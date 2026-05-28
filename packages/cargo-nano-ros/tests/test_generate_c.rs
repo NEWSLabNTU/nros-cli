@@ -3,8 +3,7 @@
 //! Tests the `generate_c_from_args_file` function which is called by CMake.
 
 use cargo_nano_ros::{GenerateCConfig, generate_c_from_args_file};
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 use tempfile::TempDir;
 
 fn create_args_file(

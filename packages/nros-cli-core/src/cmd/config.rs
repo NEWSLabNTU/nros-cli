@@ -10,8 +10,10 @@
 
 use clap::{Args as ClapArgs, Subcommand};
 use eyre::{Result, WrapErr, eyre};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Subcommand)]
 pub enum Args {
@@ -88,8 +90,8 @@ fn check(args: CheckArgs) -> Result<()> {
 }
 
 fn load(path: &Path) -> Result<toml::Value> {
-    let raw = fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
     toml::from_str::<toml::Value>(&raw)
         .wrap_err_with(|| format!("invalid TOML in {}", path.display()))
 }

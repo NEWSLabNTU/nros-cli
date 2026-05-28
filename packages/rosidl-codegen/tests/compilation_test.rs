@@ -1,9 +1,7 @@
 // Compilation tests - verify generated code compiles successfully
 use rosidl_codegen::{GeneratorError, generate_message_package};
 use rosidl_parser::parse_message;
-use std::collections::HashSet;
-use std::fs;
-use std::process::Command;
+use std::{collections::HashSet, fs, process::Command};
 use tempfile::TempDir;
 
 /// Helper to create a minimal Cargo.toml for testing compilation

@@ -1,7 +1,8 @@
-use rosidl_parser::FieldType;
-use rosidl_parser::ast::ConstantValue;
-use rosidl_parser::idl::ast::ConstantValue as IdlConstantValue;
-use rosidl_parser::idl::types::IdlType;
+use rosidl_parser::{
+    FieldType,
+    ast::ConstantValue,
+    idl::{ast::ConstantValue as IdlConstantValue, types::IdlType},
+};
 
 /// ROS 2 edition for type hash generation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -908,8 +909,7 @@ impl IdlTypeExt for IdlType {
 pub fn idl_primitive_to_primitive(
     idl_prim: &rosidl_parser::idl::types::IdlPrimitiveType,
 ) -> rosidl_parser::PrimitiveType {
-    use rosidl_parser::PrimitiveType;
-    use rosidl_parser::idl::types::IdlPrimitiveType;
+    use rosidl_parser::{PrimitiveType, idl::types::IdlPrimitiveType};
 
     match idl_prim {
         IdlPrimitiveType::Short => PrimitiveType::Int16,
@@ -940,8 +940,7 @@ pub fn idl_primitive_to_primitive(
 pub fn annotation_value_to_constant_value(
     ann_val: &rosidl_parser::idl::ast::AnnotationValue,
 ) -> rosidl_parser::ast::ConstantValue {
-    use rosidl_parser::ast::ConstantValue;
-    use rosidl_parser::idl::ast::AnnotationValue;
+    use rosidl_parser::{ast::ConstantValue, idl::ast::AnnotationValue};
 
     match ann_val {
         AnnotationValue::Integer(i) => ConstantValue::Integer(*i),

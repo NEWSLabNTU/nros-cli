@@ -114,7 +114,12 @@ fn check_license_gates(workspace: Option<&Path>) -> Result<usize> {
             Some(v) => {
                 let dir = PathBuf::from(&v);
                 if dir.is_dir() {
-                    eprintln!("  [OK] {name} {}: ${} = {}", g.version, g.env, dir.display());
+                    eprintln!(
+                        "  [OK] {name} {}: ${} = {}",
+                        g.version,
+                        g.env,
+                        dir.display()
+                    );
                 } else {
                     eprintln!(
                         "  [!!] {name}: ${} set to {} — not a directory",

@@ -1,8 +1,10 @@
 //! IDL parser implementation.
 
-use super::ast::*;
-use super::lexer::{IdlLexer, IdlToken, IdlTokenKind};
-use super::types::{IdlPrimitiveType, IdlType};
+use super::{
+    ast::*,
+    lexer::{IdlLexer, IdlToken, IdlTokenKind},
+    types::{IdlPrimitiveType, IdlType},
+};
 use std::fmt;
 
 /// Parse error type.

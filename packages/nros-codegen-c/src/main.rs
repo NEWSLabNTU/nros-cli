@@ -5,8 +5,7 @@
 //!   nros-codegen resolve-deps --package-xml <path> --output-cmake <path> [--verbose]
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(name = "nros-codegen")]

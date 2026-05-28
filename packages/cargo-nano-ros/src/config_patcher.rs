@@ -4,9 +4,11 @@
 //! [patch.crates-io] entries for generated ROS 2 bindings.
 
 use eyre::{Result, WrapErr};
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 use toml::Value;
 
 /// Cargo config patcher

@@ -12,7 +12,9 @@ use eyre::{Result, WrapErr, bail};
 
 use crate::orchestration::{
     sdk_index::{SdkIndex, host_key},
-    sdk_store::{InstallAction, LOCK_FILE, SdkLock, execute, plan_install, store_root, tool_prefix},
+    sdk_store::{
+        InstallAction, LOCK_FILE, SdkLock, execute, plan_install, store_root, tool_prefix,
+    },
 };
 
 #[derive(Debug, ClapArgs)]
@@ -414,7 +416,9 @@ mod tests {
         assert!(fr.contains(&"freertos-kernel") && fr.contains(&"lwip"));
 
         let tx = resolve_packages(&idx, "qemu-riscv64-threadx").unwrap();
-        assert!(tx.contains(&"riscv-none-elf-gcc") && tx.contains(&"qemu") && tx.contains(&"threadx"));
+        assert!(
+            tx.contains(&"riscv-none-elf-gcc") && tx.contains(&"qemu") && tx.contains(&"threadx")
+        );
 
         // ESP32-C3: declared arch riscv32, no index host-tool (rustup target).
         assert!(resolve_packages(&idx, "esp32").unwrap().is_empty());
@@ -423,7 +427,9 @@ mod tests {
         assert!(orin.contains(&"arm-none-eabi-gcc") && orin.contains(&"nv-spe-fsp"));
 
         // Unknown board → error (no silent wrong guess), lists known boards.
-        let err = resolve_packages(&idx, "totally-unknown").unwrap_err().to_string();
+        let err = resolve_packages(&idx, "totally-unknown")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown board") && err.contains("native"));
     }
 

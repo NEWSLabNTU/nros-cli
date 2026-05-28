@@ -4,10 +4,11 @@
 //! and installed ament packages, similar to the Python colcon-cargo logic.
 
 use eyre::Result;
-use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 /// Discover Cargo packages in the workspace directory
 ///
