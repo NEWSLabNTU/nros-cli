@@ -376,7 +376,17 @@ fn synth_build_overlay(
         .as_deref()
         .or(sys.rmw.as_deref())
         .unwrap_or("zenoh");
-    let body = format!("[build]\ntarget = \"{target}\"\nboard = \"{board}\"\nrmw = \"{rmw}\"\n");
+    let mut body =
+        format!("[build]\ntarget = \"{target}\"\nboard = \"{board}\"\nrmw = \"{rmw}\"\n");
+    // W.4 — bake the locator (where the agent/peer is) as a synthetic
+    // `[[transport]]`; the generator surfaces it as `TRANSPORT_LOCATOR`. An
+    // ethernet transport with only a locator (no ip) is valid — networking on
+    // native_sim is host-offloaded (NSOS), real boards add ip via their overlay.
+    if let Some(locator) = &deploy.locator {
+        body.push_str(&format!(
+            "\n[[transport]]\nkind = \"ethernet\"\nlocator = \"{locator}\"\n"
+        ));
+    }
     let path = out_root.join("deploy-build-overlay.toml");
     std::fs::write(&path, body).wrap_err_with(|| format!("write {}", path.display()))?;
     Ok(path)

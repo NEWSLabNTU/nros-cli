@@ -538,7 +538,13 @@ fn render_zephyr_entry_lib_rs(plan: &NrosPlan) -> String {
          \x20       zephyr::set_logger().ok();\n\
          \x20   }\n\
          \x20   let _ = nros::platform::zephyr::wait_for_network(2000);\n\
-         \x20   let config = ExecutorConfig::default_const().node_name(SYSTEM.default_node_name());\n\
+         \x20   // Connect to the baked locator (where the agent/peer is) when the\n\
+         \x20   // deploy declared one; else the platform default.\n\
+         \x20   let config = match TRANSPORT_LOCATOR {\n\
+         \x20       Some(locator) => ExecutorConfig::new(locator),\n\
+         \x20       None => ExecutorConfig::default_const(),\n\
+         \x20   }\n\
+         \x20   .node_name(SYSTEM.default_node_name());\n\
          \x20   let mut executor = match build_executor(&config) {\n\
          \x20       Ok(executor) => executor,\n\
          \x20       Err(_) => return,\n\

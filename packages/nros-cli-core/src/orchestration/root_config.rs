@@ -147,6 +147,12 @@ pub struct DeployTarget {
     /// Per-target RMW override of `[system].rmw`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rmw: Option<String>,
+    /// Zenoh/DDS locator baked into the generated transport (where the agent /
+    /// peer is). Embedded deploys must bake it — there's no runtime env on the
+    /// target; hosted deploys usually read `ZENOH_LOCATOR` from the env instead.
+    /// Emitted as a synthetic `[[transport]]` in the build overlay (W.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
     /// Which `[systems.<name>]` this deploys (multi-system workspaces).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,

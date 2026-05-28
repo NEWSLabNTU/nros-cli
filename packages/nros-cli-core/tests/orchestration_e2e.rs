@@ -1687,5 +1687,13 @@ fn deploy_zephyr_vendor_module_real_west_build() {
         "native_sim zephyr.exe built at {}",
         build.join("zephyr/zephyr.exe").display()
     );
+    // The `[deploy].locator` is baked into the generated tables (W.4) so the
+    // embedded app connects without a runtime env.
+    let generated_build_rs =
+        fs::read_to_string(build.join("nros/generated/build.rs")).expect("read generated build.rs");
+    assert!(
+        generated_build_rs.contains("tcp/127.0.0.1:7456"),
+        "TRANSPORT_LOCATOR baked from [deploy].locator"
+    );
     let _ = fs::remove_dir_all(&build);
 }
