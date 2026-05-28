@@ -32,6 +32,17 @@ pub struct Args {
     #[arg(long)]
     pub licenses: bool,
 
+    /// Install a single tool by name (instead of a board's whole set), e.g.
+    /// `--tool qemu`. The `just <module> setup` recipes call this.
+    #[arg(long)]
+    pub tool: Option<String>,
+
+    /// Install prefix override (only with `--tool`): place the tool here instead
+    /// of the shared store, e.g. `--prefix build/qemu` so the test harness finds
+    /// it where it already looks. Layout is identical (`<prefix>/bin/…`).
+    #[arg(long)]
+    pub prefix: Option<PathBuf>,
+
     /// Path to the SDK index.
     #[arg(long, default_value = "nros-sdk-index.toml")]
     pub index: PathBuf,
@@ -52,6 +63,10 @@ pub fn run(args: Args) -> Result<()> {
     if args.licenses {
         print_licenses(&index);
         return Ok(());
+    }
+
+    if let Some(tool) = args.tool.as_deref() {
+        return install_single_tool(&index, tool, args.prefix.as_deref(), args.dry_run);
     }
 
     let board = match args.board.as_deref() {
@@ -118,6 +133,59 @@ pub fn run(args: Args) -> Result<()> {
         );
     } else {
         eprintln!("nros setup: {board} — all packages already present");
+    }
+    Ok(())
+}
+
+/// Install one tool by name (`nros setup --tool <name>`). `prefix_override`
+/// (from `--prefix`) places it outside the shared store — e.g. `build/qemu`, the
+/// location the test harness already reads, so `just <module> setup` can delegate
+/// here with no harness change and no script-side path resolution. Prebuilt-or-
+/// source per the index (187.3); the lockfile is only updated for shared-store
+/// installs (a `--prefix` placement is workspace-local).
+fn install_single_tool(
+    index: &SdkIndex,
+    name: &str,
+    prefix_override: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    let host = host_key();
+    let tool = index
+        .tool
+        .get(name)
+        .ok_or_else(|| eyre::eyre!("nros setup --tool: no [tool.{name}] in the index"))?;
+    let root = store_root();
+    let prefix = prefix_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| tool_prefix(&root, name, &tool.version));
+
+    let action = plan_install(tool, &host, &prefix);
+    eprintln!(
+        "nros setup --tool {name}: {} → {}",
+        describe(&action, &tool.version, &host),
+        prefix.display()
+    );
+    if dry_run {
+        eprintln!("(--dry-run: nothing installed)");
+        return Ok(());
+    }
+    match action {
+        InstallAction::Present => {}
+        InstallAction::Unavailable => bail!(
+            "nros setup --tool {name} {}: no prebuilt for {host} and no source recipe",
+            tool.version
+        ),
+        other => {
+            let prov = execute(&other, name, &tool.version, &prefix)
+                .wrap_err_with(|| format!("install {name} {}", tool.version))?;
+            // Only the shared store is tracked by the lock; --prefix is local.
+            if prefix_override.is_none() {
+                let lock_path = PathBuf::from("nros-sdk.lock");
+                let mut lock = SdkLock::load(&lock_path)?;
+                lock.record(name, &prov);
+                lock.save(&lock_path)?;
+            }
+        }
     }
     Ok(())
 }
