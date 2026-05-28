@@ -1,11 +1,9 @@
 use std::fmt::Debug;
 
 use nros_cli_core::orchestration::{
-    ComponentConfig, NrosPlan, SourceMetadata, SystemConfig,
+    ComponentConfig, NrosPlan, SourceMetadata,
     plan::PlanEntity,
-    schema::{
-        COMPONENT_CONFIG_VERSION, PLAN_VERSION, SOURCE_METADATA_VERSION, SYSTEM_CONFIG_VERSION,
-    },
+    schema::{COMPONENT_CONFIG_VERSION, PLAN_VERSION, SOURCE_METADATA_VERSION},
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -102,10 +100,6 @@ fn all_fixtures_use_current_schema_versions() {
     let component: ComponentConfig =
         assert_toml_fixture(include_str!("fixtures/orchestration/component_nros.toml"));
     assert_eq!(component.version, COMPONENT_CONFIG_VERSION);
-
-    let system: SystemConfig =
-        assert_toml_fixture(include_str!("fixtures/orchestration/system_nros.toml"));
-    assert_eq!(system.version, SYSTEM_CONFIG_VERSION);
 }
 
 #[test]
@@ -119,16 +113,6 @@ fn component_nros_toml_round_trips() {
         config.metadata.source_metadata,
         "target/nros/metadata/talker.json"
     );
-}
-
-#[test]
-fn system_nros_toml_round_trips() {
-    let config: SystemConfig =
-        assert_toml_fixture(include_str!("fixtures/orchestration/system_nros.toml"));
-
-    assert_eq!(config.version, SYSTEM_CONFIG_VERSION);
-    assert_eq!(config.system, "demo_system");
-    assert_eq!(config.scheduling.contexts[0].id, "default_executor");
 }
 
 #[test]

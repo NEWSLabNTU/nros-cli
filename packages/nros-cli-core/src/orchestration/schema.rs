@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 pub const SOURCE_METADATA_VERSION: u32 = 1;
 pub const COMPONENT_CONFIG_VERSION: u32 = 1;
-pub const SYSTEM_CONFIG_VERSION: u32 = 1;
 // v2 (Phase 172.B): additive `NrosPlan.callback_chains` (inferred callback
 // execution chains from the topic dataflow graph). Old plans without the field
 // still deserialize via `#[serde(default)]`.
