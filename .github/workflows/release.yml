@@ -9,6 +9,9 @@ permissions:
 
 jobs:
   release-build:
+    # Skip for `nros-v*` tags — those are the Rust binary releases
+    # (release-binary.yml), not the Python wheel (Phase 195.A).
+    if: ${{ !startsWith(github.event.release.tag_name, 'nros-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
