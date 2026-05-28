@@ -316,8 +316,17 @@ pub fn resolve_packages(board: &str, target: Option<&str>) -> Vec<&'static str> 
     let t = target.unwrap_or("").to_ascii_lowercase();
     let mut pkgs: Vec<&'static str> = Vec::new();
 
+    // ESP32 in nano-ros is ESP32-C3 (RISC-V), built with the rustup
+    // riscv32imc-unknown-none-elf target + build-std (rust-lld, no external gcc)
+    // and tested under Espressif's qemu-system-riscv32 fork — so it needs no
+    // index host-tool here (the Rust target comes from `just workspace
+    // rust-targets`; the esp qemu fork is not yet an index tool).
+    let is_esp32 = b.contains("esp32") || t.contains("xtensa");
+
     // Cross-toolchain by target arch / board family.
-    if t.contains("thumb")
+    if is_esp32 {
+        // no host-tool to fetch — see above.
+    } else if t.contains("thumb")
         || (t.contains("arm") && !t.contains("linux"))
         || b.contains("cortex-m")
         || b.contains("cortex-r")
@@ -328,12 +337,11 @@ pub fn resolve_packages(board: &str, target: Option<&str>) -> Vec<&'static str> 
         pkgs.push("arm-none-eabi-gcc");
     } else if t.contains("riscv") || b.contains("riscv") {
         pkgs.push("riscv-none-elf-gcc");
-    } else if t.contains("xtensa") || b.contains("esp32") {
-        pkgs.push("esp-toolchain");
     }
 
-    // QEMU for sim/test boards.
-    if b.contains("qemu") || b.contains("mps2") || b.contains("native_sim") {
+    // QEMU for sim/test boards — our arm/riscv64 qemu. NOT esp32: ESP32-C3 runs
+    // under Espressif's qemu-system-riscv32 fork (esp32c3 machine), separate.
+    if !is_esp32 && (b.contains("qemu") || b.contains("mps2") || b.contains("native_sim")) {
         pkgs.push("qemu");
     }
 
@@ -444,8 +452,12 @@ mod tests {
         assert!(riscv.contains(&"riscv-none-elf-gcc"));
         assert!(riscv.contains(&"qemu") && riscv.contains(&"threadx"));
 
-        let esp = resolve_packages("esp32", None);
-        assert_eq!(esp, vec!["esp-toolchain"]);
+        // ESP32-C3 is RISC-V via the rustup target + build-std; no index
+        // host-tool (no xtensa gcc, and our arm qemu doesn't serve esp32c3).
+        assert!(resolve_packages("esp32", None).is_empty());
+        assert!(
+            resolve_packages("qemu-esp32-baremetal", Some("riscv32imc-unknown-none-elf")).is_empty()
+        );
 
         let native = resolve_packages("native", Some("x86_64-unknown-linux-gnu"));
         assert_eq!(native, vec!["zenohd"]);
