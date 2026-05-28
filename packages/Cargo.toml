@@ -7,7 +7,8 @@ members = [
     "cargo-nano-ros",
     "nros-cli-core",
     "nros-cli",
-    "nros-codegen-c",
+    "nros-codegen-c",  # Phase 195.D: superseded by `nros codegen`; kept until
+                       # the cmake-module dedup lands, then deleted.
     "colcon-cargo-ros2",  # Package dir name (contains colcon-nano-ros crate)
 ]
 
