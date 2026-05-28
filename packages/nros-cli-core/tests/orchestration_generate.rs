@@ -30,15 +30,26 @@ fn generate_fixture(name: &str, plan_fixture: &str) -> PathBuf {
 }
 
 fn generate_plan(name: &str, plan_path: PathBuf, output_dir: PathBuf) {
+    // Phase 195.C — point `nros_path` at the hermetic fixture workspace so
+    // `profile()` resolves boards from its bundled `packages/boards` without
+    // the nano-ros superproject present (the CLI ships from a separate repo).
+    let root = fixture_workspace();
     generate_package(&GenerateOptions {
         package_name: "nros-generated-test".to_string(),
         output_dir,
         plan_path,
-        nros_path: PathBuf::from("/workspace/packages/core/nros"),
-        nros_orchestration_path: PathBuf::from("/workspace/packages/core/nros-orchestration"),
+        nros_path: root.join("packages/core/nros"),
+        nros_orchestration_path: root.join("packages/core/nros-orchestration"),
         component_workspace: None,
     })
     .unwrap_or_else(|error| panic!("{name} generated package writes: {error:?}"));
+}
+
+/// Hermetic fixture workspace bundled in the crate: carries
+/// `packages/boards/*/nros-board.toml` (Phase 195.C) so board resolution works
+/// without the real nano-ros `packages/boards`.
+fn fixture_workspace() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/board-workspace")
 }
 
 fn workspace_root() -> PathBuf {
@@ -75,15 +86,16 @@ fn generated_package_writes_manifest_build_script_and_main() {
     assert!(cargo_toml.contains(
         "default = [\"std\", \"nros/platform-posix\", \"nros/rmw-cffi\", \"nros-orchestration/rmw-cffi\"]"
     ));
-    assert!(cargo_toml.contains("nros = { path = \"/workspace/packages/core/nros\""));
-    assert!(
-        cargo_toml.contains(
-            "nros-orchestration = { path = \"/workspace/packages/core/nros-orchestration\""
-        )
-    );
-    assert!(cargo_toml.contains("nros-platform-cffi = { path = \"/workspace/packages/core/nros-platform-cffi\", default-features = false, features = [\"posix-c-port\"] }"));
-    assert!(!cargo_toml.contains("nros-cli-core"));
-    assert!(!cargo_toml.contains("serde_json"));
+    // Phase 195.C — `nros_path` is now the real workspace (so board descriptors
+    // resolve), so match the dep-path suffix rather than a fixed prefix.
+    assert!(cargo_toml.contains("nros = { path = \""));
+    assert!(cargo_toml.contains("packages/core/nros\""));
+    assert!(cargo_toml.contains("packages/core/nros-orchestration\""));
+    assert!(cargo_toml.contains("packages/core/nros-platform-cffi\", default-features = false, features = [\"posix-c-port\"] }"));
+    // No dependency on the CLI crate itself (the fixture-workspace path happens
+    // to contain "nros-cli-core", so match the dependency form, not the bare name).
+    assert!(!cargo_toml.contains("nros-cli-core = "));
+    assert!(!cargo_toml.contains("serde_json = "));
 
     let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
     assert!(build_rs.contains("const PLAN_PATH: &str ="));
@@ -208,7 +220,7 @@ fn declared_serial_transport_selects_board_feature() {
     let cargo_toml = fs::read_to_string(output_dir.join("Cargo.toml")).expect("read Cargo.toml");
     assert!(
         cargo_toml.contains(
-            "nros-board-mps2-an385 = { path = \"/workspace/packages/boards/nros-board-mps2-an385\", default-features = false, features = [\"serial\"] }"
+            "packages/boards/nros-board-mps2-an385\", default-features = false, features = [\"serial\"] }"
         ),
         "serial transport selects the board `serial` feature with defaults off:\n{cargo_toml}"
     );
@@ -531,12 +543,13 @@ fn generated_package_output_is_stable() {
     let first_build = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
     let first_main = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
 
+    let root = fixture_workspace();
     generate_package(&GenerateOptions {
         package_name: "nros-generated-test".to_string(),
         output_dir: output_dir.clone(),
         plan_path: fixture("plan_pub_sub.json"),
-        nros_path: PathBuf::from("/workspace/packages/core/nros"),
-        nros_orchestration_path: PathBuf::from("/workspace/packages/core/nros-orchestration"),
+        nros_path: root.join("packages/core/nros"),
+        nros_orchestration_path: root.join("packages/core/nros-orchestration"),
         component_workspace: None,
     })
     .expect("second generated package write");

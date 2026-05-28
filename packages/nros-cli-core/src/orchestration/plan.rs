@@ -496,6 +496,12 @@ pub struct PlanBuildOptions {
     /// builds) round-trip without an empty `"transports": []`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<PlanTransport>,
+    /// Phase 195.C — workspace root, populated at generate time (NOT part of
+    /// the plan wire format). Lets `profile()` load board descriptors from
+    /// `<workspace>/packages/boards/*/nros-board.toml` so the CLI carries no
+    /// baked-in board layout. `None` outside a generate run.
+    #[serde(skip)]
+    pub workspace_root: Option<std::path::PathBuf>,
 }
 
 impl PlanBuildOptions {

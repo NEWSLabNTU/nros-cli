@@ -13,6 +13,9 @@ use std::{
 
 use super::{
     NrosPlan,
+    board_descriptor::{
+        BoardCatalog, BoardDescriptor, EntryKind, LinkKind, NetStack, PlatformKind, Toolchain,
+    },
     plan::{
         LifecycleAutostart, PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext,
         TransportKind,
@@ -53,7 +56,11 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         )
     })?;
 
-    let plan = load_plan(&options.plan_path)?;
+    let mut plan = load_plan(&options.plan_path)?;
+    // Phase 195.C — record the workspace root so `profile()` can load board
+    // descriptors from `<workspace>/packages/boards/*/nros-board.toml`. Not
+    // part of the plan wire format (a `#[serde(skip)]` field).
+    plan.build.workspace_root = workspace_from_nros_path(&options.nros_path);
     // Phase 172 — fail fast with a clear message if a `[[bridge]]` forwards an
     // undeclared topic or names an unopened session, before emitting code.
     validate_bridges(&plan)?;
@@ -70,7 +77,7 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
     // file is `src/lib.rs`, not `src/main.rs`. Every other platform
     // uses a binary crate with `src/main.rs`.
     if matches!(
-        profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
+        profile(&plan.build).map(|p| p.entry_kind),
         Some(EntryKind::ZephyrStaticlib)
     ) {
         // Phase 172 entry-lib fold: Zephyr now uses the same entry-lib base
@@ -89,9 +96,11 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
         // BoardRun-with-board_entry → no_std board shim driven by the rlib's
         // `run()`. Everything else (HostedMain, BoardRun without a
         // board_entry like NuttX/orin-spe) → cfg-gated hosted shim.
-        let prof = profile(&plan.build.board, &plan.build.target);
-        let board_shim = matches!(prof.map(|p| p.entry_kind), Some(EntryKind::BoardRun))
-            && prof.and_then(|p| p.board_entry).is_some();
+        let prof = profile(&plan.build);
+        let board_shim = matches!(
+            prof.as_ref().map(|p| p.entry_kind),
+            Some(EntryKind::BoardRun)
+        ) && prof.as_ref().and_then(|p| p.entry.as_ref()).is_some();
         let shim = if board_shim {
             render_board_shim_main(options, &plan)
         } else {
@@ -198,7 +207,7 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
 /// regular binary crate.
 fn render_lib_section(plan: &NrosPlan, package_name: &str) -> String {
     if matches!(
-        profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind),
+        profile(&plan.build).map(|p| p.entry_kind),
         Some(EntryKind::ZephyrStaticlib)
     ) {
         return "\n[lib]\nname = \"rustapp\"\ncrate-type = [\"staticlib\"]\n".to_string();
@@ -226,7 +235,7 @@ fn render_lib_section(plan: &NrosPlan, package_name: &str) -> String {
 /// staticlib at compile time. Other platforms have an empty
 /// build-deps section today.
 fn render_build_dependencies(plan: &NrosPlan) -> String {
-    match profile(&plan.build.board, &plan.build.target).map(|p| p.entry_kind) {
+    match profile(&plan.build).map(|p| p.entry_kind) {
         Some(EntryKind::ZephyrStaticlib) => "zephyr-build = \"0.1.0\"\n".to_string(),
         _ => String::new(),
     }
@@ -327,11 +336,11 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 /// Whether the board owns the net stack + the plan carries transport config to
 /// bake into its `Config` (drives the shim's `apply_transport_config` call).
 fn emits_transport_config_override(plan: &NrosPlan) -> bool {
-    let Some(p) = profile(&plan.build.board, &plan.build.target) else {
+    let Some(p) = profile(&plan.build) else {
         return false;
     };
-    p.board_entry.is_some()
-        && p.net_stack == NetStack::NanoRosOwned
+    p.entry.is_some()
+        && p.net_stack == NetStack::NanorosOwned
         && !transport_config_setter_calls(&plan.build).is_empty()
 }
 
@@ -354,7 +363,7 @@ fn system_ident(plan: &NrosPlan) -> String {
 /// boots. Board, Zephyr, no_std-hosted, and bridge entries keep their current
 /// emitter until later WP-B slices generalize the lib + add the source form.
 fn emits_entry_lib(plan: &NrosPlan) -> bool {
-    match profile(&plan.build.board, &plan.build.target) {
+    match profile(&plan.build) {
         // Hosted `self`: the std entry lib + a hosted shim.
         Some(p) if p.entry_kind == EntryKind::HostedMain => uses_std(&plan.build),
         // Board `self`: every BoardRun routes through the entry lib. Targets
@@ -584,8 +593,8 @@ fn render_zephyr_entry_lib_rs(plan: &NrosPlan) -> String {
 /// `run_system`. The board self shim needs no C ABI.
 fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String {
     let krate = crate_ident(&options.package_name);
-    let entry = profile(&plan.build.board, &plan.build.target)
-        .and_then(|p| p.board_entry)
+    let entry = profile(&plan.build)
+        .and_then(|p| p.entry)
         .expect("render_board_shim_main: board_entry present (gated by emits_entry_lib)");
     let apply_config = emits_transport_config_override(plan);
     let bridge = is_multi_session(plan);
@@ -615,15 +624,15 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
     };
     out.push_str(&imports);
     if !entry.crate_root_extra.is_empty() {
-        out.push_str(entry.crate_root_extra);
+        out.push_str(&entry.crate_root_extra);
         out.push('\n');
     }
     out.push('\n');
     if !entry.comment.is_empty() {
-        out.push_str(entry.comment);
+        out.push_str(&entry.comment);
         out.push('\n');
     }
-    out.push_str(entry.signature);
+    out.push_str(&entry.signature);
     if bridge {
         // Bridge mode: hardware bring-up via `<board>::run`, then the entry
         // lib's `build_executor_bridge` opens every SESSION_SPEC; the per-run
@@ -866,7 +875,7 @@ fn ipv4_to_hex(addr: &str) -> Option<String> {
 /// targets NuttX *and* declares an ethernet transport with an `ip` —
 /// keeping the no-transport NuttX build byte-identical (no extra file).
 fn nuttx_net_fragment(plan: &NrosPlan) -> Option<String> {
-    if profile(&plan.build.board, &plan.build.target).map(|p| p.kind) != Some(PlatformKind::Nuttx) {
+    if profile(&plan.build).map(|p| p.platform) != Some(PlatformKind::Nuttx) {
         return None;
     }
     let eth = plan
@@ -900,19 +909,18 @@ fn nuttx_net_fragment(plan: &NrosPlan) -> Option<String> {
 /// Phase 126.M5.nuttx — pin nightly + `rust-src` for targets that use
 /// `-Z build-std`. NuttX `armv7a-nuttx-eabihf` rebuilds `std` from
 /// source against the patched libc fork; the nightly date MUST match
-/// `third-party/nuttx/libc/Cargo.toml`'s `version =` field per the
-/// note in `examples/qemu-arm-nuttx/rust-toolchain.toml`. Other
+/// the version pinned by the NuttX board crate's vendored libc. Other
 /// platforms use stable rustc with prebuilt targets.
 fn render_rust_toolchain(plan: &NrosPlan) -> Option<String> {
     // Phase 173.2 / 173.6 — toolchain pin driven by `profile()`. ESP32-C3
     // and NuttX need a nightly + `rust-src` pin (for `-Z build-std`);
     // ESP32-S3 (Xtensa) needs the espup `esp` channel; every other
     // platform uses stable.
-    match profile(&plan.build.board, &plan.build.target) {
-        Some(PlatformProfile {
-            toolchain: Toolchain::Esp,
-            ..
-        }) => Some(
+    match (
+        profile(&plan.build)?.toolchain,
+        profile(&plan.build)?.platform,
+    ) {
+        (Toolchain::Esp, _) => Some(
             r#"# Auto-generated by `nros build` for the ESP32-S3 (Xtensa) target.
 # Phase 173.6 — xtensa-esp32s3-none-elf is not a rustup target; it ships
 # in the espup `esp` channel, which also bundles `rust-src` for the
@@ -923,11 +931,7 @@ components = ["rust-src", "rustfmt"]
 "#
             .to_string(),
         ),
-        Some(PlatformProfile {
-            toolchain: Toolchain::Nightly,
-            kind: PlatformKind::Esp32,
-            ..
-        }) => Some(
+        (Toolchain::Nightly, PlatformKind::Esp32) => Some(
             r#"# Auto-generated by `nros build` for the ESP32-C3 target.
 # Phase 126.M5.esp32 — riscv32imc-unknown-none-elf needs `-Z build-std`
 # (no_std + alloc), which needs nightly + `rust-src`. Pin matches
@@ -938,15 +942,11 @@ components = ["rust-src", "rustfmt"]
 "#
             .to_string(),
         ),
-        Some(PlatformProfile {
-            toolchain: Toolchain::Nightly,
-            kind: PlatformKind::Nuttx,
-            ..
-        }) => Some(
+        (Toolchain::Nightly, PlatformKind::Nuttx) => Some(
             r#"# Auto-generated by `nros build` for the NuttX target.
 # Phase 126.M5.nuttx — armv7a-nuttx-eabihf needs `-Z build-std`, which
 # needs nightly + `rust-src`. The pinned date matches the patched libc
-# version in `third-party/nuttx/libc/Cargo.toml`.
+# version pinned by the NuttX board crate.
 [toolchain]
 channel = "nightly-2026-04-11"
 components = ["rust-src", "rustfmt"]
@@ -983,7 +983,7 @@ fn render_build_rs(options: &GenerateOptions, plan: &NrosPlan) -> String {
 /// `examples/qemu-arm-nuttx/rust/zenoh/talker/build.rs` emits per
 /// crate.
 fn render_platform_link_directives(plan: &NrosPlan) -> String {
-    match profile(&plan.build.board, &plan.build.target).map(|p| p.link_kind) {
+    match profile(&plan.build).map(|p| p.link_kind) {
         Some(LinkKind::NuttxStaging) => NUTTX_LINK_DIRECTIVES.to_string(),
         _ => String::new(),
     }
@@ -1075,159 +1075,11 @@ fn render_native_link_directives(options: &GenerateOptions, plan: &NrosPlan) -> 
 }
 
 fn render_cargo_config(options: &GenerateOptions, plan: &NrosPlan) -> Option<String> {
-    let nros_path = options.nros_path.as_path();
-    let p = profile(&plan.build.board, &plan.build.target)?;
-    match p.kind {
-        // Phase 126.M5.esp32 — ESP32 bare-metal target wiring. esp-hal
-        // links via `-Tlinkall.x` (esp-hal ships the linker script);
-        // `force-frame-pointers` matches the example slices.
-        // `build-std = ["core", "alloc"]` because esp32 is no_std + alloc.
-        // ESP32-C3 uses stable riscv32imc; ESP32-S3 needs the `+esp`
-        // Xtensa nightly (handled by render_rust_toolchain).
-        PlatformKind::Esp32 => {
-            let target = esp32_target(p.chip?);
-            Some(format!(
-                r#"[build]
-target = "{target}"
-
-[target.{target}]
-rustflags = [
-    "-C", "link-arg=-Tlinkall.x",
-    "-C", "force-frame-pointers",
-]
-
-[env]
-ESP_LOG = "info"
-
-[unstable]
-build-std = ["core", "alloc"]
-"#
-            ))
-        }
-        // Phase 126.M5.stm32f4 — STM32F4 (Cortex-M4F, thumbv7em-none-eabihf).
-        // cortex-m-rt's `link.x` placed via the board crate's memory.x;
-        // diagnostics go over defmt-rtt (no QEMU runner — STM32F4 is real
-        // hardware flashed with probe-rs, so the e2e test asserts the build
-        // artifact only).
-        PlatformKind::Stm32 => Some(
-            r#"[build]
-target = "thumbv7em-none-eabihf"
-
-[target.thumbv7em-none-eabihf]
-rustflags = [
-    "-C", "link-arg=-Tlink.x",
-]
-"#
-            .to_string(),
-        ),
-        // Phase 126.M5.threadx-riscv64 — bare-metal ThreadX on QEMU RISC-V
-        // virt (riscv64gc-unknown-none-elf). `link.lds` is emitted to the
-        // board crate's OUT_DIR + surfaced via `cargo:rustc-link-search`
-        // (which propagates), so the rustflag references it by name. The
-        // ThreadX kernel + NetX C builds need the RV64 port + config dirs;
-        // the example pins them via env (the threadx-linux defaults in
-        // `.envrc` point at the wrong port). Absolute paths so the
-        // generated package (built out-of-tree) resolves them.
-        PlatformKind::ThreadxRiscv64 => {
-            let workspace = nros_path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::parent)?;
-            let config_dir = path_for_template(
-                &workspace.join("packages/boards/nros-board-threadx-qemu-riscv64/config"),
-            );
-            let extra_includes = path_for_template(
-                &workspace
-                    .join("third-party/threadx/kernel/ports/risc-v64/gnu/example_build/qemu_virt"),
-            );
-            Some(format!(
-                r#"[build]
-target = "riscv64gc-unknown-none-elf"
-
-[target.riscv64gc-unknown-none-elf]
-rustflags = [
-    "-C", "link-arg=-Tlink.lds",
-    "-C", "link-arg=--nmagic",
-]
-
-[env]
-NETX_CONFIG_DIR = {{ value = "{config_dir}", force = true }}
-THREADX_CONFIG_DIR = {{ value = "{config_dir}", force = true }}
-THREADX_PORT = {{ value = "risc-v64/gnu", force = true }}
-THREADX_EXTRA_INCLUDES = {{ value = "{extra_includes}", force = true }}
-"#
-            ))
-        }
-        PlatformKind::Freertos => Some(
-            r#"[target.thumbv7m-none-eabi]
-runner = "qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -kernel"
-rustflags = [
-    "-C", "link-arg=-Tmps2_an385.ld",
-    "-C", "link-arg=--nmagic",
-]
-"#
-            .to_string(),
-        ),
-        // Phase 126.M5.bare-metal — pure Cortex-M3. cortex-m-rt's
-        // `link.x` linker script (pulled in via the board crate's
-        // memory.x) places the vector table + sections; the QEMU
-        // runner boots the ELF as an mps2-an385 kernel image with
-        // semihosting for stdout + exit.
-        PlatformKind::BareMetal => Some(
-            r#"[target.thumbv7m-none-eabi]
-runner = "qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -kernel"
-rustflags = [
-    "-C", "link-arg=-Tlink.x",
-]
-"#
-            .to_string(),
-        ),
-        // Phase 126.M5.nuttx — NuttX QEMU ARM target wiring.
-        // armv7a-nuttx-eabihf needs build-std (Rust stdlib rebuilt
-        // against NuttX's libc), the cortex-a7 + neon-vfpv4 ABI
-        // flags, and the in-tree libc fork patched in via
-        // `[patch.crates-io]`. The `[patch.crates-io]` block MUST
-        // live in `.cargo/config.toml` (NOT `Cargo.toml`) so that
-        // `-Z build-std` applies it to the stdlib build itself —
-        // `Cargo.toml`'s `[patch]` only affects the consumer's deps.
-        // The board crate's build.rs handles CFLAGS / linker-script
-        // discovery from `$NUTTX_DIR`.
-        PlatformKind::Nuttx => {
-            let workspace = nros_path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::parent)?;
-            Some(format!(
-                r#"[build]
-target = "armv7a-nuttx-eabihf"
-
-[unstable]
-build-std = ["std", "panic_abort"]
-build-std-features = ["compiler-builtins-mem"]
-
-[target.armv7a-nuttx-eabihf]
-linker = "arm-none-eabi-gcc"
-rustflags = [
-    "-C", "link-arg=-mcpu=cortex-a7",
-    "-C", "link-arg=-mfloat-abi=hard",
-    "-C", "link-arg=-mfpu=neon-vfpv4",
-]
-
-[env]
-CC_armv7a_nuttx_eabihf = "arm-none-eabi-gcc"
-CFLAGS_armv7a_nuttx_eabihf = "-mcpu=cortex-a7 -mfloat-abi=hard -mfpu=neon-vfpv4"
-
-[patch.crates-io]
-libc = {{ path = "{}" }}
-"#,
-                path_for_template(&workspace.join("third-party/nuttx/libc")),
-            ))
-        }
-        PlatformKind::Posix
-        | PlatformKind::Zephyr
-        | PlatformKind::ThreadxLinux
-        | PlatformKind::OrinSpe => None,
-    }
+    // The board descriptor carries the verbatim `.cargo/config.toml` body (with
+    // `${workspace}` placeholders for any layout path); the CLI bakes in no
+    // per-platform config. Boards needing no config omit the field.
+    let workspace = workspace_from_nros_path(&options.nros_path)?;
+    profile(&plan.build)?.cargo_config_rendered(&workspace)
 }
 
 fn path_for_template(path: &Path) -> String {
@@ -1368,127 +1220,63 @@ fn render_platform_dependencies(options: &GenerateOptions, plan: &NrosPlan) -> S
     let Some(workspace) = workspace_from_nros_path(&options.nros_path) else {
         return String::new();
     };
-    let Some(p) = profile(&plan.build.board, &plan.build.target) else {
+    let Some(p) = profile(&plan.build) else {
         return String::new();
     };
-    match p.kind {
-        // Phase 126.M5.esp32 — ESP32 boards pull the board crate + the
-        // esp-hal entry/panic/bootloader crates. esp-hal's `#[main]` proc
-        // macro + esp-backtrace's panic handler + esp-bootloader's
-        // `esp_app_desc!()` must be visible at the generated package's
-        // crate root, so they're direct deps (not just transitive via the
-        // board crate). The chip feature (`esp32c3` / `esp32s3`) gates each.
-        PlatformKind::Esp32 => {
-            let chip = p.chip.unwrap_or("esp32c3");
-            // Phase 173.6 — the board crate is chip-specific: ESP32-C3
-            // runs under QEMU (OpenETH NIC, ethernet/serial); ESP32-S3 is
-            // real Xtensa hardware (serial). Selected from `profile().chip`,
-            // not a new match arm.
-            let board_crate = if chip == "esp32s3" {
-                "nros-board-esp32s3"
+    // Board-crate dependency — name + path come from the descriptor, so no
+    // `nros-board-*` / `packages/boards/...` literal lives in the CLI. An
+    // RtosOwned board (NuttX) takes a plain path dep: its transports land in
+    // the RTOS defconfig, not the board `Config`, so no transport-feature
+    // merge. Crate-less host boards (posix / zephyr / orin-spe) have no
+    // `board_crate` and emit their deps below.
+    let board_line = match (p.board_crate.as_deref(), p.crate_path_rel()) {
+        (Some(name), Some(rel)) => {
+            let path = path_for_template(&workspace.join(rel));
+            if p.net_stack == NetStack::RtosOwned {
+                format!("{name} = {{ path = \"{path}\" }}\n")
             } else {
-                "nros-board-esp32-qemu"
-            };
-            let board = board_dep(
-                board_crate,
-                &path_for_template(&workspace.join(format!("packages/boards/{board_crate}"))),
-                &[],
-                &plan.build,
-            );
+                let feats: Vec<&str> = p.board_features.iter().map(String::as_str).collect();
+                board_dep(name, &path, &feats, &plan.build)
+            }
+        }
+        _ => String::new(),
+    };
+    // Per-platform direct crates.io deps that must be visible at the generated
+    // package's crate root (entry-point proc macros, panic handlers, log
+    // transports) plus the crate-less boards' platform deps.
+    let extra = match p.platform {
+        // esp-hal's `#[main]` + esp-backtrace's panic handler + esp-bootloader's
+        // `esp_app_desc!()`. The chip feature (`esp32c3` / `esp32s3`) gates each.
+        PlatformKind::Esp32 => {
+            let chip = p.chip.as_deref().unwrap_or("esp32c3");
             format!(
-                "{board}\
-                 esp-hal = {{ version = \"~1.0.0\", features = [\"{chip}\", \"unstable\"] }}\n\
+                "esp-hal = {{ version = \"~1.0.0\", features = [\"{chip}\", \"unstable\"] }}\n\
                  esp-backtrace = {{ version = \"~0.18.0\", features = [\"{chip}\", \"panic-handler\", \"println\"] }}\n\
                  esp-bootloader-esp-idf = {{ version = \"~0.4.0\", features = [\"{chip}\"] }}\n",
             )
         }
-        // Phase 126.M5.stm32f4 — STM32F4 boards pull the board crate (with
-        // the chip feature) + the defmt logging + panic-probe crates.
-        // defmt's `timestamp!` macro + panic-probe's panic handler +
-        // defmt-rtt's transport must be visible at the generated package's
-        // crate root, so they're direct deps (not just transitive via the
-        // board crate).
+        // defmt's `timestamp!` + panic-probe's panic handler + defmt-rtt.
         PlatformKind::Stm32 => {
-            let chip = p.chip.unwrap_or("stm32f429");
-            let board = board_dep(
-                "nros-board-stm32f4",
-                &path_for_template(&workspace.join("packages/boards/nros-board-stm32f4")),
-                &[chip],
-                &plan.build,
-            );
-            format!(
-                "{board}\
-                 panic-probe = {{ version = \"0.3\", features = [\"print-defmt\"] }}\n\
-                 defmt = \"0.3\"\n\
-                 defmt-rtt = \"0.4\"\n",
-            )
+            "panic-probe = { version = \"0.3\", features = [\"print-defmt\"] }\n\
+             defmt = \"0.3\"\n\
+             defmt-rtt = \"0.4\"\n"
+                .to_string()
         }
+        // Cortex-M `no_std` panic handler + QEMU semihosting exit.
+        PlatformKind::Freertos | PlatformKind::BareMetal => {
+            "panic-semihosting = { version = \"0.6\", features = [\"exit\"] }\n".to_string()
+        }
+        // Posix has no board crate — the C-port platform shim is the dep.
         PlatformKind::Posix => format!(
             "nros-platform-cffi = {{ path = \"{}\", default-features = false, features = [\"posix-c-port\"] }}\n",
             path_for_template(&workspace.join("packages/core/nros-platform-cffi")),
         ),
-        PlatformKind::Freertos => format!(
-            "{}panic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
-            board_dep(
-                "nros-board-mps2-an385-freertos",
-                &path_for_template(
-                    &workspace.join("packages/boards/nros-board-mps2-an385-freertos")
-                ),
-                &[],
-                &plan.build,
-            ),
-        ),
-        // Phase 126.M5.bare-metal — pure Cortex-M3 (MPS2-AN385,
-        // thumbv7m-none-eabi). The board crate owns hardware + lwIP +
-        // smoltcp init and re-exports the `cortex-m-rt` `#[entry]`
-        // macro; panic-semihosting provides the `no_std` panic
-        // handler + QEMU exit.
-        PlatformKind::BareMetal => format!(
-            "{}panic-semihosting = {{ version = \"0.6\", features = [\"exit\"] }}\n",
-            board_dep(
-                "nros-board-mps2-an385",
-                &path_for_template(&workspace.join("packages/boards/nros-board-mps2-an385")),
-                &[],
-                &plan.build,
-            ),
-        ),
-        // Phase 126.M5.nuttx — NuttX QEMU ARM (Cortex-A7 + virtio-net,
-        // armv7a-nuttx-eabihf target). The board crate provides the
-        // BoardInit shim; NuttX kernel + virtio-net + BSD sockets are
-        // built out-of-tree via `just nuttx setup`.
-        PlatformKind::Nuttx => format!(
-            "nros-board-nuttx-qemu-arm = {{ path = \"{}\" }}\n",
-            path_for_template(&workspace.join("packages/boards/nros-board-nuttx-qemu-arm")),
-        ),
-        // Phase 126.M5.zephyr — zephyr-lang-rust integration. The
-        // generated package consumes the Zephyr Rust API through the
-        // `zephyr` crate (provides `set_logger`, `kconfig`, POSIX
-        // shims, the network-readiness wait helper). The kernel +
-        // RMW + nros C runtime are linked at the CMake layer through
-        // `rust_cargo_application()`.
+        // zephyr-lang-rust integration: the `zephyr` crate (logger, kconfig,
+        // POSIX shims). Kernel / RMW / nros C runtime link at the CMake layer.
         PlatformKind::Zephyr => "zephyr = \"0.1.0\"\nlog = \"0.4\"\n".to_string(),
-        // Phase 126.M5.threadx — ThreadX board crate. Two variants:
-        // `threadx-linux` (host-hosted ThreadX + NetX Duo over the
-        // NSOS BSD shim; builds as a normal Linux executable) and
-        // `threadx-qemu-riscv64` (bare-metal riscv64gc, QEMU virt +
-        // virtio-net). Both board crates own their kernel / NetX link
-        // via propagating `cargo:rustc-link-lib`, so the generated
-        // package needs only the path dep — no consumer-side build.rs
-        // link directives.
-        PlatformKind::ThreadxRiscv64 => board_dep(
-            "nros-board-threadx-qemu-riscv64",
-            &path_for_template(&workspace.join("packages/boards/nros-board-threadx-qemu-riscv64")),
-            &[],
-            &plan.build,
-        ),
-        PlatformKind::ThreadxLinux => board_dep(
-            "nros-board-threadx-linux",
-            &path_for_template(&workspace.join("packages/boards/nros-board-threadx-linux")),
-            &[],
-            &plan.build,
-        ),
-        PlatformKind::OrinSpe => String::new(),
-    }
+        _ => String::new(),
+    };
+    format!("{board_line}{extra}")
 }
 
 /// Canonical RMW name (`zenoh` / `xrce` / `cyclonedds`) from any of the
@@ -1580,7 +1368,7 @@ fn backend_features(build: &PlanBuildOptions, backend: &str) -> Vec<String> {
     if uses_std(build) {
         features.push("std".to_string());
     }
-    if let Some(platform) = platform_feature(&build.board, &build.target) {
+    if let Some(platform) = platform_feature(build) {
         features.push(platform.to_string());
     }
     // Phase 126.M4 — `link-tcp` / `link-udp-unicast` feature gates were
@@ -1636,12 +1424,12 @@ fn generated_default_features(
     // (which gate the platform-specific Cargo deps + cfg) both come from
     // the single `profile()` descriptor. (Since Phase 173.2b the
     // `src/main.rs` entry is selected by `render_main` from
-    // `profile().board_entry`, not by these feature aliases.) ESP32/STM32
+    // `profile().entry`, not by these feature aliases.) ESP32/STM32
     // carry only their own alias (`platform-esp32-qemu` /
     // `platform-stm32`), NOT the `platform-bare-metal` alias.
-    if let Some(p) = profile(&build.board, &build.target) {
-        features.push(format!("nros/{}", p.nros_platform_feature));
-        for alias in p.local_aliases {
+    if let Some(p) = profile(build) {
+        features.push(format!("nros/{}", p.platform_feature));
+        for alias in &p.local_aliases {
             features.push(alias.to_string());
         }
     }
@@ -1670,7 +1458,7 @@ fn uses_std(build: &PlanBuildOptions) -> bool {
     // for std`). Other RTOS sims (e.g. ThreadX-on-Linux) are genuinely
     // Linux-hosted processes and keep the triple-driven `std`.
     if matches!(
-        profile(&build.board, &build.target).map(|p| p.entry_kind),
+        profile(build).map(|p| p.entry_kind),
         Some(EntryKind::ZephyrStaticlib)
     ) {
         return false;
@@ -1684,437 +1472,27 @@ fn uses_std(build: &PlanBuildOptions) -> bool {
 }
 
 // ============================================================================
-// Phase 173.2 — PlatformProfile descriptor + single resolver
+// Phase 195.C — board profile resolved from workspace descriptors
 // ----------------------------------------------------------------------------
-// One `profile(board, target)` lookup replaces the per-render-function
-// re-matching of `platform_feature` + `esp32_chip` + `stm32_chip`. The
-// descriptor centralizes every platform's *static* metadata (nros
-// feature, default-feature aliases, entry/link/net/toolchain kinds);
-// the text-heavy render bodies (cargo config, deps) dispatch on
-// `PlatformKind` and interpolate chip / workspace paths from the
-// profile. Adding a platform = one `profile()` arm + the body hooks.
+// `profile()` no longer hardcodes any board layout. It loads every
+// `<workspace>/packages/boards/*/nros-board.toml` (via `BoardCatalog`) and
+// resolves the `(board, target)` pair to a `BoardDescriptor`. The render
+// bodies read crate names, paths, the `.cargo/config.toml` body and the
+// entry-point template from that data, so adding a board with an existing
+// platform kind is a descriptor file with no CLI edit.
 // ============================================================================
 
-/// The resolved platform identity for a `(board, target)` pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlatformKind {
-    Posix,
-    Freertos,
-    BareMetal,
-    Nuttx,
-    Zephyr,
-    ThreadxLinux,
-    ThreadxRiscv64,
-    Esp32,
-    Stm32,
-    OrinSpe,
+/// Resolve a build's `(board, target)` to its board descriptor, loading the
+/// catalog from the workspace recorded on `build` (set at generate time).
+/// `None` when the workspace is unknown or no descriptor matches.
+fn profile(build: &PlanBuildOptions) -> Option<BoardDescriptor> {
+    let workspace = build.workspace_root.as_ref()?;
+    let catalog = BoardCatalog::load(workspace).ok()?;
+    catalog.resolve(&build.board, &build.target).cloned()
 }
 
-/// Rust toolchain a generated package pins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Toolchain {
-    /// Stable rustc with a prebuilt target — no `rust-toolchain.toml`.
-    Stable,
-    /// Pinned nightly + `rust-src` for `-Z build-std`.
-    Nightly,
-    /// Xtensa `+esp` espup toolchain (ESP32-S3) — not emitted yet.
-    Esp,
-}
-
-/// External libraries the generated `build.rs` must link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkKind {
-    /// Board crate / cargo handles all linking.
-    None,
-    /// NuttX staging-archive group-link + dramboot linker script.
-    NuttxStaging,
-}
-
-/// Shape of the generated package's entry point (`src/main.rs` /
-/// `src/lib.rs`). `render_main` branches on this (and on `board_entry`)
-/// to emit one entry shape, replacing the per-platform `#[cfg]` blocks
-/// the old `main.rs.jinja` shipped (Phase 173.2b).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
-    /// Hosted Rust `fn main` (posix / threadx-linux host).
-    HostedMain,
-    /// `<board>::run(cfg, closure)` on a bare-metal / RTOS target.
-    BoardRun,
-    /// Rust staticlib consumed by zephyr-lang-rust `rust_cargo_application()`.
-    ZephyrStaticlib,
-}
-
-/// Who owns NIC + IP bring-up (Phase 173.7 emit path).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetStack {
-    /// RTOS brings up the stack (Zephyr / NuttX); generator emits an
-    /// additive RTOS-config fragment.
-    RtosOwned,
-    /// Board crate owns the stack (smoltcp / lwIP / NetX / esp-hal);
-    /// `nros.toml` values flow into the board `Config`.
-    NanoRosOwned,
-}
-
-/// Static descriptor for a resolved platform. `chip` carries the
-/// esp-hal / stm32 chip feature when applicable (drives dep + target
-/// interpolation in the render bodies).
-#[derive(Debug, Clone, Copy)]
-struct PlatformProfile {
-    kind: PlatformKind,
-    /// The `nros/<feature>` selected (e.g. `platform-posix`). ESP32 and
-    /// STM32 both map onto `platform-bare-metal`.
-    nros_platform_feature: &'static str,
-    /// Extra local default-feature aliases beyond `nros/<feature>` (gate
-    /// the platform-specific Cargo deps + cfg). Note: since Phase 173.2b
-    /// the `src/main.rs` entry shape is chosen by `render_main` from
-    /// `board_entry`, not by these aliases.
-    local_aliases: &'static [&'static str],
-    toolchain: Toolchain,
-    link_kind: LinkKind,
-    entry_kind: EntryKind,
-    #[allow(dead_code)] // consumed by Phase 173.7 emit path
-    net_stack: NetStack,
-    /// esp-hal (`esp32c3`/`esp32s3`) or stm32 (`stm32f429`/`stm32f407`)
-    /// chip feature; `None` for non-chip platforms.
-    chip: Option<&'static str>,
-    /// Phase 173.2b — `src/main.rs` entry shape. `None` for hosted
-    /// native/posix (which calls `run_system` directly via `fn main`);
-    /// `Some(spec)` for board-driven entries (bare-metal / RTOS hosts
-    /// whose board rlib's `run()` boots hardware then drives the user
-    /// closure). The hosted threadx-linux host is `HostedMain` yet still
-    /// carries a `BoardEntry` because it boots the ThreadX kernel via
-    /// `nros_board_threadx_linux::run`.
-    board_entry: Option<BoardEntry>,
-}
-
-/// Phase 173.2b — the per-board pieces `render_main` interpolates into
-/// the shared board-run entry shape. Everything else (the `run_system`
-/// helper, the `ExecutorConfig::new(..).domain_id(..).node_name(..)`
-/// chain, the closure scaffolding) is identical across boards.
-#[derive(Debug, Clone, Copy)]
-struct BoardEntry {
-    /// Board rlib invoked as `<crate>::run(<crate>::Config::default(), ..)`.
-    crate_name: &'static str,
-    /// Doc comment emitted directly above the entry fn.
-    comment: &'static str,
-    /// Attribute(s) + `fn` signature line(s) preceding the fn body
-    /// (e.g. `#[nros_board_mps2_an385::entry]\nfn main() -> !`).
-    signature: &'static str,
-    /// Panic-handler / log-transport `use`s (and any other crate-root
-    /// items) pinned at the crate root above the entry.
-    crate_root_extra: &'static str,
-    /// Builder-chain suffix appended inside the closure (e.g. esp32's
-    /// `.clock_us(...)`); empty for boards with no extra config.
-    closure_extra: &'static str,
-}
-
-/// Pure Cortex-M3 (MPS2-AN385). Entry via cortex-m-rt's `#[entry]`.
-const BOARD_ENTRY_BARE_METAL: BoardEntry = BoardEntry {
-    crate_name: "nros_board_mps2_an385",
-    comment: "\
-// Phase 126.M5.bare-metal — pure Cortex-M3 (MPS2-AN385). Entry comes
-// from cortex-m-rt's `#[entry]` (re-exported by the board crate).
-// The board crate's `run()` does hardware + smoltcp/lwIP init then
-// invokes the closure; referencing it pins the board rlib + its
-// linker-script / vector-table contributions into the image.",
-    signature: "#[nros_board_mps2_an385::entry]\nfn main() -> !",
-    crate_root_extra: "use panic_semihosting as _;",
-    closure_extra: "",
-};
-
-/// STM32F4 (Cortex-M4F). Entry via cortex-m-rt's `#[entry]`.
-const BOARD_ENTRY_STM32: BoardEntry = BoardEntry {
-    crate_name: "nros_board_stm32f4",
-    comment: "\
-// Phase 126.M5.stm32f4 — STM32F4 (Cortex-M4F). Entry via cortex-m-rt's
-// `#[entry]` (re-exported by the board crate). `run()` does clock +
-// Ethernet + smoltcp init then invokes the closure; referencing it
-// pins the board rlib + its linker-script / vector-table
-// contributions into the image. Diagnostics flow over defmt-rtt.",
-    signature: "#[nros_board_stm32f4::entry]\nfn main() -> !",
-    crate_root_extra: "\
-use defmt_rtt as _;
-use panic_probe as _;
-defmt::timestamp!(\"{=u64:us}\", { 0 });",
-    closure_extra: "",
-};
-
-/// ThreadX-Linux host: board `run()` boots ThreadX + NetX Duo on the
-/// application thread (hosted `fn main`, not bare-metal).
-const BOARD_ENTRY_THREADX_LINUX: BoardEntry = BoardEntry {
-    crate_name: "nros_board_threadx_linux",
-    comment: "\
-// Phase 126.M5.threadx — ThreadX-Linux is host-hosted: the board
-// crate's `run()` boots the ThreadX kernel + NetX Duo stack, then
-// invokes the closure on the application thread. Referencing
-// `nros_board_threadx_linux::run` is REQUIRED — it pins the board
-// rlib (and its build-script-linked ThreadX kernel + NetX archives)
-// into the link graph so `--gc-sections` doesn't drop the platform
-// `nros_platform_*` / `_tx_*` symbols.",
-    signature: "fn main() -> !",
-    crate_root_extra: "",
-    closure_extra: "",
-};
-
-/// Bare-metal ThreadX on QEMU RISC-V virt. Entry `_start -> main`.
-const BOARD_ENTRY_THREADX_RISCV64: BoardEntry = BoardEntry {
-    crate_name: "nros_board_threadx_qemu_riscv64",
-    comment: "\
-// Phase 126.M5.threadx-riscv64 — bare-metal ThreadX on QEMU RISC-V
-// virt. Entry is `#[no_mangle] extern \"C\" fn main` (the board's
-// `link.lds` jumps `_start -> main`). `run()` boots the ThreadX
-// kernel + NetX Duo over virtio-net then invokes the closure;
-// referencing it pins the board rlib + its kernel/NetX archives +
-// the linker script into the image.",
-    signature: "#[unsafe(no_mangle)]\nextern \"C\" fn main() -> !",
-    crate_root_extra: "",
-    closure_extra: "",
-};
-
-/// ESP32-C3 under QEMU (esp-hal). Entry via esp-hal's `#[main]`.
-const BOARD_ENTRY_ESP32_QEMU: BoardEntry = BoardEntry {
-    crate_name: "nros_board_esp32_qemu",
-    comment: "\
-// Phase 126.M5.esp32 — esp-hal `#[main]` entry. The board's `run()`
-// initialises the chip + network + log writer, then drives the user
-// closure and loops forever (ESP32 has no process exit). The board
-// `Config` carries the zenoh locator + domain id (defaults from the
-// board crate; override via a config.toml the generator could embed
-// in a follow-up).",
-    signature: "#[esp_hal::main]\nfn main() -> !",
-    crate_root_extra: "\
-use esp_backtrace as _;
-nros_board_esp32_qemu::esp_bootloader_esp_idf::esp_app_desc!();",
-    closure_extra: "\n                .clock_us(nros_board_esp32_qemu::nros_platform_esp32_qemu::clock::clock_us)",
-};
-
-// Phase 173.6 — ESP32-S3 (Xtensa) real-hardware entry. Same esp-hal
-// `#[main]` shape as the C3-under-QEMU board, but the crate is
-// `nros_board_esp32s3` (serial transport, no QEMU NIC).
-const BOARD_ENTRY_ESP32S3: BoardEntry = BoardEntry {
-    crate_name: "nros_board_esp32s3",
-    comment: "\
-// Phase 173.6 — ESP32-S3 esp-hal `#[main]` entry. The board's `run()`
-// initialises the chip + serial transport + log writer, then drives the
-// user closure and loops forever (ESP32 has no process exit).",
-    signature: "#[esp_hal::main]\nfn main() -> !",
-    crate_root_extra: "\
-use esp_backtrace as _;
-nros_board_esp32s3::esp_bootloader_esp_idf::esp_app_desc!();",
-    closure_extra: "\n                .clock_us(nros_board_esp32s3::nros_platform_esp32s3::clock::clock_us)",
-};
-
-/// FreeRTOS on MPS2-AN385. Entry `extern "C" fn _start`.
-const BOARD_ENTRY_FREERTOS: BoardEntry = BoardEntry {
-    crate_name: "nros_board_mps2_an385_freertos",
-    comment: "",
-    signature: "#[unsafe(no_mangle)]\nextern \"C\" fn _start() -> !",
-    crate_root_extra: "use panic_semihosting as _;",
-    closure_extra: "",
-};
-
-/// Single board/target → profile resolver. The one place new platforms
-/// register. `None` = unsupported `(board, target)`.
-fn profile(board: &str, target: &str) -> Option<PlatformProfile> {
-    let mk = |kind,
-              nros_platform_feature,
-              local_aliases: &'static [&'static str],
-              toolchain,
-              link_kind,
-              entry_kind,
-              net_stack,
-              chip,
-              board_entry| {
-        Some(PlatformProfile {
-            kind,
-            nros_platform_feature,
-            local_aliases,
-            toolchain,
-            link_kind,
-            entry_kind,
-            net_stack,
-            chip,
-            board_entry,
-        })
-    };
-    match board {
-        "native" | "posix" => mk(
-            PlatformKind::Posix,
-            "platform-posix",
-            &[],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::HostedMain,
-            NetStack::NanoRosOwned,
-            None,
-            None,
-        ),
-        "zephyr" => mk(
-            PlatformKind::Zephyr,
-            "platform-zephyr",
-            &["platform-zephyr"],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::ZephyrStaticlib,
-            NetStack::RtosOwned,
-            None,
-            None,
-        ),
-        "freertos" | "freeRTOS" | "FreeRTOS" => mk(
-            PlatformKind::Freertos,
-            "platform-freertos",
-            &["platform-freertos"],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            None,
-            Some(BOARD_ENTRY_FREERTOS),
-        ),
-        "nuttx" | "NuttX" => mk(
-            PlatformKind::Nuttx,
-            "platform-nuttx",
-            &["platform-nuttx"],
-            Toolchain::Nightly,
-            LinkKind::NuttxStaging,
-            EntryKind::BoardRun,
-            NetStack::RtosOwned,
-            None,
-            // Phase 173.2b — NuttX is `BoardRun` but the legacy template
-            // shipped no NuttX entry block, so the hosted `fn main`
-            // (active for any non-`#[cfg]`-gated platform) drives it
-            // today. `None` preserves that std hosted shape byte-for-byte;
-            // a NuttX `BoardEntry` is a future follow-up.
-            None,
-        ),
-        "threadx" | "ThreadX" => {
-            if target.contains("riscv64") {
-                mk(
-                    PlatformKind::ThreadxRiscv64,
-                    "platform-threadx",
-                    &["platform-threadx-riscv64"],
-                    Toolchain::Stable,
-                    LinkKind::None,
-                    EntryKind::BoardRun,
-                    NetStack::NanoRosOwned,
-                    None,
-                    Some(BOARD_ENTRY_THREADX_RISCV64),
-                )
-            } else {
-                mk(
-                    PlatformKind::ThreadxLinux,
-                    "platform-threadx",
-                    &["platform-threadx"],
-                    Toolchain::Stable,
-                    LinkKind::None,
-                    EntryKind::HostedMain,
-                    NetStack::NanoRosOwned,
-                    None,
-                    Some(BOARD_ENTRY_THREADX_LINUX),
-                )
-            }
-        }
-        // ESP32 (esp-hal bare-metal) maps onto `platform-bare-metal`; the
-        // chip-specific esp-hal deps + linker glue come from `chip`.
-        "esp32-qemu" | "esp32" | "esp32c3" | "esp32-c3" => mk(
-            PlatformKind::Esp32,
-            "platform-bare-metal",
-            &["platform-esp32-qemu"],
-            Toolchain::Nightly,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            Some("esp32c3"),
-            Some(BOARD_ENTRY_ESP32_QEMU),
-        ),
-        "esp32s3" | "esp32-s3" => mk(
-            PlatformKind::Esp32,
-            "platform-bare-metal",
-            &["platform-esp32-qemu"],
-            Toolchain::Esp,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            Some("esp32s3"),
-            Some(BOARD_ENTRY_ESP32S3),
-        ),
-        // STM32F4 (Cortex-M4F) maps onto `platform-bare-metal`; the chip
-        // board feature + defmt deps come from `chip`.
-        "stm32f4" | "stm32f429" => mk(
-            PlatformKind::Stm32,
-            "platform-bare-metal",
-            &["platform-stm32"],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            Some("stm32f429"),
-            Some(BOARD_ENTRY_STM32),
-        ),
-        "stm32f407" => mk(
-            PlatformKind::Stm32,
-            "platform-bare-metal",
-            &["platform-stm32"],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            Some("stm32f407"),
-            Some(BOARD_ENTRY_STM32),
-        ),
-        "baremetal" | "bare-metal" => mk(
-            PlatformKind::BareMetal,
-            "platform-bare-metal",
-            &["platform-bare-metal"],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            None,
-            Some(BOARD_ENTRY_BARE_METAL),
-        ),
-        "orin-spe" => mk(
-            PlatformKind::OrinSpe,
-            "platform-orin-spe",
-            &[],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::BoardRun,
-            NetStack::NanoRosOwned,
-            None,
-            // Phase 173.2b — like NuttX, orin-spe is `BoardRun` but had no
-            // legacy template entry block; the hosted `fn main` drives it.
-            // `None` keeps that std hosted shape byte-identical.
-            None,
-        ),
-        _ if target.contains("linux") => mk(
-            PlatformKind::Posix,
-            "platform-posix",
-            &[],
-            Toolchain::Stable,
-            LinkKind::None,
-            EntryKind::HostedMain,
-            NetStack::NanoRosOwned,
-            None,
-            None,
-        ),
-        _ => None,
-    }
-}
-
-fn platform_feature(board: &str, target: &str) -> Option<&'static str> {
-    profile(board, target).map(|p| p.nros_platform_feature)
-}
-
-/// Phase 126.M5.esp32 — rustc target triple for an ESP32 chip feature
-/// (`profile().chip`). ESP32-C3 runs under QEMU's Espressif fork on
-/// `riscv32imc-unknown-none-elf`; ESP32-S3 needs `xtensa-esp32s3-none-elf`.
-fn esp32_target(chip: &str) -> &'static str {
-    match chip {
-        "esp32s3" => "xtensa-esp32s3-none-elf",
-        // esp32c3 (and any other RISC-V ESP32) use riscv32imc.
-        _ => "riscv32imc-unknown-none-elf",
-    }
+fn platform_feature(build: &PlanBuildOptions) -> Option<String> {
+    profile(build).map(|p| p.platform_feature)
 }
 
 fn generated_feature(feature: &str) -> Option<String> {
@@ -3323,6 +2701,14 @@ mod net_fragment_tests {
     use super::*;
     use crate::orchestration::plan::PlanTransport;
 
+    /// Workspace root for tests — a hermetic fixture workspace bundled in the
+    /// crate (Phase 195.C). It carries `packages/boards/*/nros-board.toml` so
+    /// `profile()` resolves boards without the nano-ros superproject present
+    /// (the CLI ships from a separate repo; its CI has no real `packages/boards`).
+    fn test_workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/board-workspace")
+    }
+
     fn build_with(transports: Vec<PlanTransport>) -> PlanBuildOptions {
         let mut build: PlanBuildOptions = serde_json::from_value(serde_json::json!({
             "target": "x", "board": "native", "rmw": "zenoh",
@@ -3330,6 +2716,7 @@ mod net_fragment_tests {
         }))
         .unwrap();
         build.transports = transports;
+        build.workspace_root = Some(test_workspace_root());
         build
     }
 
@@ -3485,7 +2872,9 @@ mod net_fragment_tests {
                 .unwrap()
                 .insert("param_persistence".into(), pp);
         }
-        serde_json::from_value(plan).expect("plan parses")
+        let mut plan: NrosPlan = serde_json::from_value(plan).expect("plan parses");
+        plan.build.workspace_root = Some(test_workspace_root());
+        plan
     }
 
     #[test]
