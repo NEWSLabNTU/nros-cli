@@ -18,7 +18,7 @@ pub mod schema;
 pub mod source_metadata;
 pub mod workspace;
 
-pub use config::{ComponentConfig, SystemConfig};
+pub use config::ComponentConfig;
 pub use plan::NrosPlan;
 pub use root_config::WorkspaceConfig;
 pub use source_metadata::SourceMetadata;
