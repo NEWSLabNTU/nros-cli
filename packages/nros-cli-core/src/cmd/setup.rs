@@ -13,7 +13,8 @@ use eyre::{Result, WrapErr, bail};
 use crate::orchestration::{
     sdk_index::{SdkIndex, host_key},
     sdk_store::{
-        InstallAction, LOCK_FILE, SdkLock, execute, plan_install, store_root, tool_prefix,
+        InstallAction, LOCK_FILE, SdkLock, SourceDisposition, execute, plan_install,
+        provision_source, store_root, tool_prefix,
     },
 };
 
@@ -35,6 +36,14 @@ pub struct Args {
     /// `--tool qemu`. The `just <module> setup` recipes call this.
     #[arg(long)]
     pub tool: Option<String>,
+
+    /// Provision a single `[source.*]` package by name from the index (Phase
+    /// 195.B), e.g. `--source freertos-kernel`. Repeatable. The index is the
+    /// SSOT — `dest`/`ref`/`submodule` come from data, never a hardcoded path.
+    /// The `just <module> setup` recipes call this instead of inlining
+    /// `git submodule update <path>`.
+    #[arg(long = "source")]
+    pub sources: Vec<String>,
 
     /// Install prefix override (only with `--tool`): place the tool here instead
     /// of the shared store, e.g. `--prefix build/qemu` so the test harness finds
@@ -74,6 +83,10 @@ pub fn run(args: Args) -> Result<()> {
         return install_single_tool(&index, tool, args.prefix.as_deref(), args.dry_run);
     }
 
+    if !args.sources.is_empty() {
+        return provision_named_sources(&index, &args.index, &args.sources, args.dry_run);
+    }
+
     let board = match args.board.as_deref() {
         Some(b) => b,
         None => {
@@ -89,15 +102,26 @@ pub fn run(args: Args) -> Result<()> {
     );
 
     let root = store_root();
+    let workspace = index_workspace(&args.index);
     let lock_path = PathBuf::from(LOCK_FILE);
     let mut lock = SdkLock::load(&lock_path)?;
     let mut installed = false;
 
     for name in &packages {
-        // Only `[tool.*]` packages are installed into the store; `[source.*]`
-        // build with the app, `[gated.*]` are user-installed.
+        // `[tool.*]` packages install into the shared store; `[source.*]` are
+        // provisioned into their index-declared `dest` (Phase 195.B);
+        // `[gated.*]` are user-installed.
         let Some(tool) = index.tool.get(*name) else {
-            eprintln!("  {:<22} {}", name, disposition(&index, name, &host));
+            if let Some(src) = index.source.get(*name) {
+                let disp = provision_source(name, src, &workspace, args.dry_run)
+                    .wrap_err_with(|| format!("provision source {name}"))?;
+                eprintln!("  {:<22} {}", name, describe_source(src, &disp));
+                if matches!(disp, SourceDisposition::Provisioned) {
+                    installed = true;
+                }
+            } else {
+                eprintln!("  {:<22} {}", name, disposition(&index, name, &host));
+            }
             continue;
         };
         let prefix = tool_prefix(&root, name, &tool.version);
@@ -192,6 +216,29 @@ fn install_single_tool(
     Ok(())
 }
 
+/// Provision one or more `[source.*]` packages by name (`nros setup --source
+/// <name> …`) — the index-driven replacement for inline `git submodule update
+/// <path>` in the `just <module> setup` recipes (Phase 195.B; mirrors what
+/// 187.6 did for `qemu`/`zenohd` via `--tool`). The index is the SSOT: `dest`,
+/// `ref`, and `submodule` all come from data.
+fn provision_named_sources(
+    index: &SdkIndex,
+    index_path: &Path,
+    names: &[String],
+    dry_run: bool,
+) -> Result<()> {
+    let workspace = index_workspace(index_path);
+    for name in names {
+        let src = index.source.get(name.as_str()).ok_or_else(|| {
+            eyre::eyre!("nros setup --source: no [source.{name}] in the index")
+        })?;
+        let disp = provision_source(name, src, &workspace, dry_run)
+            .wrap_err_with(|| format!("provision source {name}"))?;
+        eprintln!("nros setup --source {name}: {}", describe_source(src, &disp));
+    }
+    Ok(())
+}
+
 /// Phase 187.6 — lazy install for `nros build` / `nros deploy`: resolve the
 /// board's index tools and install any not already in the store, so a first
 /// build/deploy needs no separate `nros setup` (the PlatformIO auto-install
@@ -214,6 +261,7 @@ pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf
     let index = SdkIndex::load(&index_path)?;
     let host = host_key();
     let root = store_root();
+    let ws = index_workspace(&index_path);
     let lock_path = PathBuf::from(LOCK_FILE);
     let mut lock = SdkLock::load(&lock_path)?;
     let mut installed = false;
@@ -236,7 +284,19 @@ pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf
     };
     for name in packages {
         let Some(tool) = index.tool.get(name) else {
-            continue; // source / gated / not-in-index — not a store tool
+            // Phase 195.B — provision `[source.*]` into its index `dest` so a
+            // first build/deploy gets the kernel/lib source with no `just`.
+            if let Some(src) = index.source.get(name) {
+                match provision_source(name, src, &ws, false) {
+                    Ok(SourceDisposition::Provisioned) => {
+                        eprintln!("nros: provisioned source {name} → {}", src.dest.as_deref().unwrap_or("-"));
+                        installed = true;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("nros: source {name} provisioning failed ({e}) — provide it yourself if the build needs it"),
+                }
+            }
+            continue; // gated / not-in-index — not a store tool
         };
         let prefix = tool_prefix(&root, name, &tool.version);
         match plan_install(tool, &host, &prefix) {
@@ -305,6 +365,40 @@ pub(crate) fn locate_index(workspace: Option<&Path>) -> Option<PathBuf> {
         .or_else(|| std::env::var_os("NROS_WORKSPACE").map(PathBuf::from));
     ws.map(|w| w.join("nros-sdk-index.toml"))
         .filter(|p| p.is_file())
+}
+
+/// The workspace root a `[source.*]` `dest` is resolved against: the directory
+/// containing the index (Phase 195.B — `dest` is workspace-relative index data,
+/// never a path baked into the binary). Falls back to `.` for a bare index name.
+fn index_workspace(index: &Path) -> PathBuf {
+    index
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// One-line description of a source's provisioning outcome (Phase 195.B).
+fn describe_source(src: &crate::orchestration::sdk_index::SourcePackage, disp: &SourceDisposition) -> String {
+    use crate::orchestration::sdk_index::SourceProvision;
+    let mode = match src.provision() {
+        SourceProvision::Clone => format!(
+            "clone {}@{}",
+            src.git.as_deref().unwrap_or("?"),
+            src.git_ref.as_deref().unwrap_or("?")
+        ),
+        SourceProvision::Submodule => {
+            format!("submodule {}", src.submodule.as_deref().unwrap_or("?"))
+        }
+        SourceProvision::None => "built with the app".to_string(),
+    };
+    let outcome = match disp {
+        SourceDisposition::Provisioned => "provisioned",
+        SourceDisposition::AlreadyPresent => "already present (skip)",
+        SourceDisposition::NoFetch => "no fetch step",
+        SourceDisposition::Planned => "would provision (--dry-run)",
+    };
+    format!("source {} — {mode} → {} [{outcome}]", src.version, src.dest.as_deref().unwrap_or("-"))
 }
 
 /// One-line description of the planned action (mirrors `disposition`, but for an

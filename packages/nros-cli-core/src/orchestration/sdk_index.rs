@@ -116,10 +116,64 @@ pub struct ToolSource {
 }
 
 /// A package compiled with the user's app for their chosen target.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Phase 195.B — `[source.*]` provisioning is data-driven: `nros setup`
+/// fetches the source into [`dest`](Self::dest) from index data, never a
+/// hardcoded `third-party/` path. `git`/`ref` record the canonical pin (the
+/// SSOT — so `.gitmodules` and the index can't drift); `submodule` is an
+/// optional *mode hint*:
+/// - **clone mode** (`git` + `ref` + `dest`, no `submodule`): fresh
+///   `git clone`@`ref`.
+/// - **submodule mode** (`submodule` + `dest`, `git`/`ref` document the pin):
+///   `git submodule update --init <submodule>` — used when the canonical
+///   source is a committed submodule (the contributor checkout keeps it).
+///
+/// A source with no fetch fields at all has no provisioning step (e.g. a
+/// host-built package whose tree already lives in the workspace).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcePackage {
     pub version: String,
+    /// Git URL to clone (clone mode). Mutually exclusive with `submodule`.
+    #[serde(default)]
+    pub git: Option<String>,
+    /// Git ref (tag/branch/sha) to check out — pinned in lockstep with
+    /// `version`. Required in clone mode.
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+    /// Workspace-relative destination the source is provisioned into. The
+    /// index is the SSOT — never a path baked into the `nros` binary.
+    #[serde(default)]
+    pub dest: Option<String>,
+    /// `.gitmodules` path when the canonical source is a committed submodule;
+    /// `nros setup` runs `git submodule update --init <path>` instead of a
+    /// fresh clone. `git`/`ref` still record the pin (SSOT) in this mode.
+    #[serde(default)]
+    pub submodule: Option<String>,
+}
+
+/// How a [`SourcePackage`] is provisioned (Phase 195.B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceProvision {
+    /// `git clone <git> @ <ref>` into `dest`.
+    Clone,
+    /// `git submodule update --init <submodule>` (dest is the submodule path).
+    Submodule,
+    /// No fetch step — the tree already lives in the workspace.
+    None,
+}
+
+impl SourcePackage {
+    /// Which provisioning mode this entry declares (Phase 195.B).
+    pub fn provision(&self) -> SourceProvision {
+        if self.submodule.is_some() {
+            SourceProvision::Submodule
+        } else if self.git.is_some() {
+            SourceProvision::Clone
+        } else {
+            SourceProvision::None
+        }
+    }
 }
 
 /// A license-gated package: never fetched or built; `nros setup` instructs the
@@ -179,6 +233,28 @@ impl SdkIndex {
                          (not a [tool]/[source]/[gated] entry)"
                     );
                 }
+            }
+        }
+        // Phase 195.B — a `[source.*]` provisioning recipe must be coherent so
+        // `nros setup` can act on it without guessing. `submodule` mode needs a
+        // `dest`; clone mode (a `git` with no `submodule`) needs both `ref` and
+        // `dest`. `git`/`ref` may accompany `submodule` (they record the pin).
+        for (name, src) in &self.source {
+            match src.provision() {
+                SourceProvision::Clone => {
+                    if src.git_ref.is_none() {
+                        bail!("source '{name}' has `git` but no `ref` (clone needs a pinned ref)");
+                    }
+                    if src.dest.is_none() {
+                        bail!("source '{name}' has `git` but no `dest` (where to provision it)");
+                    }
+                }
+                SourceProvision::Submodule => {
+                    if src.dest.is_none() {
+                        bail!("source '{name}' has `submodule` but no `dest`");
+                    }
+                }
+                SourceProvision::None => {}
             }
         }
         Ok(())
@@ -290,6 +366,58 @@ installer = "nvidia-sdk-manager"
         )
         .unwrap();
         assert!(src_gated.validate().is_ok());
+    }
+
+    #[test]
+    fn source_provision_modes_parse_and_validate() {
+        // Clone mode: git + ref + dest.
+        let clone = SdkIndex::parse(
+            "[source.lwip]\nversion=\"2.2.0\"\ngit=\"https://example/lwip.git\"\n\
+             ref=\"STABLE-2_2_0\"\ndest=\"third-party/freertos/lwip\"\n",
+        )
+        .unwrap();
+        let lwip = &clone.source["lwip"];
+        assert_eq!(lwip.provision(), SourceProvision::Clone);
+        assert_eq!(lwip.git_ref.as_deref(), Some("STABLE-2_2_0")); // the `ref` key
+        assert!(clone.validate().is_ok());
+
+        // Submodule mode: submodule + dest.
+        let sm = SdkIndex::parse(
+            "[source.threadx]\nversion=\"6.4.1\"\nsubmodule=\"third-party/threadx/kernel\"\n\
+             dest=\"third-party/threadx/kernel\"\n",
+        )
+        .unwrap();
+        assert_eq!(sm.source["threadx"].provision(), SourceProvision::Submodule);
+        assert!(sm.validate().is_ok());
+
+        // No-fetch mode: version only.
+        let none = SdkIndex::parse("[source.x]\nversion=\"1\"\n").unwrap();
+        assert_eq!(none.source["x"].provision(), SourceProvision::None);
+        assert!(none.validate().is_ok());
+    }
+
+    #[test]
+    fn source_submodule_with_pin_is_valid_and_submodule_mode() {
+        // git/ref accompany submodule (record the pin/SSOT) — valid, and the
+        // mode is Submodule (submodule update preferred over clone).
+        let sm = SdkIndex::parse(
+            "[source.x]\nversion=\"1\"\ngit=\"https://e/x.git\"\nref=\"abc123\"\n\
+             dest=\"third-party/x\"\nsubmodule=\"third-party/x\"\n",
+        )
+        .unwrap();
+        assert!(sm.validate().is_ok());
+        assert_eq!(sm.source["x"].provision(), SourceProvision::Submodule);
+    }
+
+    #[test]
+    fn source_provision_incoherence_is_rejected() {
+        // git without ref.
+        let no_ref = SdkIndex::parse("[source.x]\nversion=\"1\"\ngit=\"u\"\ndest=\"d\"\n").unwrap();
+        assert!(no_ref.validate().unwrap_err().to_string().contains("no `ref`"));
+
+        // git without dest.
+        let no_dest = SdkIndex::parse("[source.x]\nversion=\"1\"\ngit=\"u\"\nref=\"r\"\n").unwrap();
+        assert!(no_dest.validate().unwrap_err().to_string().contains("no `dest`"));
     }
 
     #[test]

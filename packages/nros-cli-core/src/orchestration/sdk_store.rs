@@ -17,7 +17,7 @@ use std::{
 use eyre::{Result, WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 
-use super::sdk_index::ToolPackage;
+use super::sdk_index::{SourcePackage, SourceProvision, ToolPackage};
 
 /// The lockfile name (written in cwd by `nros setup` / auto-setup — pins the
 /// installed toolset for the workspace it's run in). Single source for the name.
@@ -287,6 +287,90 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of [`provision_source`] — for the `nros setup` disposition line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceDisposition {
+    /// Fetched into `dest` (clone or submodule update).
+    Provisioned,
+    /// `dest` already present — left untouched (idempotent skip).
+    AlreadyPresent,
+    /// No fetch step declared (version-only `[source.*]`).
+    NoFetch,
+    /// `--dry-run`: what would have happened.
+    Planned,
+}
+
+/// Phase 195.B — provision a `[source.*]` package into its workspace-relative
+/// `dest` from index data (never a path baked into the binary). Idempotent: an
+/// already-present `dest` is left untouched. Two modes (see
+/// [`SourcePackage::provision`]):
+///
+/// - **Clone:** `git clone <git> <workspace>/<dest>` then `git checkout <ref>`
+///   (full clone — `ref` may be a sha, so `--branch` is not used).
+/// - **Submodule:** `git -C <workspace> submodule update --init -- <submodule>`
+///   (inherently idempotent; checks out the superproject's recorded commit,
+///   kept in lockstep with the index ref via the SSOT rule).
+pub fn provision_source(
+    name: &str,
+    src: &SourcePackage,
+    workspace: &Path,
+    dry_run: bool,
+) -> Result<SourceDisposition> {
+    match src.provision() {
+        SourceProvision::None => Ok(SourceDisposition::NoFetch),
+        SourceProvision::Submodule => {
+            let path = src.submodule.as_deref().expect("submodule mode has a path");
+            if dry_run {
+                return Ok(SourceDisposition::Planned);
+            }
+            sh(
+                &[
+                    "git",
+                    "-C",
+                    &workspace.to_string_lossy(),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--",
+                    path,
+                ],
+                None,
+            )
+            .wrap_err_with(|| format!("git submodule update {path} (source {name})"))?;
+            Ok(SourceDisposition::Provisioned)
+        }
+        SourceProvision::Clone => {
+            let git = src.git.as_deref().expect("clone mode has a git url");
+            let git_ref = src.git_ref.as_deref().expect("clone mode has a ref");
+            let dest = src.dest.as_deref().expect("clone mode has a dest");
+            let dest_abs = workspace.join(dest);
+            // Idempotent: a present, non-empty dest is left as-is (don't clobber
+            // a contributor checkout / in-progress work). `nros setup` on a
+            // fresh tree provisions; a populated tree is a skip.
+            let present = dest_abs
+                .read_dir()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            if present {
+                return Ok(SourceDisposition::AlreadyPresent);
+            }
+            if dry_run {
+                return Ok(SourceDisposition::Planned);
+            }
+            if let Some(parent) = dest_abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .wrap_err_with(|| format!("create source dest parent {}", parent.display()))?;
+            }
+            let dest_str = dest_abs.to_string_lossy();
+            sh(&["git", "clone", git, &dest_str], None)
+                .wrap_err_with(|| format!("git clone {git} (source {name})"))?;
+            sh(&["git", "-C", &dest_str, "checkout", git_ref], None)
+                .wrap_err_with(|| format!("git checkout {git_ref} (source {name})"))?;
+            Ok(SourceDisposition::Provisioned)
+        }
+    }
+}
+
 fn sh(args: &[&str], cwd: Option<&Path>) -> Result<()> {
     let (cmd, rest) = args.split_first().ok_or_else(|| eyre!("empty command"))?;
     let mut c = Command::new(cmd);
@@ -396,5 +480,47 @@ mod tests {
             InstallAction::Present
         );
         std::fs::remove_dir_all(&present).ok();
+    }
+
+    #[test]
+    fn provision_source_no_fetch_present_and_dry_run() {
+        // Version-only source → no fetch step.
+        let none = SourcePackage {
+            version: "1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            provision_source("x", &none, Path::new("/ws"), false).unwrap(),
+            SourceDisposition::NoFetch
+        );
+
+        // Clone mode, dest already populated → AlreadyPresent (no git run).
+        let ws = tmp("prov-src");
+        let dest_rel = "third-party/lwip";
+        let dest_abs = ws.join(dest_rel);
+        std::fs::create_dir_all(&dest_abs).unwrap();
+        std::fs::write(dest_abs.join("CMakeLists.txt"), "x").unwrap();
+        let clone = SourcePackage {
+            version: "2.2.0".into(),
+            git: Some("https://example/lwip.git".into()),
+            git_ref: Some("STABLE-2_2_0".into()),
+            dest: Some(dest_rel.into()),
+            submodule: None,
+        };
+        assert_eq!(
+            provision_source("lwip", &clone, &ws, false).unwrap(),
+            SourceDisposition::AlreadyPresent
+        );
+
+        // Clone mode, empty dest, dry-run → Planned (no git run).
+        let empty = SourcePackage {
+            dest: Some("third-party/empty".into()),
+            ..clone.clone()
+        };
+        assert_eq!(
+            provision_source("lwip", &empty, &ws, true).unwrap(),
+            SourceDisposition::Planned
+        );
+        std::fs::remove_dir_all(&ws).ok();
     }
 }
