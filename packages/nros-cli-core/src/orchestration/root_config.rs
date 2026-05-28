@@ -371,6 +371,72 @@ impl WorkspaceConfig {
     }
 }
 
+/// What a single `nros.toml` *is*, decided Cargo-style by the sections present
+/// (never by filename). A `[workspace]` table dominates — a file carrying it is
+/// the workspace root regardless of also-present `[component]`/`[node]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestKind {
+    /// Has `[workspace]` — the deployment SSOT / workspace root.
+    Workspace,
+    /// Has `[component]` only — a reusable component (member of a workspace).
+    Component,
+    /// Has `[node]` / `[[transport]]` only — a standalone direct-mode node.
+    DirectNode,
+    /// None of the discriminating sections present.
+    Unknown,
+}
+
+/// Permissive probe: which discriminating top-level tables a manifest carries.
+/// Ignores every other key (it does NOT validate), so it works on any of the
+/// manifest kinds — including a direct-mode `[node]` file that `WorkspaceConfig`
+/// would reject.
+#[derive(Debug, Default, Deserialize)]
+struct ManifestProbe {
+    workspace: Option<toml::Value>,
+    component: Option<toml::Value>,
+    node: Option<toml::Value>,
+    #[serde(default)]
+    transport: Vec<toml::Value>,
+}
+
+/// Classify an `nros.toml` by the sections present.
+pub fn probe_manifest_kind(path: &Path) -> Result<ManifestKind> {
+    let raw = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("read nros.toml at {}", path.display()))?;
+    let probe: ManifestProbe =
+        toml::from_str(&raw).wrap_err_with(|| format!("parse nros.toml at {}", path.display()))?;
+    Ok(if probe.workspace.is_some() {
+        ManifestKind::Workspace
+    } else if probe.component.is_some() {
+        ManifestKind::Component
+    } else if probe.node.is_some() || !probe.transport.is_empty() {
+        ManifestKind::DirectNode
+    } else {
+        ManifestKind::Unknown
+    })
+}
+
+/// Walk up from `start` (a directory, or a manifest file whose dir is used) to
+/// the nearest enclosing **workspace root** — the closest ancestor `nros.toml`
+/// carrying a `[workspace]` table. Returns its path, or `None` when there is no
+/// enclosing workspace (the start is standalone — exactly Cargo's "package with
+/// no workspace").
+pub fn resolve_workspace_root(start: &Path) -> Result<Option<PathBuf>> {
+    let mut dir: Option<&Path> = if start.is_file() {
+        start.parent()
+    } else {
+        Some(start)
+    };
+    while let Some(d) = dir {
+        let candidate = d.join("nros.toml");
+        if candidate.is_file() && probe_manifest_kind(&candidate)? == ManifestKind::Workspace {
+            return Ok(Some(candidate));
+        }
+        dir = d.parent();
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +574,95 @@ package = ["sign build/orin/spe.elf -o build/orin/spe.bin"]
     fn rejects_bridge_with_one_endpoint() {
         let s = "[system]\nrmw=\"zenoh\"\n[[system.bridge]]\nname=\"gw\"\nconnect=[{rmw=\"zenoh\",domain=0}]\n";
         assert!(err(s).contains("≥2 sessions"));
+    }
+
+    // --- W.1 slice 3: manifest-kind probe + walk-up resolution ---
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// RAII scratch dir under the system temp dir (no `tempfile` dep).
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "nros-rc-test-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+        fn write(&self, rel: &str, body: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn probe_discriminates_by_section_workspace_dominates() {
+        let s = Scratch::new("probe");
+        let ws = s.write(
+            "ws/nros.toml",
+            "[workspace]\ndefault=\"x\"\n[system]\nrmw=\"zenoh\"\n",
+        );
+        let comp = s.write("comp/nros.toml", "[component]\nversion=1\npackage=\"p\"\ncomponent=\"c\"\nlanguage=\"rust\"\n[component.linkage]\n[component.metadata]\nsource_metadata=\"m.json\"\n");
+        let node = s.write(
+            "node/nros.toml",
+            "[node]\nname=\"n\"\n[[transport]]\nid=\"t\"\nkind=\"udp\"\n",
+        );
+        // [workspace] + [component] together → still a workspace root.
+        let root_comp = s.write("rc/nros.toml", "[workspace]\n[component]\nversion=1\npackage=\"p\"\ncomponent=\"c\"\nlanguage=\"rust\"\n[component.linkage]\n[component.metadata]\nsource_metadata=\"m.json\"\n");
+        let empty = s.write("e/nros.toml", "");
+        assert_eq!(probe_manifest_kind(&ws).unwrap(), ManifestKind::Workspace);
+        assert_eq!(probe_manifest_kind(&comp).unwrap(), ManifestKind::Component);
+        assert_eq!(
+            probe_manifest_kind(&node).unwrap(),
+            ManifestKind::DirectNode
+        );
+        assert_eq!(
+            probe_manifest_kind(&root_comp).unwrap(),
+            ManifestKind::Workspace
+        );
+        assert_eq!(probe_manifest_kind(&empty).unwrap(), ManifestKind::Unknown);
+    }
+
+    #[test]
+    fn walk_up_finds_nearest_enclosing_workspace() {
+        let s = Scratch::new("walkup");
+        s.write(
+            "nros.toml",
+            "[workspace]\ndefault=\"x\"\n[system]\nrmw=\"zenoh\"\n",
+        );
+        let comp = s.write(
+            "src/pkg/nros.toml",
+            "[component]\nversion=1\npackage=\"p\"\ncomponent=\"c\"\nlanguage=\"rust\"\n[component.linkage]\n[component.metadata]\nsource_metadata=\"m.json\"\n",
+        );
+        // From the component file → walks up to the workspace root nros.toml.
+        let root = resolve_workspace_root(&comp).unwrap().expect("found");
+        assert_eq!(root, s.0.join("nros.toml"));
+        // From a deep dir with no nros.toml → same root.
+        let deep = s.0.join("src/pkg/sub/dir");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            resolve_workspace_root(&deep).unwrap().unwrap(),
+            s.0.join("nros.toml")
+        );
+    }
+
+    #[test]
+    fn walk_up_returns_none_for_standalone() {
+        let s = Scratch::new("standalone");
+        // A direct-mode node with no enclosing [workspace] anywhere above.
+        let node = s.write("proj/nros.toml", "[node]\nname=\"n\"\n");
+        assert!(resolve_workspace_root(&node).unwrap().is_none());
     }
 }

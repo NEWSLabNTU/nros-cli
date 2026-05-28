@@ -24,9 +24,14 @@
 //! orchestration-library call (`orchestration::build::build_generated_package`)
 //! driven by `nros deploy`.
 
-use crate::{cmd::deploy, orchestration::root_config::WorkspaceConfig};
+use crate::{
+    cmd::deploy,
+    orchestration::root_config::{
+        ManifestKind, WorkspaceConfig, probe_manifest_kind, resolve_workspace_root,
+    },
+};
 use clap::Args as ClapArgs;
-use eyre::{Result, WrapErr, bail, eyre};
+use eyre::{Result, WrapErr, eyre};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -61,46 +66,45 @@ pub fn run(args: Args) -> Result<()> {
         None => std::env::current_dir()?,
     };
 
-    // Phase 172 WP-A — root nros.toml deploy dispatch. `nros build <name>`
-    // aliases `nros deploy <name>`; bare `nros build` in a workspace root
-    // builds `[workspace].default`. The gate is a *loadable* root nros.toml:
-    // `WorkspaceConfig` is `deny_unknown_fields`, so a component nros.toml
-    // (`[node]`/`[[transport]]`, direct mode) fails to load and falls through
-    // to the project-flavor autodetect below — unchanged.
+    // Phase 172 WP-A + W.1 slice 3 — root nros.toml deploy dispatch.
+    //
+    // `nros build <name>` aliases `nros deploy <name>`: walk up (Cargo-style)
+    // to the enclosing `[workspace]` root, so it works from any member dir.
+    // Bare `nros build` deploys `[workspace].default` ONLY when the cwd itself
+    // is a workspace root — a member/standalone dir falls through to the
+    // project-flavor autodetect below (build the local project, like
+    // `cargo build`). A component / direct-mode `nros.toml` is not a workspace,
+    // so it never hijacks the bare build.
+    if let Some(name) = &args.deploy_name {
+        let root_toml = resolve_workspace_root(&root)?.ok_or_else(|| {
+            eyre!(
+                "nros build {name}: no workspace nros.toml found from {} — deploy targets live \
+                 in a [workspace] root",
+                root.display()
+            )
+        })?;
+        return deploy::run(deploy::Args {
+            name: Some(name.clone()),
+            config: root_toml,
+            nano_ros_workspace: args.nano_ros_workspace.clone(),
+            dry_run: false,
+        });
+    }
     let root_toml = root.join("nros.toml");
-    if root_toml.is_file() {
-        match WorkspaceConfig::load(&root_toml) {
-            Ok(cfg) => {
-                let name = args
-                    .deploy_name
-                    .clone()
-                    .or_else(|| cfg.workspace.default.clone())
-                    .ok_or_else(|| {
-                        eyre!(
-                            "nros build: no deploy name given and no [workspace].default \
-                             in {} — pass `nros build <name>`",
-                            root_toml.display()
-                        )
-                    })?;
-                return deploy::run(deploy::Args {
-                    name: Some(name),
-                    config: root_toml,
-                    nano_ros_workspace: args.nano_ros_workspace.clone(),
-                    dry_run: false,
-                });
-            }
-            Err(e) if args.deploy_name.is_some() => {
-                return Err(e)
-                    .wrap_err("nros build <name>: ./nros.toml is not a valid workspace root");
-            }
-            Err(_) => { /* component nros.toml / not a root → project flavor */ }
-        }
-    } else if let Some(name) = &args.deploy_name {
-        bail!(
-            "nros build {name}: no root nros.toml in {} (deploy targets live in the \
-             workspace-root nros.toml)",
-            root.display()
-        );
+    if root_toml.is_file() && probe_manifest_kind(&root_toml)? == ManifestKind::Workspace {
+        let cfg = WorkspaceConfig::load(&root_toml)?;
+        let name = cfg.workspace.default.clone().ok_or_else(|| {
+            eyre!(
+                "nros build: ./nros.toml is a workspace but has no [workspace].default — \
+                 pass `nros build <name>`"
+            )
+        })?;
+        return deploy::run(deploy::Args {
+            name: Some(name),
+            config: root_toml,
+            nano_ros_workspace: args.nano_ros_workspace.clone(),
+            dry_run: false,
+        });
     }
 
     let flavor = detect_flavor(&root)?;

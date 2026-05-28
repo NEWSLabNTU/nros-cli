@@ -21,7 +21,10 @@ use crate::{
     orchestration::{
         self,
         generate::{GenerateOptions, generate_package},
-        root_config::{DeployTarget, EmitForm, SystemSection, WorkspaceConfig},
+        root_config::{
+            DeployTarget, EmitForm, ManifestKind, SystemSection, WorkspaceConfig,
+            probe_manifest_kind, resolve_workspace_root,
+        },
     },
 };
 
@@ -58,9 +61,9 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let cfg = WorkspaceConfig::load(&args.config)?;
-    let root = args
-        .config
+    let config_path = resolve_deploy_config(&args.config)?;
+    let cfg = WorkspaceConfig::load(&config_path)?;
+    let root = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
@@ -78,6 +81,60 @@ pub fn run(args: Args) -> Result<()> {
         nano_ros.as_deref(),
         args.dry_run,
     )
+}
+
+/// Resolve the workspace-root `nros.toml` this deploy operates on (Phase 172
+/// W.1, slice 3). If `--config` already points at a `[workspace]` file, use it.
+/// Otherwise — a `[component]`/`[node]` file, or a missing path — walk up to the
+/// nearest enclosing `[workspace]` root (Cargo-style). A non-workspace manifest
+/// with no enclosing workspace is a clear, kind-specific error: a deploy needs a
+/// system to deploy, which only a `[workspace]` root declares.
+fn resolve_deploy_config(config: &Path) -> Result<PathBuf> {
+    if config.is_file() {
+        match probe_manifest_kind(config)? {
+            ManifestKind::Workspace => return Ok(config.to_path_buf()),
+            kind => {
+                return resolve_workspace_root(config)?
+                    .ok_or_else(|| no_workspace_err(config, kind));
+            }
+        }
+    }
+    // No file at the given path → walk up from its directory.
+    let start = config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    resolve_workspace_root(&start)?.ok_or_else(|| {
+        eyre!(
+            "nros deploy: no workspace nros.toml found from {} — a deploy needs a [workspace] \
+             root; pass --config <root nros.toml>",
+            config.display()
+        )
+    })
+}
+
+/// The "this isn't a workspace, and none encloses it" message, tailored to the
+/// manifest's actual kind so the user knows the right next move.
+fn no_workspace_err(config: &Path, kind: ManifestKind) -> eyre::Report {
+    match kind {
+        ManifestKind::DirectNode => eyre!(
+            "{}: this is a direct-mode node config (no [workspace]) — build it directly with \
+             `nros build`, or add it to a workspace's [system].components",
+            config.display()
+        ),
+        ManifestKind::Component => eyre!(
+            "{}: this is a component manifest (no [workspace]) and no enclosing workspace \
+             nros.toml was found — add it to a workspace's [system].components, or run from \
+             inside the workspace",
+            config.display()
+        ),
+        _ => eyre!(
+            "{}: not a workspace nros.toml (no [workspace] table) and no enclosing workspace \
+             was found",
+            config.display()
+        ),
+    }
 }
 
 /// Resolve the target by name, or fall back to `[workspace].default`.
@@ -542,5 +599,59 @@ build = ["west build -b {board} -d build/mcu {self}"]
         .unwrap_err()
         .to_string();
         assert!(err.contains("nano-ros workspace"), "{err}");
+    }
+
+    // --- W.1 slice 3: deploy config resolution (walk-up + direct-mode error) ---
+
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nros-deploy-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_deploy_config_passes_through_a_workspace_file() {
+        let dir = scratch("ws");
+        let path = dir.join("nros.toml");
+        std::fs::write(
+            &path,
+            "[workspace]\ndefault=\"x\"\n[system]\nrmw=\"zenoh\"\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_deploy_config(&path).unwrap(), path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_deploy_config_walks_up_from_a_component_member() {
+        let dir = scratch("member");
+        std::fs::write(
+            dir.join("nros.toml"),
+            "[workspace]\ndefault=\"x\"\n[system]\nrmw=\"zenoh\"\n",
+        )
+        .unwrap();
+        let pkg = dir.join("src/pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let comp = pkg.join("nros.toml");
+        std::fs::write(&comp, "[component]\nversion=1\npackage=\"p\"\ncomponent=\"c\"\nlanguage=\"rust\"\n[component.linkage]\n[component.metadata]\nsource_metadata=\"m.json\"\n").unwrap();
+        assert_eq!(resolve_deploy_config(&comp).unwrap(), dir.join("nros.toml"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_deploy_config_direct_mode_node_errors_clearly() {
+        let dir = scratch("direct");
+        let path = dir.join("nros.toml");
+        std::fs::write(&path, "[node]\nname=\"n\"\n").unwrap();
+        let err = resolve_deploy_config(&path).unwrap_err().to_string();
+        assert!(err.contains("direct-mode node config"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
