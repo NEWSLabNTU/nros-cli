@@ -127,15 +127,23 @@ pub fn run(args: Args) -> Result<()> {
 /// build/deploy needs no separate `nros setup` (the PlatformIO auto-install
 /// ergonomic). Only `[tool.*]` packages are installed; `[source.*]` build with
 /// the app and `[gated.*]` are user-provided. Opt out with `NROS_NO_AUTO_SETUP`.
-/// No-op (Ok) when no index is found; an unavailable tool warns rather than
+/// No-op (empty) when no index is found; an unavailable tool warns rather than
 /// fails so the downstream build surfaces the real miss (e.g. a system-installed
 /// toolchain the index doesn't host).
-pub fn ensure_tools(board: &str, target: Option<&str>, workspace: Option<&Path>) -> Result<()> {
+///
+/// Returns the `bin/` dirs of the resolved tools present in the store — Method A
+/// callers ([`activate_store_path`]) prepend these to the env so every spawned
+/// child finds the toolchain, without any non-`nros` script resolving paths.
+pub fn ensure_tools(
+    board: &str,
+    target: Option<&str>,
+    workspace: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
     if std::env::var_os("NROS_NO_AUTO_SETUP").is_some() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(index_path) = locate_index(workspace) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let index = SdkIndex::load(&index_path)?;
     let host = host_key();
@@ -143,6 +151,7 @@ pub fn ensure_tools(board: &str, target: Option<&str>, workspace: Option<&Path>)
     let lock_path = PathBuf::from("nros-sdk.lock");
     let mut lock = SdkLock::load(&lock_path)?;
     let mut installed = false;
+    let mut bin_dirs = Vec::new();
 
     for name in resolve_packages(board, target) {
         let Some(tool) = index.tool.get(name) else {
@@ -157,6 +166,7 @@ pub fn ensure_tools(board: &str, target: Option<&str>, workspace: Option<&Path>)
                      install it yourself if the build needs it",
                     tool.version
                 );
+                continue; // not in the store → nothing to add to PATH
             }
             action => {
                 eprintln!(
@@ -170,11 +180,35 @@ pub fn ensure_tools(board: &str, target: Option<&str>, workspace: Option<&Path>)
                 eprintln!("    → {}", prefix.display());
             }
         }
+        let bin = prefix.join("bin");
+        if bin.is_dir() {
+            bin_dirs.push(bin);
+        }
     }
     if installed {
         lock.save(&lock_path)?;
     }
-    Ok(())
+    Ok(bin_dirs)
+}
+
+/// Method A — prepend the store `bin/` dirs (from [`ensure_tools`]) to this
+/// process's `PATH` so every child `nros build`/`deploy` spawns (cargo, cmake,
+/// west, the `build[]`/`package[]` steps) finds the toolchain on `PATH`. `nros`
+/// is the single resolver; non-`nros` scripts/code never hunt for SDK paths.
+/// A no-op when `dirs` is empty (no store tools / auto-setup skipped).
+pub fn activate_store_path(dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
+    let mut parts: Vec<PathBuf> = dirs.to_vec();
+    if let Some(cur) = std::env::var_os("PATH") {
+        parts.extend(std::env::split_paths(&cur));
+    }
+    if let Ok(joined) = std::env::join_paths(parts) {
+        // SAFETY: a CLI invocation activating its own toolchain for the child
+        // processes it is about to spawn; set before any thread reads the env.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
 }
 
 /// Locate the SDK index for auto-setup: cwd, then the passed workspace, then

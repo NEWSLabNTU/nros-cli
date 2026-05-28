@@ -183,13 +183,14 @@ fn deploy_target(
                  --nano-ros-workspace <path> or set NROS_WORKSPACE"
             )
         })?;
-        // Phase 187.6: lazy-install the board's host tools before building
-        // (opt out with NROS_NO_AUTO_SETUP).
-        crate::cmd::setup::ensure_tools(
+        // Phase 187.6 (Method A): lazy-install the board's host tools, then put
+        // them on PATH for every child we spawn below (opt out: NROS_NO_AUTO_SETUP).
+        let bins = crate::cmd::setup::ensure_tools(
             deploy.board.as_deref().unwrap_or("native"),
             deploy.target.as_deref(),
             Some(nano_ros),
         )?;
+        crate::cmd::setup::activate_store_path(&bins);
         emit_entry_lib(root, name, sys, deploy, nano_ros)?;
     }
 
