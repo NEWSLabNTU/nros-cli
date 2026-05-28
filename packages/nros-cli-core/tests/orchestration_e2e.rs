@@ -950,9 +950,7 @@ fn fixture_workspace_builds_generated_service_action_package() {
     let generated_tables =
         fs::read_to_string(generated_dir.join("build.rs")).expect("read generated build.rs");
     assert!(generated_tables.contains("register_service_raw_sized_on::<1024, 1024>"));
-    assert!(
-        generated_tables.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>")
-    );
+    assert!(generated_tables.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>"));
     let binary = out_dir
         .join("target")
         .join(&plan.build.target)

@@ -444,8 +444,8 @@ fn parse_launch_file_record(
     launch_file: &Path,
     launch_args: HashMap<String, String>,
 ) -> Result<Value> {
-    let bin =
-        std::env::var("NROS_PLAY_LAUNCH_PARSER").unwrap_or_else(|_| "play_launch_parser".to_string());
+    let bin = std::env::var("NROS_PLAY_LAUNCH_PARSER")
+        .unwrap_or_else(|_| "play_launch_parser".to_string());
     let mut cmd = Command::new(&bin);
     cmd.arg("file").arg(launch_file);
     for (k, v) in &launch_args {

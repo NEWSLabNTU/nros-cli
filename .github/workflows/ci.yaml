@@ -43,8 +43,15 @@ jobs:
 
       # rustfmt.toml enables nightly-only options (imports_granularity,
       # format_code_in_doc_comments) — must check with nightly rustfmt.
-      - name: cargo +nightly fmt --check
-        run: cargo +nightly-2026-04-19 fmt --all -- --check
+      # Scope to first-party members via -p: `--all` also formats path-dep crates
+      # (the vendored third-party/ros-launch-manifest submodule, which has its
+      # own stable-fmt standard) — don't churn/gate on those.
+      - name: cargo fmt --check (first-party)
+        run: >
+          cargo +nightly-2026-04-19 fmt
+          -p rosidl-parser -p rosidl-codegen -p rosidl-bindgen -p cargo-nano-ros
+          -p nros-cli-core -p nros-cli -p nros-codegen-c -p colcon-nano-ros
+          -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings

@@ -229,12 +229,16 @@ fn provision_named_sources(
 ) -> Result<()> {
     let workspace = index_workspace(index_path);
     for name in names {
-        let src = index.source.get(name.as_str()).ok_or_else(|| {
-            eyre::eyre!("nros setup --source: no [source.{name}] in the index")
-        })?;
+        let src = index
+            .source
+            .get(name.as_str())
+            .ok_or_else(|| eyre::eyre!("nros setup --source: no [source.{name}] in the index"))?;
         let disp = provision_source(name, src, &workspace, dry_run)
             .wrap_err_with(|| format!("provision source {name}"))?;
-        eprintln!("nros setup --source {name}: {}", describe_source(src, &disp));
+        eprintln!(
+            "nros setup --source {name}: {}",
+            describe_source(src, &disp)
+        );
     }
     Ok(())
 }
@@ -289,11 +293,16 @@ pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf
             if let Some(src) = index.source.get(name) {
                 match provision_source(name, src, &ws, false) {
                     Ok(SourceDisposition::Provisioned) => {
-                        eprintln!("nros: provisioned source {name} → {}", src.dest.as_deref().unwrap_or("-"));
+                        eprintln!(
+                            "nros: provisioned source {name} → {}",
+                            src.dest.as_deref().unwrap_or("-")
+                        );
                         installed = true;
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("nros: source {name} provisioning failed ({e}) — provide it yourself if the build needs it"),
+                    Err(e) => eprintln!(
+                        "nros: source {name} provisioning failed ({e}) — provide it yourself if the build needs it"
+                    ),
                 }
             }
             continue; // gated / not-in-index — not a store tool
@@ -379,7 +388,10 @@ fn index_workspace(index: &Path) -> PathBuf {
 }
 
 /// One-line description of a source's provisioning outcome (Phase 195.B).
-fn describe_source(src: &crate::orchestration::sdk_index::SourcePackage, disp: &SourceDisposition) -> String {
+fn describe_source(
+    src: &crate::orchestration::sdk_index::SourcePackage,
+    disp: &SourceDisposition,
+) -> String {
     use crate::orchestration::sdk_index::SourceProvision;
     let mode = match src.provision() {
         SourceProvision::Clone => format!(
@@ -398,7 +410,11 @@ fn describe_source(src: &crate::orchestration::sdk_index::SourcePackage, disp: &
         SourceDisposition::NoFetch => "no fetch step",
         SourceDisposition::Planned => "would provision (--dry-run)",
     };
-    format!("source {} — {mode} → {} [{outcome}]", src.version, src.dest.as_deref().unwrap_or("-"))
+    format!(
+        "source {} — {mode} → {} [{outcome}]",
+        src.version,
+        src.dest.as_deref().unwrap_or("-")
+    )
 }
 
 /// One-line description of the planned action (mirrors `disposition`, but for an

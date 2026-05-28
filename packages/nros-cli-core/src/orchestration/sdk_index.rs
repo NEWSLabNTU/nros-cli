@@ -413,11 +413,23 @@ installer = "nvidia-sdk-manager"
     fn source_provision_incoherence_is_rejected() {
         // git without ref.
         let no_ref = SdkIndex::parse("[source.x]\nversion=\"1\"\ngit=\"u\"\ndest=\"d\"\n").unwrap();
-        assert!(no_ref.validate().unwrap_err().to_string().contains("no `ref`"));
+        assert!(
+            no_ref
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("no `ref`")
+        );
 
         // git without dest.
         let no_dest = SdkIndex::parse("[source.x]\nversion=\"1\"\ngit=\"u\"\nref=\"r\"\n").unwrap();
-        assert!(no_dest.validate().unwrap_err().to_string().contains("no `dest`"));
+        assert!(
+            no_dest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("no `dest`")
+        );
     }
 
     #[test]
