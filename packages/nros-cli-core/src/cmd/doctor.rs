@@ -16,7 +16,10 @@ use std::{
 
 use crate::{
     cmd::board::find_workspace_root,
-    orchestration::root_config::{VendorDir, WorkspaceConfig},
+    orchestration::{
+        root_config::{VendorDir, WorkspaceConfig},
+        sdk_index::SdkIndex,
+    },
 };
 
 #[derive(Debug, ClapArgs)]
@@ -41,6 +44,10 @@ pub fn run(args: Args) -> Result<()> {
     // target's pinned vendor dir. `None` ⇒ no root config here (e.g. running
     // in the nano-ros repo) → only the workspace health below runs.
     let pin_problems = check_deploy_pins(&args.config)?;
+
+    // Phase 187.7 — license-gated SDK presence (NVIDIA SPE, ARM FVP, …): never
+    // fetched, only instructed. Read before `args.workspace` is moved below.
+    let gate_problems = check_license_gates(args.workspace.as_deref())?;
 
     // The nano-ros workspace health (`just doctor`). When a root nros.toml was
     // checked, missing it is non-fatal (we're in a user deploy project, not the
@@ -69,12 +76,57 @@ pub fn run(args: Args) -> Result<()> {
         run_just_doctor(&root, args.platform.as_deref())?;
     }
 
-    if let Some(n) = pin_problems
-        && n > 0
-    {
-        bail!("nros doctor: {n} deploy vendor-pin problem(s)");
+    let problems = pin_problems.unwrap_or(0) + gate_problems;
+    if problems > 0 {
+        bail!("nros doctor: {problems} problem(s) (deploy pins + license gates)");
     }
     Ok(())
+}
+
+/// Phase 187.7 — license-gate presence check. For each `[gated.*]` SDK in the
+/// index (NVIDIA SPE, ARM FVP, …), report whether its env var resolves to an
+/// existing directory. These are NEVER fetched or built — only instructed. An
+/// unset env is informational (the user simply isn't targeting that board); an
+/// env that's set but points nowhere is a misconfiguration (counted). No index
+/// nearby ⇒ skip silently.
+fn check_license_gates(workspace: Option<&Path>) -> Result<usize> {
+    let Some(index_path) = crate::cmd::setup::locate_index(workspace) else {
+        return Ok(0);
+    };
+    let index = SdkIndex::load(&index_path)?;
+    if index.gated.is_empty() {
+        return Ok(0);
+    }
+
+    eprintln!("nros doctor: license-gated SDKs ({})", index_path.display());
+    let mut problems = 0usize;
+    for (name, g) in &index.gated {
+        let via = g
+            .installer
+            .as_deref()
+            .map(|i| format!(", via {i}"))
+            .unwrap_or_default();
+        match std::env::var_os(&g.env) {
+            None => eprintln!(
+                "  [--] {name} {}: not installed — set ${}{via} (never auto-fetched)",
+                g.version, g.env
+            ),
+            Some(v) => {
+                let dir = PathBuf::from(&v);
+                if dir.is_dir() {
+                    eprintln!("  [OK] {name} {}: ${} = {}", g.version, g.env, dir.display());
+                } else {
+                    eprintln!(
+                        "  [!!] {name}: ${} set to {} — not a directory",
+                        g.env,
+                        dir.display()
+                    );
+                    problems += 1;
+                }
+            }
+        }
+    }
+    Ok(problems)
 }
 
 /// Report each deploy target's vendor-pin status. Returns the problem count,
@@ -185,4 +237,38 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn license_gate_flags_misconfigured_env_only() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ws = std::env::temp_dir().join(format!("nros_gate_{n}"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("nros-sdk-index.toml"),
+            "[gated.nv-spe-fsp]\nversion=\"36.3\"\nenv=\"NROS_TEST_GATE_ENV\"\ninstaller=\"x\"\n",
+        )
+        .unwrap();
+        let env = "NROS_TEST_GATE_ENV";
+
+        // Unset ⇒ informational, not a problem.
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(check_license_gates(Some(&ws)).unwrap(), 0);
+        // Set to a non-existent dir ⇒ misconfigured ⇒ 1 problem.
+        unsafe { std::env::set_var(env, ws.join("nope")) };
+        assert_eq!(check_license_gates(Some(&ws)).unwrap(), 1);
+        // Set to an existing dir ⇒ OK.
+        unsafe { std::env::set_var(env, &ws) };
+        assert_eq!(check_license_gates(Some(&ws)).unwrap(), 0);
+
+        unsafe { std::env::remove_var(env) };
+        std::fs::remove_dir_all(&ws).ok();
+    }
 }

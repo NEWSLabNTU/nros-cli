@@ -179,8 +179,8 @@ pub fn ensure_tools(board: &str, target: Option<&str>, workspace: Option<&Path>)
 
 /// Locate the SDK index for auto-setup: cwd, then the passed workspace, then
 /// `$NROS_WORKSPACE`. `None` ⇒ auto-setup is a no-op (not every build runs near
-/// a nano-ros workspace).
-fn locate_index(workspace: Option<&Path>) -> Option<PathBuf> {
+/// a nano-ros workspace). Shared with `nros doctor`'s license-gate check (187.7).
+pub(crate) fn locate_index(workspace: Option<&Path>) -> Option<PathBuf> {
     let cwd = PathBuf::from("nros-sdk-index.toml");
     if cwd.is_file() {
         return Some(cwd);
