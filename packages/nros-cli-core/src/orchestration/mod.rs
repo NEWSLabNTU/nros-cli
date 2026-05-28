@@ -15,6 +15,7 @@ pub mod plan;
 pub mod planner;
 pub mod root_config;
 pub mod schema;
+pub mod sdk_index;
 pub mod source_metadata;
 pub mod workspace;
 
