@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::{
-    ComponentConfig, NrosPlan,
+    NrosPlan,
     plan::{
         LifecycleAutostart, PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext,
         TransportKind,
@@ -1196,10 +1196,11 @@ fn resolve_workspace_path(workspace: Option<&Path>, raw: &str) -> Option<PathBuf
 }
 
 fn component_static_library(config_path: &Path) -> Result<Option<PathBuf>> {
-    let raw = fs::read_to_string(config_path)
-        .wrap_err_with(|| format!("failed to read {}", config_path.display()))?;
-    let config: ComponentConfig = toml::from_str(&raw)
-        .wrap_err_with(|| format!("failed to parse {}", config_path.display()))?;
+    // Handles both the folded `nros.toml` `[component]` form and the legacy
+    // standalone manifest (W.1); `None` when the file carries no component.
+    let Some(config) = super::workspace::load_component_config(config_path)? else {
+        return Ok(None);
+    };
     Ok(config.linkage.static_library.map(|raw| {
         let path = PathBuf::from(raw);
         if path.is_absolute() {
