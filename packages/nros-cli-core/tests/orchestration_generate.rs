@@ -130,7 +130,11 @@ fn generated_package_writes_manifest_build_script_and_main() {
     // Phase 172 WP-B — src/lib.rs hosts the wiring + the `nros_<sys>_*` C ABI;
     // Cargo.toml is a standalone `lib` + `staticlib` crate.
     let lib_rs = fs::read_to_string(output_dir.join("src/lib.rs")).expect("read lib.rs");
-    assert!(lib_rs.contains("pub use nros_generated::{SYSTEM, build_executor, register_all};"));
+    // The entry lib re-exports the wiring the self shim / board shim needs
+    // (TRANSPORT_LOCATOR rides along for the baked locator).
+    assert!(lib_rs.contains(
+        "pub use nros_generated::{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all};"
+    ));
     // C ABI symbol prefix is the system name (`demo_system`), not the crate.
     assert!(lib_rs.contains("pub extern \"C\" fn nros_demo_system_build_executor("));
     assert!(lib_rs.contains("pub extern \"C\" fn nros_demo_system_register_all("));
@@ -217,9 +221,11 @@ fn declared_serial_transport_selects_board_feature() {
         "transport locator emitted as const:\n{build_rs}"
     );
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
+    // Phase 172 flip — the board shim `use`s the entry lib, so TRANSPORT_LOCATOR
+    // is imported (no `nros_generated::` prefix).
     assert!(
-        main_rs.contains("nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator)"),
-        "board entry prefers the transport locator:\n{main_rs}"
+        main_rs.contains("TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator)"),
+        "board shim prefers the transport locator:\n{main_rs}"
     );
 
     // Phase 173.5 — NanoRosOwned: the serial baudrate lands in the board
@@ -229,9 +235,11 @@ fn declared_serial_transport_selects_board_feature() {
         build_rs.contains("apply_transport_config") && build_rs.contains("set_baudrate(115200)"),
         "baudrate written into board Config:\n{build_rs}"
     );
+    // Phase 172 flip — the board shim calls the entry lib's apply hook through
+    // the lib crate path.
     assert!(
-        main_rs.contains("nros_generated::apply_transport_config(&mut cfg)"),
-        "board entry applies the transport Config override:\n{main_rs}"
+        main_rs.contains("nros_generated_test::apply_transport_config(&mut cfg)"),
+        "board shim applies the transport Config override:\n{main_rs}"
     );
 }
 
@@ -279,18 +287,18 @@ fn bridge_two_transports_emit_open_multi_and_session_specs() {
         "per-transport specs:\n{build_rs}"
     );
 
-    // Phase 172 WP-B — open_multi moved into the entry lib's
-    // `build_executor_bridge`; main.rs calls `run_system_bridge`, which routes
-    // through it.
+    // Phase 172 flip — open_multi lives in the entry lib's
+    // `build_executor_bridge`; the thin shim `use`s + calls it (no
+    // `nros_generated::` prefix, no `run_system_bridge` helper).
     assert!(
         build_rs.contains("Executor::open_multi(&SESSION_SPECS)"),
         "build_executor_bridge opens via open_multi:\n{build_rs}"
     );
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
     assert!(
-        main_rs.contains("run_system_bridge()")
-            && main_rs.contains("nros_generated::build_executor_bridge()"),
-        "bridge entry routes through build_executor_bridge:\n{main_rs}"
+        main_rs.contains("build_executor_bridge()?")
+            && main_rs.contains("register_all(&mut executor)?"),
+        "bridge shim routes through build_executor_bridge:\n{main_rs}"
     );
 }
 
