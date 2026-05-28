@@ -8,7 +8,9 @@
 //! per-use-case template trees land alongside the Phase 112 example
 //! sweep.
 
-use cargo_nano_ros::scaffold::{ScaffoldConfig, scaffold_package};
+use cargo_nano_ros::scaffold::{
+    ComponentScaffoldConfig, ScaffoldConfig, scaffold_component, scaffold_package,
+};
 use clap::Args as ClapArgs;
 use eyre::{Result, bail};
 use std::path::PathBuf;
@@ -38,6 +40,13 @@ pub struct Args {
     /// Use case template
     #[arg(long = "use-case", value_parser = ["talker", "listener", "service", "action"], default_value = "talker")]
     pub use_case: String,
+
+    /// Phase 172 W.3 — scaffold a planned-mode **component** (a reusable
+    /// library node with an `nros::Component` + a folded `[component]`
+    /// `nros.toml`) instead of a direct-mode binary project. Platform-agnostic
+    /// (platform/RMW are chosen at deploy time), so `--platform` is not needed.
+    #[arg(long)]
+    pub component: bool,
 
     /// Phase 172 WP-A — scaffold a `[deploy.<name>]` target in the root
     /// nros.toml (deploy mode) instead of a project.
@@ -90,7 +99,6 @@ pub fn run(args: Args) -> Result<()> {
         });
     }
 
-    // Project mode.
     let name = args
         .name
         .as_ref()
@@ -99,6 +107,25 @@ pub fn run(args: Args) -> Result<()> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| eyre::eyre!("invalid project name"))?
         .to_string();
+
+    // Component mode (Phase 172 W.3): a reusable planned-mode library node.
+    // Platform-agnostic; Rust-only for now (the `Component` trait + macro shape
+    // this scaffolds is Rust).
+    if args.component {
+        if args.lang != "rust" {
+            bail!(
+                "`nros new --component` scaffolds a Rust component; --lang {} is not yet supported",
+                args.lang
+            );
+        }
+        return scaffold_component(&ComponentScaffoldConfig {
+            name,
+            use_case: args.use_case,
+            force: args.force,
+        });
+    }
+
+    // Project mode.
     let platform = args
         .platform
         .ok_or_else(|| eyre::eyre!("`nros new <name>` requires `--platform <p>`"))?;

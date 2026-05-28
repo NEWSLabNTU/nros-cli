@@ -8,8 +8,10 @@
 //!
 //! Note: Some tests require ROS 2 to be sourced (AMENT_PREFIX_PATH set)
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 
 // Helper to check if ROS is available
@@ -666,5 +668,81 @@ mod cli_tests {
                 package_name
             );
         }
+    }
+}
+
+// Phase 172 W.3 — planned-mode component scaffold.
+mod component_scaffold {
+    use super::*;
+    use cargo_nano_ros::scaffold::{ComponentScaffoldConfig, scaffold_component};
+    use std::sync::Mutex;
+
+    // The scaffolder writes cwd-relative (matching `scaffold_package`), so the
+    // test chdir's; serialize so it never races a sibling that does the same.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scaffold_component_emits_folded_minimal_manifest_and_lib() {
+        let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = scaffold_component(&ComponentScaffoldConfig {
+            name: "my-comp".to_string(),
+            use_case: "talker".to_string(),
+            force: false,
+        });
+        std::env::set_current_dir(&prev).unwrap();
+        result.expect("scaffold_component");
+
+        let dir = tmp.path().join("my-comp");
+
+        // Folded `[component]` manifest with a 2-segment `crate::module` id
+        // (`nros metadata --build` requires it), and intentionally minimal —
+        // no `[linkage]` (derived) / `[overrides]` (defaulted), per W.3.
+        let nros_toml = fs::read_to_string(dir.join("nros.toml")).unwrap();
+        assert!(nros_toml.contains("[component]"));
+        assert!(nros_toml.contains(r#"component = "my_comp::talker""#));
+        assert!(nros_toml.contains(r#"package = "my-comp""#));
+        assert!(nros_toml.contains(r#"source_metadata = "metadata/talker.json""#));
+        assert!(
+            !nros_toml.contains("[linkage]") && !nros_toml.contains("[overrides]"),
+            "manifest must stay minimal: {nros_toml}"
+        );
+
+        // A real `nros::Component` impl in a `crate::talker` module.
+        let lib = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("impl nros::Component for Component"));
+        assert!(lib.contains(r#"const NAME: &'static str = "talker""#));
+        assert!(lib.contains("pub mod talker"));
+
+        // A library crate (rlib), not a binary.
+        let cargo = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("nros = {"));
+        assert!(
+            !cargo.contains("[[bin]]"),
+            "component is a library: {cargo}"
+        );
+        assert!(dir.join("package.xml").is_file());
+    }
+
+    #[test]
+    fn scaffold_component_uses_the_use_case_as_the_node_module() {
+        let _g = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = scaffold_component(&ComponentScaffoldConfig {
+            name: "svc".to_string(),
+            use_case: "service".to_string(),
+            force: false,
+        });
+        std::env::set_current_dir(&prev).unwrap();
+        result.expect("scaffold_component");
+
+        let nros_toml = fs::read_to_string(tmp.path().join("svc/nros.toml")).unwrap();
+        assert!(nros_toml.contains(r#"component = "svc::service""#));
+        let lib = fs::read_to_string(tmp.path().join("svc/src/lib.rs")).unwrap();
+        assert!(lib.contains("pub mod service"));
     }
 }

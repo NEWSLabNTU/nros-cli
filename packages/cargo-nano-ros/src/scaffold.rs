@@ -85,6 +85,169 @@ pub fn scaffold_package(cfg: &ScaffoldConfig) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct ComponentScaffoldConfig {
+    pub name: String,
+    /// Node flavor: `talker` / `listener` / `service` / `action`. Template
+    /// diversification is TODO — today every flavor emits the publisher+timer
+    /// shape, named after the flavor.
+    pub use_case: String,
+    pub force: bool,
+}
+
+/// Scaffold a **planned-mode component** — a reusable nano-ros node compiled as
+/// a *library* and linked into a system by `nros plan` / `nros deploy`. Unlike
+/// the direct-mode hello-world binary `scaffold_package` emits (a `[node]`
+/// manifest), this produces an `nros::Component` impl plus a *folded*
+/// `[component]` table in `nros.toml`. The platform + RMW are chosen later, at
+/// deploy time — not baked here.
+///
+/// The manifest is intentionally minimal: `[linkage]` is omitted (derived —
+/// executable ← component short name, `exported_symbol` ← `nros_component_<n>`,
+/// `crate_name` ← package) and `[overrides]` defaults to empty (Phase 172 W.3).
+pub fn scaffold_component(cfg: &ComponentScaffoldConfig) -> Result<()> {
+    let dir = PathBuf::from(&cfg.name);
+    if dir.exists() {
+        if !cfg.force {
+            bail!(
+                "Directory '{}' already exists (use --force to overwrite)",
+                cfg.name
+            );
+        }
+        fs::remove_dir_all(&dir)?;
+    }
+    fs::create_dir_all(dir.join("src"))?;
+
+    let crate_name = cfg.name.replace('-', "_");
+    let module = &cfg.use_case; // constrained by the CLI to a valid Rust ident
+
+    let package_xml = format!(
+        r#"<?xml version="1.0"?>
+<package format="3">
+  <name>{name}</name>
+  <version>0.1.0</version>
+  <description>{name} — nano-ros reusable component.</description>
+  <maintainer email="TODO@todo.com">TODO</maintainer>
+  <license>Apache-2.0</license>
+</package>
+"#,
+        name = cfg.name,
+    );
+    fs::write(dir.join("package.xml"), package_xml)?;
+
+    let cargo_toml = format!(
+        r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone-buildable: an empty [workspace] makes this its own Cargo root even
+# when dropped under a colcon workspace's src/.
+[workspace]
+
+# A reusable component is a library (rlib); the deployed system links it.
+[dependencies]
+nros = {{ version = "0.1", default-features = false }}
+"#,
+        name = cfg.name,
+    );
+    fs::write(dir.join("Cargo.toml"), cargo_toml)?;
+
+    let lib_rs = format!(
+        r#"#![no_std]
+
+//! `{name}` — a reusable nano-ros component (planned mode).
+//!
+//! `nros plan` / `nros deploy` link this crate into a system and call
+//! `{module}::Component::register`. `nros metadata --build` records its
+//! declarations into `metadata/{module}.json`. Platform + RMW are chosen at
+//! deploy time, not here.
+
+pub mod {module} {{
+    use nros::{{
+        CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult, DeserError,
+        Deserialize, EntityId, NodeId, NodeOptions, RosMessage, SerError, Serialize, TimerDuration,
+    }};
+
+    pub struct Component;
+
+    impl nros::Component for Component {{
+        const NAME: &'static str = "{module}";
+
+        fn register(context: &mut ComponentContext<'_>) -> ComponentResult<()> {{
+            let mut node =
+                context.create_node(NodeId::new("node_{module}"), NodeOptions::new("{module}"))?;
+            let _publisher =
+                node.create_publisher::<StringMsg>(EntityId::new("pub_chatter"), "chatter")?;
+            let _timer = node.create_timer(
+                EntityId::new("timer_publish"),
+                CallbackId::new("cb_timer"),
+                TimerDuration::from_millis(100),
+            )?;
+            Ok(())
+        }}
+    }}
+
+    /// Minimal hand-rolled `std_msgs/String` stand-in. Replace with a generated
+    /// message type (`nros generate-rust`) for real payloads.
+    pub struct StringMsg;
+    impl Serialize for StringMsg {{
+        fn serialize(&self, _writer: &mut CdrWriter) -> Result<(), SerError> {{
+            Ok(())
+        }}
+    }}
+    impl Deserialize for StringMsg {{
+        fn deserialize(_reader: &mut CdrReader) -> Result<Self, DeserError> {{
+            Ok(Self)
+        }}
+    }}
+    impl RosMessage for StringMsg {{
+        const TYPE_NAME: &'static str = "std_msgs::msg::dds_::String_";
+        const TYPE_HASH: &'static str = "std_msgs/String";
+    }}
+}}
+
+// The planner links the component via the Rust type path above. To also expose
+// the C / dynamic registration symbol (`__nros_component_register`), add:
+//     nros::component!({module}::Component);
+"#,
+        name = cfg.name,
+    );
+    fs::write(dir.join("src/lib.rs"), lib_rs)?;
+
+    // Folded `[component]` manifest (Phase 172 W.1). Minimal — no `[linkage]`
+    // (derived) and no `[overrides]` (defaults to empty). The `crate::module`
+    // component id is required by `nros metadata --build`.
+    let nros_toml = format!(
+        r#"# nano-ros component manifest (planned mode). A reusable node linked into a
+# system by `nros plan` / `nros deploy`. See
+# docs/design/configuration-and-transports.md.
+
+[component]
+version = 1
+package = "{name}"
+component = "{crate_name}::{module}"
+language = "rust"
+
+[component.metadata]
+source_metadata = "metadata/{module}.json"
+"#,
+        name = cfg.name,
+    );
+    fs::write(dir.join("nros.toml"), nros_toml)?;
+
+    println!("✓ Created nano-ros component '{}'", cfg.name);
+    println!("  Component : {crate_name}::{module}");
+    println!("  Kind      : planned-mode (library, linked by `nros deploy`)");
+    println!();
+    println!("Next steps:");
+    println!("  cd {}", cfg.name);
+    println!("  # add this package to a workspace's [system].components, then:");
+    println!("  nros metadata --build   # record its source metadata");
+
+    Ok(())
+}
+
 fn scaffold_rust(name: &str, platform: &str, dir: &Path) -> Result<()> {
     let mut deps = String::new();
     let is_embedded = platform != "native";
