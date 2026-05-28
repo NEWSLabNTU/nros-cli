@@ -58,5 +58,8 @@ jobs:
       - name: cargo clippy
         run: cargo +stable clippy --workspace -- -D warnings
 
+      # --lib: unit tests only. The integration tests (tests/orchestration_e2e.rs)
+      # generate workspaces that path-dep the nano-ros superproject's `nros` crate
+      # + toolchains — they run in nano-ros CI, not in this standalone repo.
       - name: cargo test
-        run: cargo +stable test --workspace
+        run: cargo +stable test --workspace --lib
