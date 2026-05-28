@@ -29,12 +29,29 @@ pub struct SdkIndex {
     /// License-gated packages (never hosted/built), by name.
     #[serde(default)]
     pub gated: BTreeMap<String, GatedPackage>,
+    /// RMW → host package set (Phase 191.6.a). The RMW axis is orthogonal to the
+    /// board/platform axis: a board lists only its platform/toolchain packages,
+    /// the chosen RMW contributes its host daemon/tool (`zenohd` / `xrce-agent`
+    /// / `cyclonedds`). `nros setup <board> --rmw <name>` resolves
+    /// `board.packages ∪ rmw.packages` — no `board×rmw` pair enumeration.
+    #[serde(default)]
+    pub rmw: BTreeMap<String, RmwEntry>,
     /// Board → required package set (Phase 191.1). The board→toolchain SSOT that
     /// ships with the index — replaces board-name keyword guessing in
     /// `resolve_packages`. Keyed by the canonical board id the user passes to
     /// `nros setup <board>`.
     #[serde(default)]
     pub board: BTreeMap<String, BoardEntry>,
+}
+
+/// An RMW's host package set — the orthogonal RMW axis (Phase 191.6.a).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RmwEntry {
+    /// The index package names (`[tool]`/`[source]`/`[gated]`) this RMW's host
+    /// side needs — e.g. `["zenohd"]`, `["xrce-agent"]`, `["cyclonedds"]`.
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
 /// A prebuilt host tool: a per-host `dist` map + an optional `source` fallback.
@@ -135,17 +152,30 @@ impl SdkIndex {
     }
 
     /// Phase 191.4 — every `[board.*].packages` name must be a defined
-    /// `[tool]`/`[source]`/`[gated]` package. Catches typos/renames that would
-    /// otherwise silently skip (a board's tool would just not install).
+    /// `[tool]`/`[source]`/`[gated]` package. Phase 191.6.a extends this to
+    /// `[rmw.*].packages`. Catches typos/renames that would otherwise silently
+    /// skip (a board's/RMW's tool would just not install).
     pub fn validate(&self) -> Result<()> {
+        let known = |pkg: &str| {
+            self.tool.contains_key(pkg)
+                || self.source.contains_key(pkg)
+                || self.gated.contains_key(pkg)
+        };
         for (board, entry) in &self.board {
             for pkg in &entry.packages {
-                let known = self.tool.contains_key(pkg)
-                    || self.source.contains_key(pkg)
-                    || self.gated.contains_key(pkg);
-                if !known {
+                if !known(pkg) {
                     bail!(
                         "board '{board}' references undefined package '{pkg}' \
+                         (not a [tool]/[source]/[gated] entry)"
+                    );
+                }
+            }
+        }
+        for (rmw, entry) in &self.rmw {
+            for pkg in &entry.packages {
+                if !known(pkg) {
+                    bail!(
+                        "rmw '{rmw}' references undefined package '{pkg}' \
                          (not a [tool]/[source]/[gated] entry)"
                     );
                 }

@@ -46,6 +46,12 @@ pub struct Args {
     #[arg(long, default_value = "nros-sdk-index.toml")]
     pub index: PathBuf,
 
+    /// RMW backend whose host daemon/tool to also provision — orthogonal to the
+    /// board (Phase 191.6.a): `zenoh` | `xrce` | `cyclonedds`. Defaults to
+    /// `zenoh`. Resolves `board.packages ∪ rmw.packages`.
+    #[arg(long)]
+    pub rmw: Option<String>,
+
     /// Resolve + print the plan without fetching/building anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -75,8 +81,12 @@ pub fn run(args: Args) -> Result<()> {
         }
     };
 
-    let packages = resolve_packages(&index, board)?;
-    eprintln!("nros setup: {board} needs {} package(s):", packages.len());
+    let packages = resolve_packages_with_rmw(&index, board, args.rmw.as_deref())?;
+    eprintln!(
+        "nros setup: {board} (rmw {}) needs {} package(s):",
+        args.rmw.as_deref().unwrap_or("zenoh"),
+        packages.len()
+    );
 
     let root = store_root();
     let lock_path = PathBuf::from(LOCK_FILE);
@@ -211,7 +221,10 @@ pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf
 
     // Unknown board ⇒ no known package set — warn + skip (lazy auto-setup is
     // best-effort; the user provides tools). `nros setup` errors instead.
-    let packages = match resolve_packages(&index, board) {
+    // Auto-setup defaults to the zenoh RMW host set (rmw=None). `nros build` /
+    // `deploy` can later pass the app's configured RMW; until then the default
+    // keeps the historical behaviour (e.g. native pulls `zenohd`).
+    let packages = match resolve_packages_with_rmw(&index, board, None) {
         Ok(p) => p,
         Err(_) => {
             eprintln!(
@@ -331,6 +344,43 @@ pub fn resolve_packages<'i>(index: &'i SdkIndex, board: &str) -> Result<Vec<&'i 
     }
 }
 
+/// Resolve `board.packages ∪ rmw.packages` (Phase 191.6.a). RMW is an axis
+/// orthogonal to the board: the board contributes its platform/toolchain
+/// packages, the chosen RMW its host daemon/tool (`zenohd` / `xrce-agent` /
+/// `cyclonedds`) — no `board×rmw` pair enumeration. `rmw=None` defaults to
+/// `zenoh`. A legacy index with no `[rmw.*]` table returns the board set
+/// unchanged; an unknown RMW name errors (listing the known ones).
+pub fn resolve_packages_with_rmw<'i>(
+    index: &'i SdkIndex,
+    board: &str,
+    rmw: Option<&str>,
+) -> Result<Vec<&'i str>> {
+    let mut packages = resolve_packages(index, board)?;
+    if index.rmw.is_empty() {
+        return Ok(packages); // legacy index without the RMW axis
+    }
+    let rmw = rmw.unwrap_or("zenoh");
+    match index.rmw.get(rmw) {
+        Some(entry) => {
+            for pkg in &entry.packages {
+                let p = pkg.as_str();
+                if !packages.contains(&p) {
+                    packages.push(p);
+                }
+            }
+        }
+        None => {
+            let mut known: Vec<&str> = index.rmw.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            bail!(
+                "nros setup: unknown rmw '{rmw}'. Known RMWs: {}.",
+                known.join(", ")
+            );
+        }
+    }
+    Ok(packages)
+}
+
 /// How `name` would be provisioned on `host`, per the index.
 fn disposition(index: &SdkIndex, name: &str, host: &str) -> String {
     if let Some(tool) = index.tool.get(name) {
@@ -431,6 +481,36 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown board") && err.contains("native"));
+    }
+
+    #[test]
+    fn resolve_with_rmw_unions_board_and_rmw_packages() {
+        let idx = SdkIndex::parse(
+            "[tool.zenohd]\nversion=\"1\"\n[tool.xrce-agent]\nversion=\"1\"\n\
+             [rmw.zenoh]\npackages=[\"zenohd\"]\n[rmw.xrce]\npackages=[\"xrce-agent\"]\n\
+             [board.native]\npackages=[]\n[board.qemu-arm-freertos]\npackages=[\"qemu\"]\n",
+        )
+        .unwrap();
+        // Default RMW is zenoh.
+        assert_eq!(
+            resolve_packages_with_rmw(&idx, "native", None).unwrap(),
+            vec!["zenohd"]
+        );
+        // Explicit RMW swaps the daemon, board contributes the rest.
+        assert_eq!(
+            resolve_packages_with_rmw(&idx, "native", Some("xrce")).unwrap(),
+            vec!["xrce-agent"]
+        );
+        let fr = resolve_packages_with_rmw(&idx, "qemu-arm-freertos", Some("xrce")).unwrap();
+        assert!(fr.contains(&"qemu") && fr.contains(&"xrce-agent"));
+        // Unknown RMW errors (lists known).
+        assert!(resolve_packages_with_rmw(&idx, "native", Some("nope")).is_err());
+        // Legacy index without an [rmw.*] table → board set unchanged.
+        let legacy = SdkIndex::parse("[board.native]\npackages=[\"zenohd\"]\n").unwrap();
+        assert_eq!(
+            resolve_packages_with_rmw(&legacy, "native", None).unwrap(),
+            vec!["zenohd"]
+        );
     }
 
     #[test]
