@@ -1,8 +1,8 @@
 //! Phase 187.1 — the SDK package index that `nros setup` reads.
 //!
 //! `nros-sdk-index.toml` is the versioned manifest of host toolchains/tools.
-//! Each `[tool.*]` carries a per-host prebuilt `dist` (GitHub Release asset URL
-//! + sha256) **and** a `[tool.*.source]` recipe used when no `dist` matches the
+//! Each `[tool.*]` carries a per-host prebuilt `dist` (GitHub Release asset URL,
+//! sha256) **and** a `[tool.*.source]` recipe used when no `dist` matches the
 //! host — both install into the same `$NROS_HOME/sdk/<tool>/<version>/` prefix.
 //! `[source.*]` packages build with the app (target-compiled, never prebuilt);
 //! `[gated.*]` are license-gated (never fetched/built — instruct + env check).
@@ -13,7 +13,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
 /// The whole `nros-sdk-index.toml`.
@@ -117,16 +117,41 @@ pub struct GatedPackage {
 }
 
 impl SdkIndex {
-    /// Read + parse an `nros-sdk-index.toml`.
+    /// Read, parse, + validate an `nros-sdk-index.toml`.
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .wrap_err_with(|| format!("failed to read SDK index {}", path.display()))?;
-        Self::parse(&raw).wrap_err_with(|| format!("invalid SDK index {}", path.display()))
+        let idx =
+            Self::parse(&raw).wrap_err_with(|| format!("invalid SDK index {}", path.display()))?;
+        idx.validate()
+            .wrap_err_with(|| format!("invalid SDK index {}", path.display()))?;
+        Ok(idx)
     }
 
-    /// Parse from a string.
+    /// Parse from a string (schema only — no cross-reference validation, so unit
+    /// tests can parse partial fixtures). [`load`] additionally [`validate`]s.
     pub fn parse(raw: &str) -> Result<Self> {
         toml::from_str(raw).wrap_err("invalid nros-sdk-index.toml schema")
+    }
+
+    /// Phase 191.4 — every `[board.*].packages` name must be a defined
+    /// `[tool]`/`[source]`/`[gated]` package. Catches typos/renames that would
+    /// otherwise silently skip (a board's tool would just not install).
+    pub fn validate(&self) -> Result<()> {
+        for (board, entry) in &self.board {
+            for pkg in &entry.packages {
+                let known = self.tool.contains_key(pkg)
+                    || self.source.contains_key(pkg)
+                    || self.gated.contains_key(pkg);
+                if !known {
+                    bail!(
+                        "board '{board}' references undefined package '{pkg}' \
+                         (not a [tool]/[source]/[gated] entry)"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -214,6 +239,31 @@ installer = "nvidia-sdk-manager"
     fn unknown_field_is_rejected() {
         let bad = "[tool.qemu]\nversion = \"1\"\nbogus = true\n";
         assert!(SdkIndex::parse(bad).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_board_referencing_undefined_package() {
+        // qemu defined; board references it (ok) + a typo'd one (rejected).
+        let ok = SdkIndex::parse(
+            "[tool.qemu]\nversion=\"1\"\n[board.x]\npackages=[\"qemu\"]\n",
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+
+        let bad = SdkIndex::parse(
+            "[tool.qemu]\nversion=\"1\"\n[board.x]\npackages=[\"qemoo\"]\n",
+        )
+        .unwrap();
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("undefined package 'qemoo'"), "{err}");
+
+        // source + gated names are valid package targets too.
+        let src_gated = SdkIndex::parse(
+            "[source.lwip]\nversion=\"1\"\n[gated.fvp]\nversion=\"1\"\nenv=\"E\"\n\
+             [board.b]\npackages=[\"lwip\",\"fvp\"]\n",
+        )
+        .unwrap();
+        assert!(src_gated.validate().is_ok());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use eyre::{Result, WrapErr, bail};
 
 use crate::orchestration::{
     sdk_index::{SdkIndex, host_key},
-    sdk_store::{InstallAction, SdkLock, execute, plan_install, store_root, tool_prefix},
+    sdk_store::{InstallAction, LOCK_FILE, SdkLock, execute, plan_install, store_root, tool_prefix},
 };
 
 #[derive(Debug, ClapArgs)]
@@ -77,7 +77,7 @@ pub fn run(args: Args) -> Result<()> {
     eprintln!("nros setup: {board} needs {} package(s):", packages.len());
 
     let root = store_root();
-    let lock_path = PathBuf::from("nros-sdk.lock");
+    let lock_path = PathBuf::from(LOCK_FILE);
     let mut lock = SdkLock::load(&lock_path)?;
     let mut installed = false;
 
@@ -170,7 +170,7 @@ fn install_single_tool(
                 .wrap_err_with(|| format!("install {name} {}", tool.version))?;
             // Only the shared store is tracked by the lock; --prefix is local.
             if prefix_override.is_none() {
-                let lock_path = PathBuf::from("nros-sdk.lock");
+                let lock_path = PathBuf::from(LOCK_FILE);
                 let mut lock = SdkLock::load(&lock_path)?;
                 lock.record(name, &prov);
                 lock.save(&lock_path)?;
@@ -202,7 +202,7 @@ pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf
     let index = SdkIndex::load(&index_path)?;
     let host = host_key();
     let root = store_root();
-    let lock_path = PathBuf::from("nros-sdk.lock");
+    let lock_path = PathBuf::from(LOCK_FILE);
     let mut lock = SdkLock::load(&lock_path)?;
     let mut installed = false;
     let mut bin_dirs = Vec::new();

@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use super::sdk_index::ToolPackage;
 
+/// The lockfile name (written in cwd by `nros setup` / auto-setup — pins the
+/// installed toolset for the workspace it's run in). Single source for the name.
+pub const LOCK_FILE: &str = "nros-sdk.lock";
+
 /// The shared SDK store root: `$NROS_HOME/sdk`, else `~/.nros/sdk`, else
 /// `./.nros/sdk`.
 pub fn store_root() -> PathBuf {
