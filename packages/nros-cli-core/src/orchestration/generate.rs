@@ -1562,6 +1562,18 @@ fn generated_default_features(
 }
 
 fn uses_std(build: &PlanBuildOptions) -> bool {
+    // Zephyr (zephyr-lang-rust) is no_std + alloc even on `native_sim`, whose
+    // Cargo target triple is a host (`x86_64-*-linux`). Without this guard the
+    // triple heuristic below wrongly enables `std`, and the generated entry
+    // crate fails to build against the no_std Zephyr target (`can't find crate
+    // for std`). Other RTOS sims (e.g. ThreadX-on-Linux) are genuinely
+    // Linux-hosted processes and keep the triple-driven `std`.
+    if matches!(
+        profile(&build.board, &build.target).map(|p| p.entry_kind),
+        Some(EntryKind::ZephyrStaticlib)
+    ) {
+        return false;
+    }
     matches!(build.board.as_str(), "native" | "posix")
         || build.target.contains("linux")
         || build.target.contains("darwin")

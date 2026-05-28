@@ -23,17 +23,21 @@ target = "x86_64-unknown-linux-gnu"
 # owns the build. nano-ros emits the *source* form — for Zephyr the generated
 # entry crate IS a west-buildable app (a `rustapp` staticlib + Zephyr
 # CMakeLists calling `rust_cargo_application()` + prj.conf), so the build[]
-# step just points `west` at `{entry_src}`. native_sim is the net-capable sim
-# (matches examples/zephyr/rust/talker); the target triple is the host arch
-# native_sim compiles to.
+# step just points `west` at `{entry_src}`.
+#
+# `board` here is the nano-ros *platform* ("zephyr") that drives codegen
+# (profile → ZephyrStaticlib); the Zephyr *board* (native_sim/native/64, the
+# net-capable sim matching examples/zephyr/rust/talker) is a west `-b` arg,
+# literal in build[]. (The single `board` field can't carry both — a separate
+# platform/vendor-board split is a schema follow-up.)
 [deploy.zephyr-mod]
 kind = "vendor-module"
-board = "native_sim/native/64"
+board = "zephyr"
 target = "x86_64-unknown-linux-gnu"
 self = "deploy/zephyr-mod"   # vendor glue: west manifest import + overlays
 # emit defaults to "source" for vendor-module.
 build = [
-  "west build -b {board} -d build/zephyr-mod {entry_src}",
+  "west build -b native_sim/native/64 -d build/zephyr-mod {entry_src}",
 ]
 package = [
   "echo zephyr-mod image: build/zephyr-mod/zephyr/zephyr.exe",

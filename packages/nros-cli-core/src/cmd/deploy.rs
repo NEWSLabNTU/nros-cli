@@ -62,6 +62,12 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let config_path = resolve_deploy_config(&args.config)?;
+    // Absolutize so the workspace root (and the component path-deps the
+    // generator renders against it) is independent of the cwd a relative
+    // `--config nros.toml` was run from — otherwise an out-of-tree vendor
+    // build (e.g. Zephyr `west`, which compiles from its own build dir)
+    // can't resolve a `./src/<pkg>` relative dep.
+    let config_path = config_path.canonicalize().unwrap_or(config_path);
     let cfg = WorkspaceConfig::load(&config_path)?;
     let root = config_path
         .parent()
