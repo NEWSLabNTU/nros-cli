@@ -22,8 +22,8 @@ use crate::{
         self,
         generate::{GenerateOptions, generate_package},
         root_config::{
-            DeployTarget, DomainGroup, EmitForm, ManifestKind, SystemSection, WorkspaceConfig,
-            probe_manifest_kind, resolve_workspace_root,
+            BridgeSpec, DeployTarget, DomainGroup, EmitForm, ManifestKind, SystemSection,
+            WorkspaceConfig, probe_manifest_kind, resolve_workspace_root,
         },
     },
 };
@@ -323,6 +323,10 @@ fn emit_entry_lib(
     // `[system].[[domain]]` group, so the generator opens a session per domain
     // and routes each node to its own (in-binary multi-domain).
     apply_domain_groups(&plan_path, &sys.domain)?;
+    // Phase 172 — carry the root `[system].[[bridge]]` gateways into the plan;
+    // the generator resolves each forwarded topic's type from the plan's
+    // interfaces and emits the raw sub→pub forwarding.
+    apply_bridges(&plan_path, &sys.bridge)?;
     let emit = deploy.emit.unwrap_or_else(|| deploy.kind.default_emit());
     match emit {
         EmitForm::Source => {
@@ -432,6 +436,43 @@ fn node_in_group(node: &orchestration::plan::PlanNode, group: &DomainGroup) -> b
     let resolved = node.resolved_name.as_str();
     let short = resolved.rsplit('/').next().unwrap_or(resolved);
     group.nodes.iter().any(|n| n == resolved || n == short)
+}
+
+/// Phase 172 — copy the root `[system].[[bridge]]` gateways into the plan
+/// (`plan.bridges`). The generator resolves each forwarded topic's type from
+/// the plan's `interfaces` and emits the raw sub→pub forwarding across the
+/// connected sessions. No bridges ⇒ no-op.
+fn apply_bridges(plan_path: &Path, bridges: &[BridgeSpec]) -> Result<()> {
+    if bridges.is_empty() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(plan_path)
+        .wrap_err_with(|| format!("read plan {}", plan_path.display()))?;
+    let mut plan: orchestration::plan::NrosPlan =
+        serde_json::from_str(&raw).wrap_err("parse plan for bridge wiring")?;
+    plan.bridges = bridges.iter().map(plan_bridge).collect();
+    let pretty = serde_json::to_string_pretty(&plan).wrap_err("serialize bridge plan")?;
+    std::fs::write(plan_path, pretty)
+        .wrap_err_with(|| format!("write plan {}", plan_path.display()))?;
+    Ok(())
+}
+
+/// Map a root `[[bridge]]` to its plan form (the generator resolves topic types
+/// from the plan's interfaces + emits the forwarding).
+fn plan_bridge(spec: &BridgeSpec) -> orchestration::plan::PlanBridge {
+    orchestration::plan::PlanBridge {
+        name: spec.name.clone(),
+        connect: spec
+            .connect
+            .iter()
+            .map(|e| orchestration::plan::PlanBridgeEndpoint {
+                rmw: e.rmw.clone(),
+                domain: e.domain,
+                locator: e.locator.clone(),
+            })
+            .collect(),
+        topics: spec.topics.clone(),
+    }
 }
 
 type Vars = BTreeMap<&'static str, String>;
@@ -732,5 +773,33 @@ build = ["west build -b {board} -d build/mcu {self}"]
         assert!(node_in_group(&node, &group(&["/talker"])), "resolved name");
         assert!(node_in_group(&node, &group(&["talker"])), "short name");
         assert!(!node_in_group(&node, &group(&["/listener"])), "no match");
+    }
+
+    #[test]
+    fn plan_bridge_preserves_name_endpoints_and_topics() {
+        use crate::orchestration::root_config::BridgeEndpoint;
+        let spec = BridgeSpec {
+            name: "gw".to_string(),
+            connect: vec![
+                BridgeEndpoint {
+                    rmw: "zenoh".to_string(),
+                    domain: 0,
+                    locator: Some("tcp/127.0.0.1:7447".to_string()),
+                },
+                BridgeEndpoint {
+                    rmw: "xrce".to_string(),
+                    domain: 0,
+                    locator: None,
+                },
+            ],
+            topics: vec!["/chatter".to_string()],
+        };
+        let pb = plan_bridge(&spec);
+        assert_eq!(pb.name, "gw");
+        assert_eq!(pb.connect.len(), 2);
+        assert_eq!(pb.connect[0].rmw, "zenoh");
+        assert_eq!(pb.connect[0].locator.as_deref(), Some("tcp/127.0.0.1:7447"));
+        assert_eq!(pb.connect[1].rmw, "xrce");
+        assert_eq!(pb.topics, vec!["/chatter".to_string()]);
     }
 }

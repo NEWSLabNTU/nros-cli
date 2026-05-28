@@ -42,7 +42,36 @@ pub struct NrosPlan {
     /// Omitted from output when absent so plans stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub param_persistence: Option<PlanParamPersistence>,
+    /// Phase 172 — in-binary bridges: gateways that forward declared topics
+    /// between the sessions in each bridge's `connect` list. The generator
+    /// resolves each topic's type from `interfaces` and emits raw sub→pub
+    /// forwarding across the sessions. Additive; absent ⇒ no bridges. Omitted
+    /// from output when empty so non-bridge plans stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bridges: Vec<PlanBridge>,
     pub build: PlanBuildOptions,
+}
+
+/// Phase 172 — a topic-forwarding gateway: relay the `topics` (raw CDR) between
+/// the sessions named in `connect` (≥2). Mirrors the root `[[bridge]]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanBridge {
+    pub name: String,
+    pub connect: Vec<PlanBridgeEndpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+}
+
+/// One session a bridge connects (`rmw` + ROS `domain` + optional `locator`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanBridgeEndpoint {
+    pub rmw: String,
+    #[serde(default)]
+    pub domain: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
 }
 
 /// Phase 172.H — where the generated runtime persists parameter overrides set
