@@ -28,8 +28,11 @@ jobs:
         with:
           components: clippy
 
+      # Pin the rustfmt nightly — rustfmt's nightly-only options aren't stable
+      # across nightlies, so bleeding-edge `@nightly` drifts vs the formatted
+      # code. Bump in lockstep when reformatting.
       - name: Install nightly toolchain (rustfmt)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@nightly-2026-04-19
         with:
           components: rustfmt
 
@@ -40,7 +43,7 @@ jobs:
       # rustfmt.toml enables nightly-only options (imports_granularity,
       # format_code_in_doc_comments) — must check with nightly rustfmt.
       - name: cargo +nightly fmt --check
-        run: cargo +nightly fmt --all -- --check
+        run: cargo +nightly-2026-04-19 fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
