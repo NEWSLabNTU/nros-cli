@@ -188,34 +188,37 @@ fn collect_field_type_intra_pkg_includes(
     }
 }
 
+/// Inputs for [`render_ffi_rs`]: the names of the generated FFI
+/// functions plus the message's fields and sequence-struct defs.
+struct FfiRenderSpec<'a> {
+    package_name: &'a str,
+    message_name: &'a str,
+    struct_name: &'a str,
+    ffi_publish_fn: &'a str,
+    ffi_serialize_fn: &'a str,
+    ffi_deserialize_fn: &'a str,
+    serialize_fn: &'a str,
+    deserialize_fn: &'a str,
+    ffi_fields: &'a [CppFfiField],
+    seq_structs: &'a [SequenceStructDef],
+}
+
 /// Generate a Rust FFI glue module for a message-like struct
-#[allow(clippy::too_many_arguments)]
-fn render_ffi_rs(
-    package_name: &str,
-    message_name: &str,
-    struct_name: &str,
-    ffi_publish_fn: &str,
-    ffi_serialize_fn: &str,
-    ffi_deserialize_fn: &str,
-    serialize_fn: &str,
-    deserialize_fn: &str,
-    ffi_fields: &[CppFfiField],
-    seq_structs: &[SequenceStructDef],
-) -> Result<String, GeneratorError> {
-    let has_fields = !ffi_fields.is_empty();
-    let serialized_size_max = compute_serialized_size_max(ffi_fields);
+fn render_ffi_rs(spec: FfiRenderSpec<'_>) -> Result<String, GeneratorError> {
+    let has_fields = !spec.ffi_fields.is_empty();
+    let serialized_size_max = compute_serialized_size_max(spec.ffi_fields);
 
     let template = MessageCppFfiTemplate {
-        package_name,
-        message_name,
-        repr_c_struct_name: struct_name.to_string(),
-        ffi_publish_fn: ffi_publish_fn.to_string(),
-        ffi_serialize_fn: ffi_serialize_fn.to_string(),
-        ffi_deserialize_fn: ffi_deserialize_fn.to_string(),
-        serialize_fn: serialize_fn.to_string(),
-        deserialize_fn: deserialize_fn.to_string(),
-        fields: ffi_fields.to_vec(),
-        sequence_structs: seq_structs.to_vec(),
+        package_name: spec.package_name,
+        message_name: spec.message_name,
+        repr_c_struct_name: spec.struct_name.to_string(),
+        ffi_publish_fn: spec.ffi_publish_fn.to_string(),
+        ffi_serialize_fn: spec.ffi_serialize_fn.to_string(),
+        ffi_deserialize_fn: spec.ffi_deserialize_fn.to_string(),
+        serialize_fn: spec.serialize_fn.to_string(),
+        deserialize_fn: spec.deserialize_fn.to_string(),
+        fields: spec.ffi_fields.to_vec(),
+        sequence_structs: spec.seq_structs.to_vec(),
         has_fields,
         serialized_size_max,
     };
@@ -275,18 +278,18 @@ pub fn generate_cpp_message_package(
     let header = header_template.render()?;
 
     // Render Rust FFI glue
-    let ffi_rs = render_ffi_rs(
+    let ffi_rs = render_ffi_rs(FfiRenderSpec {
         package_name,
         message_name,
-        &struct_name,
-        &ffi_publish_fn,
-        &ffi_serialize_fn,
-        &ffi_deserialize_fn,
-        &serialize_fn,
-        &deserialize_fn,
-        &ffi_fields,
-        &seq_structs,
-    )?;
+        struct_name: &struct_name,
+        ffi_publish_fn: &ffi_publish_fn,
+        ffi_serialize_fn: &ffi_serialize_fn,
+        ffi_deserialize_fn: &ffi_deserialize_fn,
+        serialize_fn: &serialize_fn,
+        deserialize_fn: &deserialize_fn,
+        ffi_fields: &ffi_fields,
+        seq_structs: &seq_structs,
+    })?;
 
     Ok(GeneratedCppPackage {
         header,
@@ -405,31 +408,31 @@ pub fn generate_cpp_service_package(
     let header = header_template.render()?;
 
     // Render FFI glue for request and response
-    let request_ffi_rs = render_ffi_rs(
+    let request_ffi_rs = render_ffi_rs(FfiRenderSpec {
         package_name,
-        &format!("{}Request", service_name),
-        &req_struct,
-        &req_publish_fn,
-        &req_serialize_fn,
-        &req_deser_fn,
-        &req_ser_fn,
-        &req_deser_fn_inner,
-        &req_ffi_fields,
-        &req_seq_structs,
-    )?;
+        message_name: &format!("{}Request", service_name),
+        struct_name: &req_struct,
+        ffi_publish_fn: &req_publish_fn,
+        ffi_serialize_fn: &req_serialize_fn,
+        ffi_deserialize_fn: &req_deser_fn,
+        serialize_fn: &req_ser_fn,
+        deserialize_fn: &req_deser_fn_inner,
+        ffi_fields: &req_ffi_fields,
+        seq_structs: &req_seq_structs,
+    })?;
 
-    let response_ffi_rs = render_ffi_rs(
+    let response_ffi_rs = render_ffi_rs(FfiRenderSpec {
         package_name,
-        &format!("{}Response", service_name),
-        &resp_struct,
-        &resp_publish_fn,
-        &resp_serialize_fn,
-        &resp_deser_fn,
-        &resp_ser_fn,
-        &resp_deser_fn_inner,
-        &resp_ffi_fields,
-        &resp_seq_structs,
-    )?;
+        message_name: &format!("{}Response", service_name),
+        struct_name: &resp_struct,
+        ffi_publish_fn: &resp_publish_fn,
+        ffi_serialize_fn: &resp_serialize_fn,
+        ffi_deserialize_fn: &resp_deser_fn,
+        serialize_fn: &resp_ser_fn,
+        deserialize_fn: &resp_deser_fn_inner,
+        ffi_fields: &resp_ffi_fields,
+        seq_structs: &resp_seq_structs,
+    })?;
 
     Ok(GeneratedCppServicePackage {
         header,
@@ -577,44 +580,44 @@ pub fn generate_cpp_action_package(
     let header = header_template.render()?;
 
     // Render FFI glue for each part
-    let goal_ffi_rs = render_ffi_rs(
+    let goal_ffi_rs = render_ffi_rs(FfiRenderSpec {
         package_name,
-        &format!("{}Goal", action_name),
-        &goal.struct_name,
-        &goal.publish_fn,
-        &goal.serialize_fn,
-        &goal.deser_fn,
-        &goal.ser_fn,
-        &goal.deser_fn_inner,
-        &goal.ffi_fields,
-        &goal.seq_structs,
-    )?;
+        message_name: &format!("{}Goal", action_name),
+        struct_name: &goal.struct_name,
+        ffi_publish_fn: &goal.publish_fn,
+        ffi_serialize_fn: &goal.serialize_fn,
+        ffi_deserialize_fn: &goal.deser_fn,
+        serialize_fn: &goal.ser_fn,
+        deserialize_fn: &goal.deser_fn_inner,
+        ffi_fields: &goal.ffi_fields,
+        seq_structs: &goal.seq_structs,
+    })?;
 
-    let result_ffi_rs = render_ffi_rs(
+    let result_ffi_rs = render_ffi_rs(FfiRenderSpec {
         package_name,
-        &format!("{}Result", action_name),
-        &result.struct_name,
-        &result.publish_fn,
-        &result.serialize_fn,
-        &result.deser_fn,
-        &result.ser_fn,
-        &result.deser_fn_inner,
-        &result.ffi_fields,
-        &result.seq_structs,
-    )?;
+        message_name: &format!("{}Result", action_name),
+        struct_name: &result.struct_name,
+        ffi_publish_fn: &result.publish_fn,
+        ffi_serialize_fn: &result.serialize_fn,
+        ffi_deserialize_fn: &result.deser_fn,
+        serialize_fn: &result.ser_fn,
+        deserialize_fn: &result.deser_fn_inner,
+        ffi_fields: &result.ffi_fields,
+        seq_structs: &result.seq_structs,
+    })?;
 
-    let feedback_ffi_rs = render_ffi_rs(
+    let feedback_ffi_rs = render_ffi_rs(FfiRenderSpec {
         package_name,
-        &format!("{}Feedback", action_name),
-        &feedback.struct_name,
-        &feedback.publish_fn,
-        &feedback.serialize_fn,
-        &feedback.deser_fn,
-        &feedback.ser_fn,
-        &feedback.deser_fn_inner,
-        &feedback.ffi_fields,
-        &feedback.seq_structs,
-    )?;
+        message_name: &format!("{}Feedback", action_name),
+        struct_name: &feedback.struct_name,
+        ffi_publish_fn: &feedback.publish_fn,
+        ffi_serialize_fn: &feedback.serialize_fn,
+        ffi_deserialize_fn: &feedback.deser_fn,
+        serialize_fn: &feedback.ser_fn,
+        deserialize_fn: &feedback.deser_fn_inner,
+        ffi_fields: &feedback.ffi_fields,
+        seq_structs: &feedback.seq_structs,
+    })?;
 
     Ok(GeneratedCppActionPackage {
         header,

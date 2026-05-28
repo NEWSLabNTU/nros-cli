@@ -429,7 +429,11 @@ fn generated_package_registers_service_and_action_callbacks() {
     assert!(build_rs.contains("noop_raw_cancel"));
     assert!(build_rs.contains("noop_raw_accepted"));
     assert!(build_rs.contains("register_service_raw_sized_on::<1024, 1024>"));
-    assert!(build_rs.contains("register_action_server_raw_sized_on::<1024, 1024, 1024, 4>"));
+    assert!(build_rs.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>"));
+    assert!(build_rs.contains(
+        "nros::RawActionServerSpec { node_id: Some(node_handle_1)"
+    ));
+    assert!(build_rs.contains("qos: nros::QosSettings::services_default()"));
     assert!(build_rs.contains("action_1.handle_id()"));
     assert!(!build_rs.contains("unsupported generated callback"));
 }

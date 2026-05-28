@@ -1452,20 +1452,24 @@ fn build_instances(
         let remaps = pairs_field(node, "remaps");
         let param_files = string_list_field(node, "params_files");
         instances.push(build_node_instance(
-            package,
-            executable,
-            string_field(node, &["name"]),
-            string_field(node, &["namespace"]),
-            &params,
-            &param_files,
-            &remaps,
-            "node",
-            metadata,
-            workspace,
-            overlays,
-            record_path,
-            &mut counts,
-            &mut diagnostics,
+            NodeInstanceSpec {
+                package,
+                executable,
+                name: string_field(node, &["name"]),
+                namespace: string_field(node, &["namespace"]),
+                params: &params,
+                param_files: &param_files,
+                remaps: &remaps,
+                launch_kind: "node",
+            },
+            &mut PlanCtx {
+                metadata,
+                workspace,
+                overlays,
+                record_path,
+                counts: &mut counts,
+                diagnostics: &mut diagnostics,
+            },
         ));
     }
 
@@ -1476,44 +1480,71 @@ fn build_instances(
         let params = pairs_field(load_node, "params");
         let remaps = pairs_field(load_node, "remaps");
         instances.push(build_node_instance(
-            package,
-            executable,
-            string_field(load_node, &["node_name"]),
-            string_field(load_node, &["namespace"]),
-            &params,
-            &[],
-            &remaps,
-            "load_node",
-            metadata,
-            workspace,
-            overlays,
-            record_path,
-            &mut counts,
-            &mut diagnostics,
+            NodeInstanceSpec {
+                package,
+                executable,
+                name: string_field(load_node, &["node_name"]),
+                namespace: string_field(load_node, &["namespace"]),
+                params: &params,
+                param_files: &[],
+                remaps: &remaps,
+                launch_kind: "load_node",
+            },
+            &mut PlanCtx {
+                metadata,
+                workspace,
+                overlays,
+                record_path,
+                counts: &mut counts,
+                diagnostics: &mut diagnostics,
+            },
         ));
     }
 
     (instances, diagnostics)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_node_instance(
-    package: &str,
-    executable: &str,
-    name: Option<&str>,
-    namespace: Option<&str>,
-    params: &[(String, String)],
-    param_files: &[String],
-    remaps: &[(String, String)],
-    launch_kind: &str,
-    metadata: &[JsonArtifact],
-    workspace: &Workspace,
-    overlays: &[Value],
-    record_path: &Path,
-    counts: &mut HashMap<(String, String), usize>,
-    diagnostics: &mut Vec<Value>,
-) -> Value {
-    let index = next_instance_index(counts, package, executable);
+/// Per-node inputs for [`build_node_instance`].
+struct NodeInstanceSpec<'a> {
+    package: &'a str,
+    executable: &'a str,
+    name: Option<&'a str>,
+    namespace: Option<&'a str>,
+    params: &'a [(String, String)],
+    param_files: &'a [String],
+    remaps: &'a [(String, String)],
+    launch_kind: &'a str,
+}
+
+/// Ambient state threaded through plan construction: read-only inputs
+/// plus the two accumulators ([`counts`](Self::counts) for per-package
+/// instance indices and [`diagnostics`](Self::diagnostics)).
+struct PlanCtx<'a> {
+    metadata: &'a [JsonArtifact],
+    workspace: &'a Workspace,
+    overlays: &'a [Value],
+    record_path: &'a Path,
+    counts: &'a mut HashMap<(String, String), usize>,
+    diagnostics: &'a mut Vec<Value>,
+}
+
+fn build_node_instance(spec: NodeInstanceSpec<'_>, ctx: &mut PlanCtx<'_>) -> Value {
+    let NodeInstanceSpec {
+        package,
+        executable,
+        name,
+        namespace,
+        params,
+        param_files,
+        remaps,
+        launch_kind,
+    } = spec;
+    let metadata = ctx.metadata;
+    let workspace = ctx.workspace;
+    let overlays = ctx.overlays;
+    let record_path = ctx.record_path;
+
+    let index = next_instance_index(ctx.counts, package, executable);
     let instance_id = format!(
         "{}.{}.{}",
         sanitize_id(package),
@@ -1524,7 +1555,7 @@ fn build_node_instance(
     let namespace = names::normalize_namespace(namespace);
     let source_metadata = find_source_metadata(metadata, package, executable);
     if source_metadata.is_none() {
-        diagnostics.push(diagnostic(
+        ctx.diagnostics.push(diagnostic(
             "error",
             "missing-source-metadata",
             format!("missing source metadata for {package}/{executable}"),
@@ -1576,7 +1607,7 @@ fn build_node_instance(
         .map(|artifact| source_callbacks(&artifact.value))
         .unwrap_or_default();
     if let Some(artifact) = source_metadata {
-        diagnostics.extend(check_source_metadata_links(
+        ctx.diagnostics.extend(check_source_metadata_links(
             &artifact.value,
             &artifact.path,
             package,
