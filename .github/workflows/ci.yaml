@@ -6,55 +6,37 @@ on:
     branches: ['main']
   pull_request:
 
+# Rust CI for the nros-cli workspace. (Phase 195.A: nros-cli dropped colcon
+# build support — the former Python/colcon `python-test` job + wheel workflows
+# were removed. The CLI is a pure-Rust tool now.)
 jobs:
-  # Rust CI
   rust-test:
     name: Rust Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive  # path deps live in third-party/* submodules
 
-      - name: Install Rust toolchain
+      - name: Install stable toolchain (clippy/test/build)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Install nightly toolchain (rustfmt)
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          components: rustfmt
 
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      # rustfmt.toml enables nightly-only options (imports_granularity,
+      # format_code_in_doc_comments) — must check with nightly rustfmt.
+      - name: cargo +nightly fmt --check
+        run: cargo +nightly fmt --all -- --check
 
-      - name: Run cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: Run cargo clippy
+      - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Run cargo test
+      - name: cargo test
         run: cargo test --workspace
-
-      - name: Run cargo build
-        run: cargo build --workspace --profile dev-release
-
-  # Python CI
-  python-test:
-    name: Python Tests
-    uses: colcon/ci/.github/workflows/pytest.yaml@main
-    with:
-      matrix-filter: del(.matrix.include[] | select(.os == "ubuntu-20.04"))
-      package-root: colcon-cargo-ros2
-    secrets:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

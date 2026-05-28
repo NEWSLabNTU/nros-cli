@@ -26,10 +26,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux built on ubuntu-22.04 (glibc 2.35) for a broad runtime floor —
+          # building on a newer runner pins a newer GLIBC ("GLIBC_2.xx not found"
+          # on older hosts). musl-static was ruled out: a transitive dep compiles
+          # C (cc-rs) and musl-tools doesn't ship the target-prefixed gcc.
           - host: linux-x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
           - host: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
           - host: macos-x86_64
             runner: macos-13
           - host: macos-arm64
@@ -41,7 +45,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build nros (release, libc-only)
+      - name: Build nros (release)
         run: cargo build --release --manifest-path packages/Cargo.toml -p nros-cli --bin nros
 
       - name: Package nros-${{ matrix.host }}.tar.zst
@@ -50,11 +54,11 @@ jobs:
           command -v zstd >/dev/null 2>&1 || {
             if [ "$RUNNER_OS" = "macOS" ]; then brew install zstd; else sudo apt-get update && sudo apt-get install -y zstd; fi
           }
-          bin=packages/target/release/nros
-          strip "$bin" || true
+          bindir="packages/target/release"
+          strip "$bindir/nros" || true
           mkdir -p dist
           asset="nros-${{ matrix.host }}.tar.zst"
-          tar -C packages/target/release -caf "dist/$asset" nros
+          tar -C "$bindir" -caf "dist/$asset" nros
           if command -v sha256sum >/dev/null 2>&1; then
             ( cd dist && sha256sum "$asset" > "$asset.sha256" )
           else
