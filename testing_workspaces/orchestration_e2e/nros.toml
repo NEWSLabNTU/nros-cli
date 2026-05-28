@@ -36,8 +36,11 @@ board = "zephyr"
 target = "x86_64-unknown-linux-gnu"
 self = "deploy/zephyr-mod"   # vendor glue: west manifest import + overlays
 # emit defaults to "source" for vendor-module.
+# The NSOS overlay (from {self}) makes native_sim use the host's BSD sockets
+# (no TAP/`zeth` bridge needed) — board-specific, so it rides EXTRA_CONF_FILE
+# rather than the board-agnostic generated prj.conf.
 build = [
-  "west build -b native_sim/native/64 -d build/zephyr-mod {entry_src}",
+  "west build -b native_sim/native/64 -d build/zephyr-mod {entry_src} -- -DEXTRA_CONF_FILE={self}/native-sim-nsos.conf",
 ]
 package = [
   "echo zephyr-mod image: build/zephyr-mod/zephyr/zephyr.exe",
