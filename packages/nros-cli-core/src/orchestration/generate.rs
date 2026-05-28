@@ -385,9 +385,10 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
     if emits_transport_config_override(plan) {
         reexports.push_str(", apply_transport_config");
     }
-    // Bridge mode: the open_multi path uses `build_executor_bridge` (no
-    // ExecutorConfig; sessions come from baked SESSION_SPECS).
-    if plan.build.is_bridge() {
+    // Multi-session (bridge or multi-domain): the open_multi path uses
+    // `build_executor_bridge` (no ExecutorConfig; sessions come from baked
+    // SESSION_SPECS).
+    if is_multi_session(plan) {
         reexports.push_str(", build_executor_bridge");
     }
     out.push_str(&format!("pub use nros_generated::{{{reexports}}};\n\n"));
@@ -474,9 +475,10 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
 /// `lib.rs`; the shim only exists so a `self` deploy produces a runnable binary.
 fn render_hosted_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String {
     let krate = crate_ident(&options.package_name);
-    // Bridge: the open_multi path opens sessions from baked SESSION_SPECS —
-    // no `ExecutorConfig`. Same cfg-gated spin as the non-bridge shim.
-    if plan.build.is_bridge() {
+    // Multi-session (bridge or multi-domain): the open_multi path opens
+    // sessions from baked SESSION_SPECS — no `ExecutorConfig`. Same cfg-gated
+    // spin as the single-session shim.
+    if is_multi_session(plan) {
         return format!(
             "//! Generated bridge `self` startup shim (Phase 172 entry-lib). The entry\n\
              //! lib's `build_executor_bridge` opens every SESSION_SPEC; we just\n\
@@ -569,7 +571,7 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
         .and_then(|p| p.board_entry)
         .expect("render_board_shim_main: board_entry present (gated by emits_entry_lib)");
     let apply_config = emits_transport_config_override(plan);
-    let bridge = plan.build.is_bridge();
+    let bridge = is_multi_session(plan);
     let cfg_expr = if apply_config {
         format!(
             "{{\n            let mut cfg = {b}::Config::default();\n\
@@ -2205,11 +2207,31 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
             None => "::core::option::Option::None".to_string(),
         }
     ));
-    // Phase 173.5 — bridge mode (≥2 transports): one SessionSpec per
-    // transport (its rmw + locator), consumed by `Executor::open_multi`.
-    // Emitted only when bridging — single-transport builds use
-    // `Executor::open` and never reference this.
-    if plan.build.is_bridge() {
+    // Multi-session builds bake a `SESSION_SPECS` table consumed by
+    // `Executor::open_multi`; single-session builds use `Executor::open` and
+    // never reference it. Two sources: bridge mode (≥2 transports — one spec
+    // per transport's rmw+locator+domain, Phase 173.5) and multi-domain mode
+    // (≥2 distinct node domains — one spec per domain, same rmw+locator,
+    // Phase 172.K.5).
+    if let Some(domains) = multi_domain_sessions(plan) {
+        let rmw = normalize_rmw(&plan.build.rmw).unwrap_or(plan.build.rmw.as_str());
+        let locator = plan
+            .build
+            .transports
+            .iter()
+            .find_map(|t| t.locator.as_deref())
+            .unwrap_or("");
+        out.push_str(&format!(
+            "pub static SESSION_SPECS: [nros::SessionSpec<'static>; {}] = [\n",
+            domains.len()
+        ));
+        for d in &domains {
+            out.push_str(&format!(
+                "    nros::SessionSpec::new({rmw:?}, {locator:?}).domain_id({d}),\n"
+            ));
+        }
+        out.push_str("];\n\n");
+    } else if plan.build.is_bridge() {
         out.push_str(&format!(
             "pub static SESSION_SPECS: [nros::SessionSpec<'static>; {}] = [\n",
             plan.build.transports.len()
@@ -2288,7 +2310,14 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     );
     out.push_str("        let namespace = planned.map(|node| node.namespace).unwrap_or(options.namespace);\n");
     out.push_str("        let domain_id = planned.and_then(|node| node.domain_id).unwrap_or(options.domain_id);\n");
-    out.push_str("        self.executor.node_builder(name).namespace(namespace).domain_id(domain_id).build().map_err(|_| nros::ComponentError::Runtime)\n");
+    if multi_domain_sessions(plan).is_some() {
+        // Phase 172.K.5 — route the node to the session opened for its domain
+        // (one SESSION_SPEC per distinct domain); fall back to the primary.
+        out.push_str("        let session_idx = SESSION_SPECS.iter().position(|s| s.domain_id == domain_id).unwrap_or(0) as u8;\n");
+        out.push_str("        self.executor.node_builder(name).namespace(namespace).session_idx(session_idx).build().map_err(|_| nros::ComponentError::Runtime)\n");
+    } else {
+        out.push_str("        self.executor.node_builder(name).namespace(namespace).domain_id(domain_id).build().map_err(|_| nros::ComponentError::Runtime)\n");
+    }
     out.push_str("    }\n");
     out.push_str("}\n\n");
     out.push_str("#[allow(dead_code)]\nunsafe extern \"C\" fn noop_raw_subscription(_data: *const u8, _len: usize, _context: *mut core::ffi::c_void) {}\n");
@@ -2354,7 +2383,9 @@ fn render_entry_lib_fns(out: &mut String, plan: &NrosPlan) {
     out.push_str("    register_backends();\n");
     out.push_str("    nros::Executor::open(config)\n");
     out.push_str("}\n");
-    if plan.build.is_bridge() {
+    // Emitted for any multi-session build — a bridge (≥2 transports) or
+    // multi-domain (≥2 distinct node domains, Phase 172.K.5).
+    if is_multi_session(plan) {
         out.push_str(
             "\npub fn build_executor_bridge() -> Result<nros::Executor, nros::NodeError> {\n",
         );
@@ -2619,6 +2650,31 @@ fn render_instances(out: &mut String, plan: &NrosPlan) {
     out.push_str("];\n\n");
 }
 
+/// Phase 172.K.5 — the distinct ROS domains the plan's nodes span (sorted),
+/// when there is more than one (so a session per domain is needed). `None` ⇒
+/// a single domain, or a bridge build (whose sessions come from transports
+/// instead). A node with no `domain_id` uses the default domain `0`.
+fn multi_domain_sessions(plan: &NrosPlan) -> Option<Vec<u32>> {
+    if plan.build.is_bridge() {
+        return None;
+    }
+    let mut domains: Vec<u32> = plan
+        .instances
+        .iter()
+        .flat_map(|instance| instance.nodes.iter())
+        .map(|node| node.domain_id.unwrap_or(0))
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    (domains.len() > 1).then_some(domains)
+}
+
+/// A build opens multiple RMW sessions (`SESSION_SPECS` + `open_multi`) when it
+/// bridges (≥2 transports) or spans ≥2 ROS domains (Phase 172.K.5).
+fn is_multi_session(plan: &NrosPlan) -> bool {
+    plan.build.is_bridge() || multi_domain_sessions(plan).is_some()
+}
+
 fn render_nodes(out: &mut String, plan: &NrosPlan) {
     let node_count = plan
         .instances
@@ -2645,8 +2701,15 @@ fn render_nodes(out: &mut String, plan: &NrosPlan) {
     for instance in &plan.instances {
         for node in &instance.nodes {
             let node_name = final_node_name(&node.resolved_name, &node.namespace);
+            // Phase 172.K.5 — carry the node's assigned domain (from a
+            // `[[domain]]` group); `build_component_node` maps it to the right
+            // `SESSION_SPECS` slot for multi-domain builds.
+            let domain_id = match node.domain_id {
+                Some(d) => format!("Some({d})"),
+                None => "None".to_string(),
+            };
             out.push_str(&format!(
-                "    NodeSpec {{ instance_id: {instance_id:?}, node_id: {node_id:?}, source_node: {source_node:?}, node_name: {node_name:?}, namespace: {namespace:?}, domain_id: None }},\n",
+                "    NodeSpec {{ instance_id: {instance_id:?}, node_id: {node_id:?}, source_node: {source_node:?}, node_name: {node_name:?}, namespace: {namespace:?}, domain_id: {domain_id} }},\n",
                 instance_id = instance.id,
                 node_id = node.id,
                 source_node = node.source_node,

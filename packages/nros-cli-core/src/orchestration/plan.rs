@@ -116,6 +116,13 @@ pub struct PlanNode {
     pub resolved_name: String,
     pub namespace: String,
     pub entities: Vec<PlanEntity>,
+    /// Phase 172.K.5 — ROS domain this node is bound to (from a root
+    /// `[system].[[domain]]` group). `None` ⇒ the system default domain. When
+    /// nodes span >1 distinct domain the generator opens a session per domain
+    /// (`SESSION_SPECS` + `open_multi`) and routes each node to its slot.
+    /// Additive + skip-when-absent so single-domain plans round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

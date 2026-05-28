@@ -4,7 +4,10 @@ use std::{
     process::Command,
 };
 
-use nros_cli_core::orchestration::generate::{GenerateOptions, generate_package};
+use nros_cli_core::orchestration::{
+    generate::{GenerateOptions, generate_package},
+    plan::NrosPlan,
+};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -299,6 +302,66 @@ fn bridge_two_transports_emit_open_multi_and_session_specs() {
         main_rs.contains("build_executor_bridge()?")
             && main_rs.contains("register_all(&mut executor)?"),
         "bridge shim routes through build_executor_bridge:\n{main_rs}"
+    );
+}
+
+#[test]
+fn multi_domain_nodes_emit_session_per_domain_and_route_by_session_idx() {
+    // Phase 172.K.5 — two nodes on distinct ROS domains put the (non-bridge)
+    // build in multi-domain mode: a SESSION_SPECS array with one spec per
+    // distinct domain (same rmw), open_multi via build_executor_bridge, NODES
+    // carry their domain, and build_component_node routes each node to the
+    // session whose domain matches.
+    let root = temp_output("multi_domain");
+    fs::create_dir_all(&root).expect("create temp plan dir");
+    let mut plan: NrosPlan = serde_json::from_str(include_str!(
+        "fixtures/orchestration/plan_multi_instance.json"
+    ))
+    .expect("parse multi-instance plan");
+    // Assign the two nodes to distinct domains (0 and 5).
+    let mut domain = [0u32, 5u32].into_iter();
+    for instance in &mut plan.instances {
+        for node in &mut instance.nodes {
+            node.domain_id = Some(domain.next().unwrap_or(5));
+        }
+    }
+    let plan_path = root.join("nros-plan.json");
+    fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap())
+        .expect("write multi-domain plan");
+
+    let output_dir = root.join("generated");
+    generate_plan("multi_domain", plan_path, output_dir.clone());
+
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+    // One SessionSpec per distinct domain (0 and 5), same rmw + locator.
+    assert!(
+        build_rs.contains("SESSION_SPECS"),
+        "session specs:\n{build_rs}"
+    );
+    assert!(
+        build_rs.contains(".domain_id(0)") && build_rs.contains(".domain_id(5)"),
+        "one spec per distinct domain:\n{build_rs}"
+    );
+    // NODES carry their assigned domain (not the old hardcoded None).
+    assert!(
+        build_rs.contains("domain_id: Some(0)") && build_rs.contains("domain_id: Some(5)"),
+        "nodes carry their domain:\n{build_rs}"
+    );
+    // build_component_node routes each node to the session matching its domain.
+    assert!(
+        build_rs.contains("SESSION_SPECS.iter().position(|s| s.domain_id == domain_id)")
+            && build_rs.contains(".session_idx(session_idx)"),
+        "per-node session routing:\n{build_rs}"
+    );
+    assert!(
+        build_rs.contains("Executor::open_multi(&SESSION_SPECS)"),
+        "build_executor_bridge opens via open_multi:\n{build_rs}"
+    );
+    // Hosted shim opens the multi-session executor.
+    let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
+    assert!(
+        main_rs.contains("build_executor_bridge()?"),
+        "multi-domain shim routes through build_executor_bridge:\n{main_rs}"
     );
 }
 
