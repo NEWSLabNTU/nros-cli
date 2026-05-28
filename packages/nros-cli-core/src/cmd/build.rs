@@ -110,7 +110,7 @@ pub fn run(args: Args) -> Result<()> {
     // Phase 187.6 (Method A): lazy-install host tools a native build needs
     // (zenohd for the host router), then put them on PATH for the spawned build;
     // no-op away from a nano-ros workspace / with NROS_NO_AUTO_SETUP.
-    let bins = crate::cmd::setup::ensure_tools("native", None, args.nano_ros_workspace.as_deref())?;
+    let bins = crate::cmd::setup::ensure_tools("native", args.nano_ros_workspace.as_deref())?;
     crate::cmd::setup::activate_store_path(&bins);
 
     let flavor = detect_flavor(&root)?;

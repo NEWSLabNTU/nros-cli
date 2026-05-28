@@ -187,7 +187,6 @@ fn deploy_target(
         // them on PATH for every child we spawn below (opt out: NROS_NO_AUTO_SETUP).
         let bins = crate::cmd::setup::ensure_tools(
             deploy.board.as_deref().unwrap_or("native"),
-            deploy.target.as_deref(),
             Some(nano_ros),
         )?;
         crate::cmd::setup::activate_store_path(&bins);

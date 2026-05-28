@@ -17,12 +17,9 @@ use crate::orchestration::{
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Board to set up (resolves its toolchain/SDK package set).
+    /// Board to set up (resolves its toolchain/SDK package set from the index
+    /// `[board.*]` table).
     pub board: Option<String>,
-
-    /// Resolve by target triple (with or instead of `<board>`).
-    #[arg(long)]
-    pub target: Option<String>,
 
     /// List every package in the index + its version.
     #[arg(long)]
@@ -72,19 +69,12 @@ pub fn run(args: Args) -> Result<()> {
     let board = match args.board.as_deref() {
         Some(b) => b,
         None => {
-            bail!("nros setup: give a <board> (or `--target <triple>`), `--list`, or `--licenses`")
+            bail!("nros setup: give a <board>, `--tool <name>`, `--list`, or `--licenses`")
         }
     };
 
-    let packages = resolve_packages(board, args.target.as_deref());
-    eprintln!(
-        "nros setup: {board}{} needs {} package(s):",
-        args.target
-            .as_deref()
-            .map(|t| format!(" ({t})"))
-            .unwrap_or_default(),
-        packages.len()
-    );
+    let packages = resolve_packages(&index, board)?;
+    eprintln!("nros setup: {board} needs {} package(s):", packages.len());
 
     let root = store_root();
     let lock_path = PathBuf::from("nros-sdk.lock");
@@ -202,11 +192,7 @@ fn install_single_tool(
 /// Returns the `bin/` dirs of the resolved tools present in the store — Method A
 /// callers ([`activate_store_path`]) prepend these to the env so every spawned
 /// child finds the toolchain, without any non-`nros` script resolving paths.
-pub fn ensure_tools(
-    board: &str,
-    target: Option<&str>,
-    workspace: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
+pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf>> {
     if std::env::var_os("NROS_NO_AUTO_SETUP").is_some() {
         return Ok(Vec::new());
     }
@@ -221,7 +207,19 @@ pub fn ensure_tools(
     let mut installed = false;
     let mut bin_dirs = Vec::new();
 
-    for name in resolve_packages(board, target) {
+    // Unknown board ⇒ no known package set — warn + skip (lazy auto-setup is
+    // best-effort; the user provides tools). `nros setup` errors instead.
+    let packages = match resolve_packages(&index, board) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "nros: board '{board}' not in the SDK index — skipping auto-setup \
+                 (provide its tools yourself, or add a [board.{board}] entry)"
+            );
+            return Ok(Vec::new());
+        }
+    };
+    for name in packages {
         let Some(tool) = index.tool.get(name) else {
             continue; // source / gated / not-in-index — not a store tool
         };
@@ -307,72 +305,28 @@ fn describe(action: &InstallAction, version: &str, host: &str) -> String {
     }
 }
 
-/// Resolve a board (+ optional target triple) to the SDK package names it needs.
-/// Heuristic on the target arch + board/platform keyword — the same knowledge
-/// `profile()` encodes for the build; package *fetch* dispositions come from the
-/// index (see [`disposition`]).
-pub fn resolve_packages(board: &str, target: Option<&str>) -> Vec<&'static str> {
-    let b = board.to_ascii_lowercase();
-    let t = target.unwrap_or("").to_ascii_lowercase();
-    let mut pkgs: Vec<&'static str> = Vec::new();
-
-    // ESP32 in nano-ros is ESP32-C3 (RISC-V), built with the rustup
-    // riscv32imc-unknown-none-elf target + build-std (rust-lld, no external gcc)
-    // and tested under Espressif's qemu-system-riscv32 fork — so it needs no
-    // index host-tool here (the Rust target comes from `just workspace
-    // rust-targets`; the esp qemu fork is not yet an index tool).
-    let is_esp32 = b.contains("esp32") || t.contains("xtensa");
-
-    // Cross-toolchain by target arch / board family.
-    if is_esp32 {
-        // no host-tool to fetch — see above.
-    } else if t.contains("thumb")
-        || (t.contains("arm") && !t.contains("linux"))
-        || b.contains("cortex-m")
-        || b.contains("cortex-r")
-        || b.contains("stm32")
-        || b.contains("mps2")
-        || b.contains("orin")
-    {
-        pkgs.push("arm-none-eabi-gcc");
-    } else if t.contains("riscv") || b.contains("riscv") {
-        pkgs.push("riscv-none-elf-gcc");
+/// Resolve a board to its SDK package set from the index `[board.*]` table — the
+/// board→toolchain SSOT (Phase 191.1). No board-name guessing: an unknown board
+/// is a clear error listing the known boards, not a silent wrong package set
+/// (the failure mode the old keyword heuristic had — it mis-resolved ESP32-C3 as
+/// Xtensa). Adding a board is a `[board.<name>]` entry, no code change.
+pub fn resolve_packages<'i>(index: &'i SdkIndex, board: &str) -> Result<Vec<&'i str>> {
+    match index.board.get(board) {
+        Some(entry) => Ok(entry.packages.iter().map(String::as_str).collect()),
+        None => {
+            let mut known: Vec<&str> = index.board.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            bail!(
+                "nros setup: unknown board '{board}'. Known boards: {}. \
+                 Add a [board.{board}] entry to nros-sdk-index.toml.",
+                if known.is_empty() {
+                    "(none in index)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            )
+        }
     }
-
-    // QEMU for sim/test boards — our arm/riscv64 qemu. NOT esp32: ESP32-C3 runs
-    // under Espressif's qemu-system-riscv32 fork (esp32c3 machine), separate.
-    if !is_esp32 && (b.contains("qemu") || b.contains("mps2") || b.contains("native_sim")) {
-        pkgs.push("qemu");
-    }
-
-    // RTOS kernel / framework sources.
-    if b.contains("freertos") {
-        pkgs.push("freertos-kernel");
-        pkgs.push("lwip");
-    }
-    if b.contains("threadx") {
-        pkgs.push("threadx");
-    }
-    if b.contains("zephyr") || b.contains("native_sim") {
-        pkgs.push("zephyr-sdk");
-    }
-
-    // Host router (run on the host for the Zenoh P2P path).
-    if b == "native" || b == "posix" || t.contains("linux") {
-        pkgs.push("zenohd");
-    }
-
-    // License-gated vendor SDKs.
-    if b.contains("orin") {
-        pkgs.push("nv-spe-fsp");
-    }
-    if b.contains("fvp") {
-        pkgs.push("arm-fvp");
-    }
-
-    pkgs.sort_unstable();
-    pkgs.dedup();
-    pkgs
 }
 
 /// How `name` would be provisioned on `host`, per the index.
@@ -441,29 +395,36 @@ fn print_licenses(index: &SdkIndex) {
 mod tests {
     use super::*;
 
+    fn board_index() -> SdkIndex {
+        SdkIndex::parse(
+            "[board.qemu-arm-freertos]\npackages=[\"arm-none-eabi-gcc\",\"qemu\",\"freertos-kernel\",\"lwip\"]\n\
+             [board.qemu-riscv64-threadx]\npackages=[\"riscv-none-elf-gcc\",\"qemu\",\"threadx\"]\n\
+             [board.esp32]\narch=\"riscv32\"\npackages=[]\n\
+             [board.native]\npackages=[\"zenohd\"]\n\
+             [board.orin-spe]\npackages=[\"arm-none-eabi-gcc\",\"nv-spe-fsp\"]\n",
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn resolves_board_package_sets() {
-        let arm_qemu = resolve_packages("mps2-an385-freertos", Some("thumbv7m-none-eabi"));
-        assert!(arm_qemu.contains(&"arm-none-eabi-gcc"));
-        assert!(arm_qemu.contains(&"qemu"));
-        assert!(arm_qemu.contains(&"freertos-kernel") && arm_qemu.contains(&"lwip"));
+    fn resolves_board_package_sets_from_index() {
+        let idx = board_index();
+        let fr = resolve_packages(&idx, "qemu-arm-freertos").unwrap();
+        assert!(fr.contains(&"arm-none-eabi-gcc") && fr.contains(&"qemu"));
+        assert!(fr.contains(&"freertos-kernel") && fr.contains(&"lwip"));
 
-        let riscv = resolve_packages("threadx-qemu-riscv64", Some("riscv64imac-unknown-none-elf"));
-        assert!(riscv.contains(&"riscv-none-elf-gcc"));
-        assert!(riscv.contains(&"qemu") && riscv.contains(&"threadx"));
+        let tx = resolve_packages(&idx, "qemu-riscv64-threadx").unwrap();
+        assert!(tx.contains(&"riscv-none-elf-gcc") && tx.contains(&"qemu") && tx.contains(&"threadx"));
 
-        // ESP32-C3 is RISC-V via the rustup target + build-std; no index
-        // host-tool (no xtensa gcc, and our arm qemu doesn't serve esp32c3).
-        assert!(resolve_packages("esp32", None).is_empty());
-        assert!(
-            resolve_packages("qemu-esp32-baremetal", Some("riscv32imc-unknown-none-elf")).is_empty()
-        );
-
-        let native = resolve_packages("native", Some("x86_64-unknown-linux-gnu"));
-        assert_eq!(native, vec!["zenohd"]);
-
-        let orin = resolve_packages("orin-spe", Some("armv7r-none-eabihf"));
+        // ESP32-C3: declared arch riscv32, no index host-tool (rustup target).
+        assert!(resolve_packages(&idx, "esp32").unwrap().is_empty());
+        assert_eq!(resolve_packages(&idx, "native").unwrap(), vec!["zenohd"]);
+        let orin = resolve_packages(&idx, "orin-spe").unwrap();
         assert!(orin.contains(&"arm-none-eabi-gcc") && orin.contains(&"nv-spe-fsp"));
+
+        // Unknown board → error (no silent wrong guess), lists known boards.
+        let err = resolve_packages(&idx, "totally-unknown").unwrap_err().to_string();
+        assert!(err.contains("unknown board") && err.contains("native"));
     }
 
     #[test]
@@ -492,7 +453,7 @@ mod tests {
             .as_nanos();
         let ws = std::env::temp_dir().join(format!("nros_noidx_{n}"));
         std::fs::create_dir_all(&ws).unwrap();
-        assert!(ensure_tools("native", None, Some(&ws)).is_ok());
+        assert!(ensure_tools("native", Some(&ws)).is_ok());
         std::fs::remove_dir_all(&ws).ok();
     }
 

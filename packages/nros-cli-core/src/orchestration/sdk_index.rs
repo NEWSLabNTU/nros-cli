@@ -29,6 +29,12 @@ pub struct SdkIndex {
     /// License-gated packages (never hosted/built), by name.
     #[serde(default)]
     pub gated: BTreeMap<String, GatedPackage>,
+    /// Board → required package set (Phase 191.1). The board→toolchain SSOT that
+    /// ships with the index — replaces board-name keyword guessing in
+    /// `resolve_packages`. Keyed by the canonical board id the user passes to
+    /// `nros setup <board>`.
+    #[serde(default)]
+    pub board: BTreeMap<String, BoardEntry>,
 }
 
 /// A prebuilt host tool: a per-host `dist` map + an optional `source` fallback.
@@ -36,12 +42,36 @@ pub struct SdkIndex {
 #[serde(deny_unknown_fields)]
 pub struct ToolPackage {
     pub version: String,
+    /// The exact upstream revision the prebuilt is built/repackaged from (Phase
+    /// 191.2) — e.g. ARM `13.2.rel1`, xPack `14.2.0-3`, a fork branch. The SSOT
+    /// the build scripts consume (as the `build-tool.yml` `upstream` input)
+    /// instead of hardcoding/hand-deriving it. For tools with a `source` recipe
+    /// this equals `source.ref`; recorded here too for dist-only tools.
+    #[serde(default)]
+    pub upstream: Option<String>,
     /// host key (`<os>-<arch>`, e.g. `linux-x86_64`) → prebuilt artifact.
     #[serde(default)]
     pub dist: BTreeMap<String, DistArtifact>,
     /// Build-from-source recipe used when no `dist` matches the host.
     #[serde(default)]
     pub source: Option<ToolSource>,
+}
+
+/// A board's required SDK package set — the board→toolchain SSOT (Phase 191.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoardEntry {
+    /// Target arch family (descriptive: `cortex-m3`, `riscv32`, `x86_64`, …).
+    #[serde(default)]
+    pub arch: Option<String>,
+    /// Platform / RTOS (descriptive: `bare-metal`, `freertos`, `posix`, …).
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// The index package names (`[tool]`/`[source]`/`[gated]`) this board needs.
+    /// Explicit — no derivation, no board-name guessing. May be empty (e.g. an
+    /// ESP32-C3 board whose riscv32 toolchain is rustup-managed).
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
 /// A prebuilt artifact for one host.
