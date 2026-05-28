@@ -24,6 +24,7 @@ pub mod new;
 pub mod plan;
 pub mod run_target;
 pub mod scaffold_deploy;
+pub mod setup;
 pub mod version;
 
 #[cfg(feature = "release")]
@@ -62,6 +63,9 @@ pub enum Cmd {
 
     /// Run a [deploy.<name>] target from the root nros.toml (Phase 172 WP-A)
     Deploy(deploy::Args),
+
+    /// Resolve + fetch a board's toolchain/SDK packages (Phase 187)
+    Setup(setup::Args),
 
     /// Build, flash, and monitor the current project on the selected target
     #[command(name = "run")]
