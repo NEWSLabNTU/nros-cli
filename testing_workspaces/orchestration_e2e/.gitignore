@@ -2,3 +2,5 @@
 # under the workspace; keep them out of git.
 /build/
 **/target/
+# Phase 172.V — the vendor-lib e2e test builds a stub `libfakevendor.a` here.
+/deploy/orin-stub/vendor/

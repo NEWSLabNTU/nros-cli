@@ -1639,6 +1639,80 @@ package = ["echo packaged {{target}}"]
     .expect("vendor-lib deploy dry-run resolves + substitutes the var-set");
 }
 
+/// Phase 172.V — vendor-lib **real build**. Closes the coverage gap where
+/// vendor-lib had only the dry-run template test (the only ownership model
+/// without a real-build e2e). Drives the full `dry_run:false` pipeline on the
+/// host: emit the *compiled* entry lib (`libnros_orin_stub.a`), then run the
+/// `[deploy.orin-stub]` link step — `gcc {self}/startup.c {entry_lib}
+/// -L{vendor.dir}/lib -lfakevendor` — against a stub `libfakevendor.a` the test
+/// builds, producing `build/orin-stub/app.elf`. Stands in for the license-gated
+/// Orin SPE link (`libtegra_aon_fsp.a`) with no vendor SDK. x86_64 host target
+/// so no cross toolchain / `-Z build-std` is needed.
+#[test]
+fn deploy_vendor_lib_real_build_with_stub_lib() {
+    unsafe { std::env::set_var("NROS_NO_AUTO_SETUP", "1") };
+    // Precondition: host gcc + ar (the link step + stub archive need them).
+    for tool in ["gcc", "ar"] {
+        if std::process::Command::new(tool).arg("--version").output().is_err() {
+            eprintln!("[SKIPPED] deploy_vendor_lib_real_build_with_stub_lib: `{tool}` not found");
+            return;
+        }
+    }
+    let fixture = fixture_workspace();
+    let build = fixture.join("build/orin-stub");
+    let _ = fs::remove_dir_all(&build);
+
+    // Build the stub vendor static lib the [deploy.orin-stub] link step expects
+    // at deploy/orin-stub/vendor/lib/libfakevendor.a (gitignored).
+    let vendor_lib = fixture.join("deploy/orin-stub/vendor/lib");
+    fs::create_dir_all(&vendor_lib).expect("create stub vendor lib dir");
+    let csrc = vendor_lib.join("fake_vendor.c");
+    fs::write(&csrc, "int fake_vendor_init(void) { return 0; }\n").expect("write stub vendor src");
+    let obj = vendor_lib.join("fake_vendor.o");
+    assert!(
+        std::process::Command::new("gcc")
+            .arg("-c")
+            .arg(&csrc)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .expect("run gcc -c")
+            .success(),
+        "compile stub vendor object"
+    );
+    assert!(
+        std::process::Command::new("ar")
+            .arg("rcs")
+            .arg(vendor_lib.join("libfakevendor.a"))
+            .arg(&obj)
+            .status()
+            .expect("run ar")
+            .success(),
+        "archive stub vendor lib"
+    );
+
+    deploy::run(deploy::Args {
+        name: Some("orin-stub".to_string()),
+        config: fixture.join("nros.toml"),
+        nano_ros_workspace: Some(nano_ros_workspace()),
+        dry_run: false,
+    })
+    .expect("vendor-lib real deploy: emit compiled entry lib + link against stub vendor lib");
+
+    // The compiled entry lib was emitted, and the vendor link produced the ELF.
+    let entry_lib = build.join("nros/target/x86_64-unknown-linux-gnu/debug/libnros_orin_stub.a");
+    assert!(
+        entry_lib.is_file(),
+        "compiled entry lib emitted: {}",
+        entry_lib.display()
+    );
+    assert!(
+        build.join("app.elf").is_file(),
+        "vendor-linked ELF produced at build/orin-stub/app.elf"
+    );
+    let _ = fs::remove_dir_all(&build);
+}
+
 /// Phase 172 W.4 (step 1) — the Zephyr **vendor-module** `[deploy.zephyr-mod]`
 /// target in the orchestration_e2e fixture resolves + the runner substitutes
 /// `{board}` / `{entry_src}` into the `west build` step, host-side via
