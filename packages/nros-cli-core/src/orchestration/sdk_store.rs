@@ -1,0 +1,396 @@
+//! Phase 187.3 — the install store, provenance, lockfile, and fetch/source-build
+//! engine behind `nros setup`.
+//!
+//! A tool always lands at the same versioned prefix
+//! `$NROS_HOME/sdk/<tool>/<version>/`, whether fetched (prebuilt `dist`) or
+//! source-built — downstream resolves the prefix, provenance-agnostic
+//! (`.nros-provenance` records which). The store is shared across workspaces;
+//! `nros-sdk.lock` pins what's installed. See
+//! `docs/design/nros-setup-toolchain-management.md`.
+
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use eyre::{Result, WrapErr, bail, eyre};
+use serde::{Deserialize, Serialize};
+
+use super::sdk_index::ToolPackage;
+
+/// The shared SDK store root: `$NROS_HOME/sdk`, else `~/.nros/sdk`, else
+/// `./.nros/sdk`.
+pub fn store_root() -> PathBuf {
+    if let Some(h) = std::env::var_os("NROS_HOME") {
+        return PathBuf::from(h).join("sdk");
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h).join(".nros").join("sdk");
+    }
+    PathBuf::from(".nros").join("sdk")
+}
+
+/// The versioned install prefix for a tool — identical for prebuilt + source.
+pub fn tool_prefix(root: &Path, tool: &str, version: &str) -> PathBuf {
+    root.join(tool).join(version)
+}
+
+/// How a tool was installed; persisted to `<prefix>/.nros-provenance`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvenanceKind {
+    Prebuilt,
+    Source,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub kind: ProvenanceKind,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+impl Provenance {
+    fn marker(prefix: &Path) -> PathBuf {
+        prefix.join(".nros-provenance")
+    }
+
+    /// Read the provenance marker, if the prefix is populated.
+    pub fn read(prefix: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::marker(prefix)).ok()?;
+        toml::from_str(&raw).ok()
+    }
+
+    pub fn write(&self, prefix: &Path) -> Result<()> {
+        std::fs::create_dir_all(prefix)
+            .wrap_err_with(|| format!("create prefix {}", prefix.display()))?;
+        std::fs::write(Self::marker(prefix), toml::to_string(self)?)
+            .wrap_err("write .nros-provenance")?;
+        Ok(())
+    }
+}
+
+/// `nros-sdk.lock` — the exact installed toolset, for reproducibility.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SdkLock {
+    #[serde(default)]
+    pub tool: BTreeMap<String, LockEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockEntry {
+    pub version: String,
+    pub provenance: ProvenanceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+impl SdkLock {
+    /// Load the lockfile; a missing file is an empty lock (not an error).
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => toml::from_str(&raw).wrap_err("invalid nros-sdk.lock"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).wrap_err_with(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn record(&mut self, tool: &str, p: &Provenance) {
+        self.tool.insert(
+            tool.to_string(),
+            LockEntry {
+                version: p.version.clone(),
+                provenance: p.kind,
+                sha256: p.sha256.clone(),
+            },
+        );
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, toml::to_string_pretty(self)?)
+            .wrap_err_with(|| format!("write {}", path.display()))
+    }
+}
+
+/// The decided install action for a tool on a host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallAction {
+    /// Already at the prefix (idempotent skip).
+    Present,
+    /// Fetch + verify + unpack the prebuilt artifact.
+    Prebuilt { url: String, sha256: String },
+    /// Build from source into the same prefix.
+    Source {
+        git: String,
+        git_ref: String,
+        configure: Option<String>,
+        install: Option<String>,
+    },
+    /// No prebuilt for this host and no source recipe.
+    Unavailable,
+}
+
+/// Decide how to install `tool` on `host`, given the prefix's current state.
+/// Pure — does no I/O beyond reading the provenance marker.
+pub fn plan_install(tool: &ToolPackage, host: &str, prefix: &Path) -> InstallAction {
+    if Provenance::read(prefix).is_some() {
+        return InstallAction::Present;
+    }
+    if let Some(d) = tool.dist_for(host) {
+        return InstallAction::Prebuilt {
+            url: d.url.clone(),
+            sha256: d.sha256.clone(),
+        };
+    }
+    if let Some(s) = &tool.source {
+        return InstallAction::Source {
+            git: s.git.clone(),
+            git_ref: s.git_ref.clone(),
+            configure: s.configure.clone(),
+            install: s.install.clone(),
+        };
+    }
+    InstallAction::Unavailable
+}
+
+/// Execute an install action into `prefix`, returning the recorded provenance.
+/// Side-effecting (shells out to curl / sha256sum / tar / git); real-run only.
+pub fn execute(
+    action: &InstallAction,
+    tool: &str,
+    version: &str,
+    prefix: &Path,
+) -> Result<Provenance> {
+    match action {
+        InstallAction::Present => Provenance::read(prefix)
+            .ok_or_else(|| eyre!("{tool}: present but no provenance marker")),
+        InstallAction::Prebuilt { url, sha256 } => {
+            std::fs::create_dir_all(prefix)
+                .wrap_err_with(|| format!("create {}", prefix.display()))?;
+            let archive = prefix.with_extension("download");
+            sh(
+                &[
+                    "curl",
+                    "-L",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "-o",
+                    &archive.to_string_lossy(),
+                    url,
+                ],
+                None,
+            )
+            .wrap_err_with(|| format!("download {url}"))?;
+            verify_sha256(&archive, sha256)?;
+            sh(
+                &[
+                    "tar",
+                    "-xf",
+                    &archive.to_string_lossy(),
+                    "-C",
+                    &prefix.to_string_lossy(),
+                ],
+                None,
+            )
+            .wrap_err("unpack prebuilt archive")?;
+            let _ = std::fs::remove_file(&archive);
+            let p = Provenance {
+                kind: ProvenanceKind::Prebuilt,
+                version: version.to_string(),
+                sha256: Some(sha256.clone()),
+            };
+            p.write(prefix)?;
+            Ok(p)
+        }
+        InstallAction::Source {
+            git,
+            git_ref,
+            configure,
+            install,
+        } => {
+            let src = prefix.with_extension("src");
+            let _ = std::fs::remove_dir_all(&src);
+            sh(
+                &[
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    git_ref,
+                    git,
+                    &src.to_string_lossy(),
+                ],
+                None,
+            )
+            .wrap_err_with(|| format!("git clone {git} @ {git_ref}"))?;
+            let prefix_abs = prefix.to_string_lossy().to_string();
+            if let Some(cfg) = configure {
+                sh(
+                    &["sh", "-c", &cfg.replace("{prefix}", &prefix_abs)],
+                    Some(&src),
+                )
+                .wrap_err("configure step")?;
+            }
+            if let Some(inst) = install {
+                sh(
+                    &["sh", "-c", &inst.replace("{prefix}", &prefix_abs)],
+                    Some(&src),
+                )
+                .wrap_err("install step")?;
+            }
+            let p = Provenance {
+                kind: ProvenanceKind::Source,
+                version: version.to_string(),
+                sha256: None,
+            };
+            p.write(prefix)?;
+            Ok(p)
+        }
+        InstallAction::Unavailable => {
+            bail!("{tool} {version}: no prebuilt for this host and no source recipe in the index")
+        }
+    }
+}
+
+/// Verify `path`'s sha256 equals `expected` (shells out to `sha256sum`, falling
+/// back to `shasum -a 256` on macOS).
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .or_else(|_| {
+            Command::new("shasum")
+                .args(["-a", "256"])
+                .arg(path)
+                .output()
+        })
+        .wrap_err("run sha256sum / shasum")?;
+    if !out.status.success() {
+        bail!("sha256sum failed for {}", path.display());
+    }
+    let got = String::from_utf8_lossy(&out.stdout);
+    let got = got.split_whitespace().next().unwrap_or("");
+    if !got.eq_ignore_ascii_case(expected) {
+        bail!(
+            "sha256 mismatch for {}: expected {expected}, got {got}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn sh(args: &[&str], cwd: Option<&Path>) -> Result<()> {
+    let (cmd, rest) = args.split_first().ok_or_else(|| eyre!("empty command"))?;
+    let mut c = Command::new(cmd);
+    c.args(rest);
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    let status = c.status().wrap_err_with(|| format!("spawn {cmd}"))?;
+    if !status.success() {
+        bail!("`{}` failed ({status})", args.join(" "));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::sdk_index::SdkIndex;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("nros_store_{tag}_{n}"))
+    }
+
+    #[test]
+    fn prefix_layout_is_tool_then_version() {
+        let p = tool_prefix(Path::new("/store"), "qemu", "11.0-nros1");
+        assert_eq!(p, Path::new("/store/qemu/11.0-nros1"));
+    }
+
+    #[test]
+    fn provenance_roundtrips_and_marks_present() {
+        let prefix = tmp("prov");
+        assert!(Provenance::read(&prefix).is_none());
+        let p = Provenance {
+            kind: ProvenanceKind::Prebuilt,
+            version: "11.0".into(),
+            sha256: Some("abc".into()),
+        };
+        p.write(&prefix).unwrap();
+        assert_eq!(Provenance::read(&prefix).as_ref(), Some(&p));
+        std::fs::remove_dir_all(&prefix).ok();
+    }
+
+    #[test]
+    fn lockfile_records_and_roundtrips() {
+        let path = tmp("lock").join("nros-sdk.lock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(SdkLock::load(&path).unwrap().tool.is_empty()); // missing ⇒ empty
+        let mut lock = SdkLock::default();
+        lock.record(
+            "qemu",
+            &Provenance {
+                kind: ProvenanceKind::Source,
+                version: "11.0".into(),
+                sha256: None,
+            },
+        );
+        lock.save(&path).unwrap();
+        let back = SdkLock::load(&path).unwrap();
+        assert_eq!(back.tool["qemu"].version, "11.0");
+        assert_eq!(back.tool["qemu"].provenance, ProvenanceKind::Source);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn plan_picks_present_then_prebuilt_then_source_then_unavailable() {
+        let idx = SdkIndex::parse(
+            "[tool.qemu]\nversion=\"11.0\"\ndist.linux-x86_64={url=\"u\",sha256=\"h\"}\n\
+             [tool.qemu.source]\ngit=\"g\"\nref=\"r\"\n\
+             [tool.bare]\nversion=\"1\"\n",
+        )
+        .unwrap();
+        let qemu = &idx.tool["qemu"];
+        let bare = &idx.tool["bare"];
+        let fresh = tmp("plan-fresh");
+
+        // prebuilt host → Prebuilt; non-prebuilt host with source → Source.
+        assert!(matches!(
+            plan_install(qemu, "linux-x86_64", &fresh),
+            InstallAction::Prebuilt { .. }
+        ));
+        assert!(matches!(
+            plan_install(qemu, "macos-arm64", &fresh),
+            InstallAction::Source { .. }
+        ));
+        // no dist + no source → Unavailable.
+        assert_eq!(
+            plan_install(bare, "macos-arm64", &fresh),
+            InstallAction::Unavailable
+        );
+
+        // a populated prefix → Present (idempotent skip).
+        let present = tmp("plan-present");
+        Provenance {
+            kind: ProvenanceKind::Prebuilt,
+            version: "11.0".into(),
+            sha256: None,
+        }
+        .write(&present)
+        .unwrap();
+        assert_eq!(
+            plan_install(qemu, "linux-x86_64", &present),
+            InstallAction::Present
+        );
+        std::fs::remove_dir_all(&present).ok();
+    }
+}

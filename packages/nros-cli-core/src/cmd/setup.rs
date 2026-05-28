@@ -8,9 +8,12 @@
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
-use eyre::{Result, bail};
+use eyre::{Result, WrapErr, bail};
 
-use crate::orchestration::sdk_index::{SdkIndex, host_key};
+use crate::orchestration::{
+    sdk_index::{SdkIndex, host_key},
+    sdk_store::{InstallAction, SdkLock, execute, plan_install, store_root, tool_prefix},
+};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -32,6 +35,10 @@ pub struct Args {
     /// Path to the SDK index.
     #[arg(long, default_value = "nros-sdk-index.toml")]
     pub index: PathBuf,
+
+    /// Resolve + print the plan without fetching/building anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -63,14 +70,69 @@ pub fn run(args: Args) -> Result<()> {
             .unwrap_or_default(),
         packages.len()
     );
+
+    let root = store_root();
+    let lock_path = PathBuf::from("nros-sdk.lock");
+    let mut lock = SdkLock::load(&lock_path)?;
+    let mut installed = false;
+
     for name in &packages {
-        eprintln!("  {:<22} {}", name, disposition(&index, name, &host));
+        // Only `[tool.*]` packages are installed into the store; `[source.*]`
+        // build with the app, `[gated.*]` are user-installed.
+        let Some(tool) = index.tool.get(*name) else {
+            eprintln!("  {:<22} {}", name, disposition(&index, name, &host));
+            continue;
+        };
+        let prefix = tool_prefix(&root, name, &tool.version);
+        let action = plan_install(tool, &host, &prefix);
+        eprintln!("  {:<22} {}", name, describe(&action, &tool.version, &host));
+
+        if args.dry_run {
+            continue;
+        }
+        match action {
+            InstallAction::Unavailable => {
+                bail!(
+                    "nros setup: {name} {} has no prebuilt for {host} and no source recipe \
+                     (add one to the index, or set up that host's toolchain manually)",
+                    tool.version
+                );
+            }
+            other => {
+                let provenance = execute(&other, name, &tool.version, &prefix)
+                    .wrap_err_with(|| format!("install {name} {}", tool.version))?;
+                lock.record(name, &provenance);
+                installed = true;
+                eprintln!("    → {}", prefix.display());
+            }
+        }
     }
-    eprintln!(
-        "(Phase 187.2 resolves + plans; fetch / source-build / cache is 187.3 — \
-         nothing was installed.)"
-    );
+
+    if args.dry_run {
+        eprintln!("(--dry-run: nothing installed)");
+    } else if installed {
+        lock.save(&lock_path)?;
+        eprintln!(
+            "nros setup: {board} ready; locked in {}",
+            lock_path.display()
+        );
+    } else {
+        eprintln!("nros setup: {board} — all packages already present");
+    }
     Ok(())
+}
+
+/// One-line description of the planned action (mirrors `disposition`, but for an
+/// already-resolved [`InstallAction`]).
+fn describe(action: &InstallAction, version: &str, host: &str) -> String {
+    match action {
+        InstallAction::Present => format!("present {version} (skip)"),
+        InstallAction::Prebuilt { .. } => format!("prebuilt {version} (dist {host})"),
+        InstallAction::Source { .. } => format!("source build {version} (no prebuilt for {host})"),
+        InstallAction::Unavailable => {
+            format!("UNAVAILABLE {version} (no prebuilt for {host}, no source)")
+        }
+    }
 }
 
 /// Resolve a board (+ optional target triple) to the SDK package names it needs.
