@@ -4,6 +4,7 @@
 //! contracts and host-side launch artifacts; generated target code remains in
 //! the Phase 126.D surface.
 
+pub mod board_descriptor;
 pub mod build;
 pub mod config;
 pub mod generate;
