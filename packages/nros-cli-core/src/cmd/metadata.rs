@@ -59,12 +59,14 @@ fn metadata_build_options(
     let id = decl.config.component.clone();
     let name = id.rsplit("::").next().unwrap_or(&id).to_string();
     let probe = out_root.join("metadata-probe").join(id.replace("::", "__"));
+    // W.3 (Phase 172): a minimal `[component]` may omit `[linkage]` — derive the
+    // executable + exported symbol from the component name / crate convention.
     MetadataBuildOptions {
         component_id: id,
         package: decl.config.package.clone(),
+        executable: Some(decl.config.linkage.resolved_executable(&name)),
+        exported_symbol: Some(decl.config.linkage.resolved_exported_symbol(&name)),
         component: name,
-        executable: decl.config.linkage.executable.clone(),
-        exported_symbol: decl.config.linkage.exported_symbol.clone(),
         component_dir: decl.package_root.clone(),
         nano_ros_workspace: nano_ros.to_path_buf(),
         output_path: decl.source_metadata_path(),
@@ -217,5 +219,30 @@ mod tests {
             o.harness_dir,
             PathBuf::from("/out/metadata-probe/demo_pkg__talker")
         );
+    }
+
+    /// W.3 (Phase 172): a `[component]` with no `[linkage]` still yields a usable
+    /// executable + exported symbol, derived from the component's short name.
+    #[test]
+    fn metadata_build_options_derives_linkage_when_absent() {
+        let decl = ComponentDeclaration {
+            package_root: PathBuf::from("/ws/src/demo_pkg"),
+            manifest_path: PathBuf::from("/ws/src/demo_pkg/nros.toml"),
+            config: ComponentConfig {
+                version: 1,
+                package: "demo_pkg".into(),
+                component: "demo_pkg::talker".into(),
+                language: ComponentLanguage::Rust,
+                linkage: ComponentLinkage::default(), // no [linkage] table
+                metadata: ComponentMetadataConfig {
+                    source_metadata: "talker.metadata.json".into(),
+                    generated_by: None,
+                },
+                overrides: ComponentOverrides::default(),
+            },
+        };
+        let o = metadata_build_options(&decl, Path::new("/nano-ros"), Path::new("/out"));
+        assert_eq!(o.executable.as_deref(), Some("talker"));
+        assert_eq!(o.exported_symbol.as_deref(), Some("nros_component_talker"));
     }
 }

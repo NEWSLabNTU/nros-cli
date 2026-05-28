@@ -12,6 +12,11 @@ pub struct ComponentConfig {
     pub package: String,
     pub component: String,
     pub language: ComponentLanguage,
+    // W.3 (Phase 172): an absent `[linkage]` is legal — the fields are derived
+    // from the package/component name + crate convention (see `ComponentLinkage`
+    // `resolved_*`). A minimal component manifest declares only package +
+    // component + language + metadata.
+    #[serde(default)]
     pub linkage: ComponentLinkage,
     pub metadata: ComponentMetadataConfig,
     // W.3 (Phase 172): an absent `[overrides]` is legal — a minimal component
@@ -20,13 +25,42 @@ pub struct ComponentConfig {
     pub overrides: ComponentOverrides,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentLinkage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crate_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exported_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_library: Option<String>,
+}
+
+impl ComponentLinkage {
+    /// Crate name — explicit, else the ROS package name with `-`→`_`
+    /// (`package.xml` ⇒ Cargo crate convention). W.3 derivation.
+    pub fn resolved_crate_name(&self, package: &str) -> String {
+        self.crate_name
+            .clone()
+            .unwrap_or_else(|| package.replace('-', "_"))
+    }
+
+    /// Executable / bin name — explicit, else the component's short name.
+    pub fn resolved_executable(&self, component_name: &str) -> String {
+        self.executable
+            .clone()
+            .unwrap_or_else(|| component_name.to_string())
+    }
+
+    /// Exported registration symbol — explicit, else the `nros_component_<name>`
+    /// convention the codegen + `nros::component!` macro use.
+    pub fn resolved_exported_symbol(&self, component_name: &str) -> String {
+        self.exported_symbol
+            .clone()
+            .unwrap_or_else(|| format!("nros_component_{component_name}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +136,46 @@ mod tests {
         assert!(cfg.overrides.parameters.is_empty());
         assert!(cfg.overrides.remaps.is_empty());
         assert!(cfg.overrides.default_namespace.is_none());
+    }
+
+    /// W.3 (Phase 172): an absent `[linkage]` is legal too — the metadata
+    /// driver derives executable / symbol from the component name.
+    #[test]
+    fn minimal_component_manifest_without_linkage_parses() {
+        let raw = r#"
+            version = 1
+            package = "demo_nodes_rs"
+            component = "demo_nodes_rs::talker"
+            language = "rust"
+            [metadata]
+            source_metadata = "target/nros/metadata/talker.json"
+        "#;
+        let cfg: ComponentConfig = toml::from_str(raw).expect("no-linkage manifest parses");
+        assert_eq!(cfg.linkage, ComponentLinkage::default());
+        assert!(cfg.linkage.executable.is_none());
+    }
+
+    #[test]
+    fn linkage_resolves_explicit_then_derived() {
+        // Explicit wins.
+        let explicit = ComponentLinkage {
+            crate_name: Some("my_crate".into()),
+            executable: Some("my_exe".into()),
+            exported_symbol: Some("my_sym".into()),
+            static_library: None,
+        };
+        assert_eq!(explicit.resolved_crate_name("ros-pkg"), "my_crate");
+        assert_eq!(explicit.resolved_executable("talker"), "my_exe");
+        assert_eq!(explicit.resolved_exported_symbol("talker"), "my_sym");
+
+        // Derived from name / crate convention.
+        let bare = ComponentLinkage::default();
+        assert_eq!(bare.resolved_crate_name("ros-pkg"), "ros_pkg");
+        assert_eq!(bare.resolved_executable("talker"), "talker");
+        assert_eq!(
+            bare.resolved_exported_symbol("talker"),
+            "nros_component_talker"
+        );
     }
 
     /// An `[overrides]` table that sets only `default_namespace` (no
