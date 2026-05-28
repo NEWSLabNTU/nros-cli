@@ -17,11 +17,10 @@ name = "nros_cli_core"
 path = "src/lib.rs"
 
 [features]
-default = ["play-launch-parser"]
+default = []
 # Maintainer-only release subcommands (`nros release detect|publish|tag`).
 # Hidden from `nros --help` unless this feature is on at build time.
 release = []
-play-launch-parser = ["dep:play_launch_parser"]
 
 [dependencies]
 clap = { workspace = true }
@@ -31,7 +30,12 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 toml_edit = "0.22"
 cargo_metadata = "0.18"
-play_launch_parser = { path = "../../third-party/play_launch_parser/crates/play_launch_parser", optional = true }
+# Phase 195.A: launch-file resolution shells out to the external
+# `play_launch_parser` binary (planner.rs) rather than linking it — that crate
+# embeds CPython via pyo3 `auto-initialize`, and abi3 cannot unpin an embedding
+# binary's libpython (pyo3 docs). Keeping it out of the link makes the shipped
+# `nros` a portable libc-only binary; the python-bearing parser is distributed
+# separately (`pip install play-launch-parser` / its own binary).
 ros-launch-manifest-types = { path = "../../third-party/ros-launch-manifest/types" }
 
 # Reuse the codegen implementation that still lives in the

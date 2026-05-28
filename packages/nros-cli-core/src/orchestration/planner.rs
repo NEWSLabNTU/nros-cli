@@ -8,12 +8,13 @@ use super::{
     schema::InterfaceRef,
     workspace::{Workspace, unique_paths},
 };
-use eyre::{Context, Result, eyre};
+use eyre::{Context, Result, bail, eyre};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[derive(Debug, Clone)]
@@ -432,30 +433,46 @@ fn load_or_parse_record(
     parse_launch_file_record(launch_file, launch_args)
 }
 
-#[cfg(feature = "play-launch-parser")]
+/// Resolve a launch file to a record by shelling out to the external
+/// `play_launch_parser` binary (Phase 195.A). nano-ros keeps the `nros` binary
+/// itself free of the pyo3/`libpython` embedding (the launch parser embeds
+/// CPython to execute `.launch.py`); it lives in the separate, python-bearing
+/// `play_launch_parser` tool (`pip install play-launch-parser` or its binary).
+/// The build system runs this internally to produce the record; `--record` is
+/// not a user-facing surface. Override the binary via `NROS_PLAY_LAUNCH_PARSER`.
 fn parse_launch_file_record(
     launch_file: &Path,
     launch_args: HashMap<String, String>,
 ) -> Result<Value> {
-    let record =
-        play_launch_parser::parse_launch_file(launch_file, launch_args).map_err(|err| {
-            eyre!(
-                "failed to parse launch file {}: {err}",
-                launch_file.display()
-            )
-        })?;
-    Ok(serde_json::to_value(record)?)
-}
-
-#[cfg(not(feature = "play-launch-parser"))]
-fn parse_launch_file_record(
-    launch_file: &Path,
-    _launch_args: HashMap<String, String>,
-) -> Result<Value> {
-    Err(eyre!(
-        "play_launch_parser adapter is disabled for this build; pass --record <record.json> or build nros-cli-core with feature `play-launch-parser` (launch file: {})",
-        launch_file.display()
-    ))
+    let bin =
+        std::env::var("NROS_PLAY_LAUNCH_PARSER").unwrap_or_else(|_| "play_launch_parser".to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("file").arg(launch_file);
+    for (k, v) in &launch_args {
+        cmd.arg(format!("{k}:={v}"));
+    }
+    let output = cmd.output().map_err(|err| {
+        eyre!(
+            "failed to run `{bin}` (launch parser) for {}: {err}. Install it \
+             (`pip install play-launch-parser`, or build the play_launch_parser \
+             binary) and put it on PATH, or set NROS_PLAY_LAUNCH_PARSER=<path>.",
+            launch_file.display()
+        )
+    })?;
+    if !output.status.success() {
+        bail!(
+            "{bin} failed for {} (exit {}):\n{}",
+            launch_file.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).wrap_err_with(|| {
+        format!(
+            "invalid record JSON from {bin} for {}",
+            launch_file.display()
+        )
+    })
 }
 
 fn record_array<'a>(record: &'a Value, key: &str) -> &'a [Value] {
