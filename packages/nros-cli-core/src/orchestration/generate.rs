@@ -54,6 +54,9 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
     })?;
 
     let plan = load_plan(&options.plan_path)?;
+    // Phase 172 — fail fast with a clear message if a `[[bridge]]` forwards an
+    // undeclared topic or names an unopened session, before emitting code.
+    validate_bridges(&plan)?;
     let cargo_toml = render_cargo_toml(options, &plan);
     let build_rs = render_build_rs(options, &plan);
     let cargo_config = render_cargo_config(options, &plan);
@@ -168,6 +171,7 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
                 &plan.build,
                 plan.lifecycle.is_some(),
                 plan.param_persistence.is_some(),
+                !plan.bridges.is_empty(),
             )),
         )
         .replace("{{ nros_path }}", &path_for_template(&options.nros_path))
@@ -1592,10 +1596,17 @@ fn generated_default_features(
     build: &PlanBuildOptions,
     managed_lifecycle: bool,
     param_persistence: bool,
+    has_bridges: bool,
 ) -> Vec<String> {
     let mut features = Vec::new();
     if uses_std(build) {
         features.push("std".to_string());
+    }
+    // Phase 172 — a `[[bridge]]` plan's generated `register_bridges` uses the
+    // `nros-bridge` origin codec (`nros::bridge::{parse,encode}_bridge_origin`),
+    // gated behind `nros/bridge`.
+    if has_bridges {
+        features.push("nros/bridge".to_string());
     }
     // Phase 172.A — a `[lifecycle]` plan needs the REP-2002 services on the
     // executor (`nros/lifecycle-services` → `nros-node/lifecycle-services`).
@@ -2395,11 +2406,12 @@ fn render_entry_lib_fns(out: &mut String, plan: &NrosPlan) {
         out.push_str("    nros::Executor::open_multi(&SESSION_SPECS)\n");
         out.push_str("}\n");
     }
-    render_register_all_fn(out);
+    render_register_all_fn(out, plan);
+    render_register_bridges_fn(out, plan);
 }
 
 /// Emit `register_all` (see [`render_entry_lib_fns`]).
-fn render_register_all_fn(out: &mut String) {
+fn render_register_all_fn(out: &mut String, plan: &NrosPlan) {
     out.push_str(
         "\npub fn register_all(executor: &mut nros::Executor) -> Result<(), nros::NodeError> {\n",
     );
@@ -2424,6 +2436,162 @@ fn render_register_all_fn(out: &mut String) {
     out.push_str("    }\n");
     out.push_str("    apply_lifecycle(executor)?;\n");
     out.push_str("    apply_param_persistence(executor)?;\n");
+    if !plan.bridges.is_empty() {
+        out.push_str("    register_bridges(executor)?;\n");
+    }
+    out.push_str("    Ok(())\n");
+    out.push_str("}\n");
+}
+
+/// Resolve a forwarded topic's interface (type name + hash) from the plan's
+/// declared entities — the topic must be a publisher/subscriber `resolved_name`
+/// somewhere in the plan (the "resolve from interfaces" model). `None` ⇒ the
+/// topic isn't declared by any component, which [`validate_bridges`] rejects.
+fn resolve_topic_interface<'a>(
+    plan: &'a NrosPlan,
+    topic: &str,
+) -> Option<&'a super::schema::InterfaceRef> {
+    plan.instances
+        .iter()
+        .flat_map(|instance| instance.nodes.iter())
+        .flat_map(|node| node.entities.iter())
+        .find_map(|entity| match entity {
+            super::plan::PlanEntity::Publisher {
+                resolved_name,
+                interface,
+                ..
+            }
+            | super::plan::PlanEntity::Subscriber {
+                resolved_name,
+                interface,
+                ..
+            } if resolved_name == topic => Some(interface),
+            _ => None,
+        })
+}
+
+/// Map a bridge endpoint to its `SESSION_SPECS` slot index. SESSION_SPECS for a
+/// bridge build is one entry per `plan.build.transports` (same order); an
+/// endpoint matches the transport with the same canonical rmw + domain +
+/// locator. `None` ⇒ the endpoint names a session the build didn't open.
+fn bridge_endpoint_session_idx(
+    plan: &NrosPlan,
+    ep: &super::plan::PlanBridgeEndpoint,
+) -> Option<usize> {
+    let ep_rmw = normalize_rmw(&ep.rmw).unwrap_or(ep.rmw.as_str());
+    plan.build.transports.iter().position(|t| {
+        let t_rmw = t.rmw.as_deref().unwrap_or(plan.build.rmw.as_str());
+        let t_rmw = normalize_rmw(t_rmw).unwrap_or(t_rmw);
+        t_rmw == ep_rmw
+            && t.domain.unwrap_or(0) == ep.domain
+            && t.locator.as_deref().unwrap_or("") == ep.locator.as_deref().unwrap_or("")
+    })
+}
+
+/// Validate every `[[bridge]]` resolves before codegen: each forwarded topic
+/// must be a declared interface, and each `connect` endpoint must map to an
+/// opened session. Returns a clear deploy-time error otherwise (the infallible
+/// renderer then re-resolves with the same helpers, guaranteed to succeed).
+fn validate_bridges(plan: &NrosPlan) -> Result<()> {
+    for bridge in &plan.bridges {
+        if bridge.connect.len() < 2 {
+            bail!(
+                "bridge `{}` connects {} session(s); a bridge needs ≥2",
+                bridge.name,
+                bridge.connect.len()
+            );
+        }
+        for ep in &bridge.connect {
+            if bridge_endpoint_session_idx(plan, ep).is_none() {
+                bail!(
+                    "bridge `{}` endpoint (rmw={}, domain={}, locator={:?}) matches no opened \
+                     session — declare a matching `[[transport]]` in the bridge build",
+                    bridge.name,
+                    ep.rmw,
+                    ep.domain,
+                    ep.locator
+                );
+            }
+        }
+        for topic in &bridge.topics {
+            if resolve_topic_interface(plan, topic).is_none() {
+                bail!(
+                    "bridge `{}` forwards topic `{}`, but no component declares it — the type is \
+                     resolved from the plan's interfaces (wildcards are not supported)",
+                    bridge.name,
+                    topic
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit `register_bridges` — the Phase 172 topic-forwarding relay. For each
+/// `[[bridge]]`: one bridge node per endpoint session (bound via
+/// `session_idx`), then per forwarded topic, per ordered endpoint pair `(i→j)`,
+/// a generic publisher on `j` plus a generic+`MessageInfo` subscription on `i`
+/// whose callback re-publishes through it. Echo/loop suppression: every forward
+/// stamps the bridge's `bridge_origin`; a subscription drops samples already
+/// carrying its own bridge's origin (the `nros-bridge` codec). The node-centric
+/// builder is the Phase 189.M1 surface; resolution is pre-checked by
+/// [`validate_bridges`], so the `expect`s here cannot fire.
+fn render_register_bridges_fn(out: &mut String, plan: &NrosPlan) {
+    if plan.bridges.is_empty() {
+        return;
+    }
+    out.push_str(
+        "\npub fn register_bridges(executor: &mut nros::Executor) -> Result<(), nros::NodeError> {\n",
+    );
+    for (bi, bridge) in plan.bridges.iter().enumerate() {
+        out.push_str(&format!("    // bridge {:?}\n", bridge.name));
+        out.push_str(&format!(
+            "    let origin_b{bi}: &[u8] = {:?}.as_bytes();\n",
+            bridge.name
+        ));
+        // One bridge node per endpoint session.
+        for (ei, ep) in bridge.connect.iter().enumerate() {
+            let idx = bridge_endpoint_session_idx(plan, ep)
+                .expect("validate_bridges checked endpoint→session");
+            let node_name = format!("{}_ep{ei}", bridge.name);
+            out.push_str(&format!(
+                "    let node_b{bi}_ep{ei} = executor.node_builder({node_name:?}).session_idx({idx}).build()?;\n"
+            ));
+        }
+        for (ti, topic) in bridge.topics.iter().enumerate() {
+            let interface =
+                resolve_topic_interface(plan, topic).expect("validate_bridges checked topic");
+            let ty = interface_type_name(interface);
+            let hash = interface_type_hash(interface);
+            out.push_str(&format!("    // topic {topic:?} : {ty} / {hash}\n"));
+            let n = bridge.connect.len();
+            for i in 0..n {
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let pub_var = format!("pub_b{bi}_{i}_{j}_t{ti}");
+                    out.push_str(&format!(
+                        "    let {pub_var} = executor.node_mut(node_b{bi}_ep{j}).publisher({topic:?}).generic({ty:?}, {hash:?}).build()?;\n"
+                    ));
+                    out.push_str(&format!(
+                        "    executor.node_mut(node_b{bi}_ep{i}).subscription({topic:?}).generic({ty:?}, {hash:?}).message_info().build(move |payload: &[u8], info: &nros::RawMessageInfo| {{\n"
+                    ));
+                    out.push_str(&format!(
+                        "        if let Some(o) = nros::bridge::parse_bridge_origin(info.attachment()) {{ if o == origin_b{bi} {{ return; }} }}\n"
+                    ));
+                    out.push_str("        let mut att = [0u8; 64];\n");
+                    out.push_str(&format!(
+                        "        let n = nros::bridge::encode_bridge_origin(origin_b{bi}, &mut att);\n"
+                    ));
+                    out.push_str(&format!(
+                        "        let _ = {pub_var}.publish_raw_with_attachment(payload, &att[..n]);\n"
+                    ));
+                    out.push_str("    })?;\n");
+                }
+            }
+        }
+    }
     out.push_str("    Ok(())\n");
     out.push_str("}\n");
 }
@@ -3315,8 +3483,12 @@ mod net_fragment_tests {
         assert!(out.contains("let _ = executor;"), "{out}");
         assert!(!out.contains("register_parameter_services"), "{out}");
         // And a None plan must not pull the param-services feature.
-        let feats =
-            generated_default_features(&plan_with_param_persistence(None).build, false, false);
+        let feats = generated_default_features(
+            &plan_with_param_persistence(None).build,
+            false,
+            false,
+            false,
+        );
         assert!(
             !feats.iter().any(|f| f == "nros/param-services"),
             "{feats:?}"
@@ -3348,7 +3520,7 @@ mod net_fragment_tests {
         );
         assert!(out.contains("nros::ParameterValue::Integer(i)"), "{out}");
 
-        let feats = generated_default_features(&plan.build, false, true);
+        let feats = generated_default_features(&plan.build, false, true, false);
         assert!(
             feats.iter().any(|f| f == "nros/param-services"),
             "{feats:?}"
@@ -3499,6 +3671,115 @@ mod net_fragment_tests {
             tables.contains("nros::SessionSpec::new(\"zenoh\", \"tcp/b:7447\").domain_id(5)"),
             "domain-5 transport emits .domain_id(5):\n{tables}"
         );
+    }
+
+    /// Build a bridge plan: two zenoh transports (domains 0 + 5), a `[[bridge]]`
+    /// connecting them forwarding `topics`, and (optionally) an instance whose
+    /// node publishes each topic so it resolves to an interface.
+    fn bridge_plan(topics: &[&str], declare: bool) -> NrosPlan {
+        use crate::orchestration::schema::PLAN_VERSION;
+        let entities: Vec<_> = if declare {
+            topics
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    serde_json::json!({
+                        "role": "publisher", "id": format!("e{i}"), "source_entity": format!("e{i}"),
+                        "resolved_name": t,
+                        "interface": { "package": "std_msgs", "name": "msg/Int32", "kind": "message" },
+                        "qos": { "reliability": "reliable", "durability": "volatile",
+                                 "history": "keep_last", "depth": 10, "deadline_ms": null,
+                                 "lifespan_ms": null, "liveliness": "automatic",
+                                 "liveliness_lease_duration_ms": null, "extensions": {} },
+                        "trace": { "source_artifact": { "artifact": "x", "line": null, "column": null },
+                                   "manifest_endpoint": null }
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let instances = if declare {
+            serde_json::json!([{
+                "id": "i0", "component": "c", "package": "p", "executable": "e",
+                "launch_name": "n", "namespace": "/", "remaps": [],
+                "nodes": [{ "id": "n0", "source_node": "n0", "resolved_name": "/n",
+                            "namespace": "/", "entities": entities }],
+                "callbacks": [], "parameters": [], "sched_bindings": [],
+                "trace": { "launch_record_entity": "x", "source_metadata": "y" }
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::from_value(serde_json::json!({
+            "version": PLAN_VERSION, "system": "s",
+            "trace": { "system_config": "nros.toml", "launch_record": "r", "generated_by": "t" },
+            "components": [], "instances": instances, "interfaces": [], "sched_contexts": [],
+            "bridges": [{ "name": "gw", "connect": [
+                { "rmw": "zenoh", "domain": 0, "locator": "tcp/a:7447" },
+                { "rmw": "zenoh", "domain": 5, "locator": "tcp/b:7447" }
+            ], "topics": topics }],
+            "build": {
+                "target": "x86_64-unknown-linux-gnu", "board": "native", "rmw": "zenoh",
+                "profile": "release", "features": [], "cfg": {},
+                "transports": [
+                    { "kind": "ethernet", "rmw": "zenoh", "locator": "tcp/a:7447" },
+                    { "kind": "ethernet", "rmw": "zenoh", "locator": "tcp/b:7447", "domain": 5 }
+                ]
+            }
+        }))
+        .expect("bridge plan parses")
+    }
+
+    #[test]
+    fn validate_bridges_rejects_undeclared_topic() {
+        // A forwarded topic no component declares ⇒ clear error (no wildcards).
+        let plan = bridge_plan(&["/ghost"], false);
+        let err = validate_bridges(&plan).expect_err("undeclared topic must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("/ghost") && msg.contains("no component declares"),
+            "{msg}"
+        );
+        // Declared ⇒ passes.
+        assert!(validate_bridges(&bridge_plan(&["/chatter"], true)).is_ok());
+    }
+
+    #[test]
+    fn register_bridges_emits_relay() {
+        let plan = bridge_plan(&["/chatter"], true);
+        let tables = render_generated_tables(&plan);
+        // register_bridges fn + per-endpoint bridge nodes bound to their session.
+        assert!(tables.contains("pub fn register_bridges"), "{tables}");
+        assert!(
+            tables.contains("node_builder(\"gw_ep0\").session_idx(0)"),
+            "{tables}"
+        );
+        assert!(
+            tables.contains("node_builder(\"gw_ep1\").session_idx(1)"),
+            "{tables}"
+        );
+        // The relay: generic publisher + generic+message_info subscription, with
+        // bridge_origin echo suppression and attachment re-stamping.
+        assert!(
+            tables.contains(".publisher(\"/chatter\").generic("),
+            "{tables}"
+        );
+        assert!(
+            tables.contains(".subscription(\"/chatter\").generic(")
+                && tables.contains(".message_info().build(move |payload"),
+            "{tables}"
+        );
+        assert!(
+            tables.contains("nros::bridge::parse_bridge_origin(info.attachment())"),
+            "{tables}"
+        );
+        assert!(
+            tables.contains("publish_raw_with_attachment(payload"),
+            "{tables}"
+        );
+        // register_all calls it.
+        assert!(tables.contains("register_bridges(executor)?;"), "{tables}");
     }
 
     #[test]
