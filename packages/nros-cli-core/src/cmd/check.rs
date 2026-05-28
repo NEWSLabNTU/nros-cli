@@ -44,22 +44,21 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Phase 172 WP-B — warn when a root `nros.toml` declares `[[bridge]]` /
-/// `[[domain]]` groups: those parse + validate, but the planner does not yet
-/// bind nodes to per-session/per-domain sessions (no per-instance transport
-/// binding flows into the plan). Multi-session *opening* works (SESSION_SPECS +
-/// `open_multi`); the per-node *routing* does not. `None` ⇒ no such config ⇒ no
-/// warning. Returns the message so it stays unit-testable (the caller prints).
+/// Warn when a root `nros.toml` declares `[[bridge]]` groups: those parse +
+/// validate, but per-node *bridge* routing isn't emitted yet (bridge nodes bind
+/// to the primary session). `[[domain]]` multi-domain routing **is** emitted as
+/// of Phase 172.K.5 (`nros deploy` stamps node domains → the generator opens a
+/// session per domain + routes via `NodeBuilder::session_idx`), so it no longer
+/// warns. `None` ⇒ no bridge config ⇒ no warning. Returned (not printed) so it
+/// stays unit-testable.
 fn pending_routing_warning(cfg: &WorkspaceConfig) -> Option<String> {
     let all_systems = || cfg.system.iter().chain(cfg.systems.values());
     let bridges: usize = all_systems().map(|s| s.bridge.len()).sum();
-    let domains: usize = all_systems().map(|s| s.domain.len()).sum();
-    (bridges > 0 || domains > 0).then(|| {
+    (bridges > 0).then(|| {
         format!(
-            "{bridges} [[bridge]] + {domains} [[domain]] group(s) declared, but per-node session \
-             routing is not yet emitted (Phase 172 WP-B). Nodes still bind to the primary \
-             session; in-binary bridge/multi-domain routing is pending the planner's \
-             per-instance transport binding."
+            "{bridges} [[bridge]] group(s) declared, but per-node bridge routing is not yet \
+             emitted — bridge nodes bind to the primary session. (Multi-domain `[[domain]]` \
+             routing landed in Phase 172.K.5.)"
         )
     })
 }
@@ -69,11 +68,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_routing_warns_on_bridge_or_domain_else_silent() {
+    fn pending_routing_warns_on_bridge_only() {
         let plain: WorkspaceConfig =
             toml::from_str("[workspace]\n[system]\nrmw = \"zenoh\"\n").unwrap();
         assert!(pending_routing_warning(&plain).is_none());
 
+        // [[domain]] is routed now (Phase 172.K.5) → no warning.
+        let domained: WorkspaceConfig = toml::from_str(
+            "[workspace]\n[system]\nrmw = \"zenoh\"\n\
+             [[system.domain]]\nid = 5\nnodes = [\"/talker\"]\n",
+        )
+        .unwrap();
+        assert!(
+            pending_routing_warning(&domained).is_none(),
+            "[[domain]] routing landed → no warning"
+        );
+
+        // [[bridge]] still lacks per-node routing → warns.
         let bridged: WorkspaceConfig = toml::from_str(
             "[workspace]\n[system]\nrmw = \"zenoh\"\n\
              [[system.bridge]]\nname = \"gw\"\n\
@@ -81,6 +92,6 @@ mod tests {
         )
         .unwrap();
         let msg = pending_routing_warning(&bridged).expect("bridge ⇒ warning");
-        assert!(msg.contains("1 [[bridge]]") && msg.contains("routing is not yet emitted"));
+        assert!(msg.contains("1 [[bridge]]") && msg.contains("bridge routing is not yet emitted"));
     }
 }

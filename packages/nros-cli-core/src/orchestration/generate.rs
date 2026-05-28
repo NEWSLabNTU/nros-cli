@@ -713,11 +713,11 @@ fn render_zephyr_prj_conf(plan: &NrosPlan) -> String {
 }
 
 /// Phase 172 W.4 — the per-RMW Zephyr Kconfig the generated app needs to build
-/// + link the chosen transport. Mirrors `examples/zephyr/rust/talker/
-/// prj-<rmw>.conf` (the source of truth for the knobs); `CONFIG_POSIX_API=y` in
-/// particular is what reconciles Zephyr's POSIX/net headers for the zenoh-pico
-/// / Cyclone C builds. Later assignments override the base prj.conf (Kconfig
-/// fragment semantics). Board-specific tuning (e.g. native_sim NSOS offload)
+/// and link the chosen transport. Mirrors the per-RMW overlays under
+/// `examples/zephyr/rust/talker/` (the source of truth for the knobs);
+/// `CONFIG_POSIX_API=y` in particular reconciles Zephyr's POSIX and net headers
+/// for the zenoh-pico and Cyclone C builds. Later assignments override the base
+/// prj.conf (Kconfig fragment semantics). Board-specific tuning (e.g. native_sim NSOS offload)
 /// belongs in a `[deploy].config` hook overlay, not here.
 fn zephyr_rmw_fragment(build: &PlanBuildOptions) -> String {
     let body = match build.rmw.as_str() {

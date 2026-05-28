@@ -22,7 +22,7 @@ use crate::{
         self,
         generate::{GenerateOptions, generate_package},
         root_config::{
-            DeployTarget, EmitForm, ManifestKind, SystemSection, WorkspaceConfig,
+            DeployTarget, DomainGroup, EmitForm, ManifestKind, SystemSection, WorkspaceConfig,
             probe_manifest_kind, resolve_workspace_root,
         },
     },
@@ -319,6 +319,10 @@ fn emit_entry_lib(
     .wrap_err("deploy: plan step")?;
 
     let plan_path = paths.out_root.join("nros-plan.json");
+    // Phase 172.K.5 — stamp each plan node with the ROS domain from its root
+    // `[system].[[domain]]` group, so the generator opens a session per domain
+    // and routes each node to its own (in-binary multi-domain).
+    apply_domain_groups(&plan_path, &sys.domain)?;
     let emit = deploy.emit.unwrap_or_else(|| deploy.kind.default_emit());
     match emit {
         EmitForm::Source => {
@@ -390,6 +394,44 @@ fn synth_build_overlay(
     let path = out_root.join("deploy-build-overlay.toml");
     std::fs::write(&path, body).wrap_err_with(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+/// Phase 172.K.5 — stamp each plan node with the ROS domain from its root
+/// `[system].[[domain]]` group (matched by node name). The generator then opens
+/// a session per distinct domain (`SESSION_SPECS` + `open_multi`) and routes
+/// each node to its own via `NodeBuilder::session_idx`. No groups ⇒ no-op.
+fn apply_domain_groups(plan_path: &Path, groups: &[DomainGroup]) -> Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(plan_path)
+        .wrap_err_with(|| format!("read plan {}", plan_path.display()))?;
+    let mut plan: orchestration::plan::NrosPlan =
+        serde_json::from_str(&raw).wrap_err("parse plan for domain assignment")?;
+    let mut changed = false;
+    for instance in &mut plan.instances {
+        for node in &mut instance.nodes {
+            if let Some(group) = groups.iter().find(|g| node_in_group(node, g)) {
+                node.domain_id = Some(group.id);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let pretty =
+            serde_json::to_string_pretty(&plan).wrap_err("serialize domain-stamped plan")?;
+        std::fs::write(plan_path, pretty)
+            .wrap_err_with(|| format!("write plan {}", plan_path.display()))?;
+    }
+    Ok(())
+}
+
+/// A `[[domain]]` group matches a plan node by its resolved graph name or that
+/// name's short (last-segment) form.
+fn node_in_group(node: &orchestration::plan::PlanNode, group: &DomainGroup) -> bool {
+    let resolved = node.resolved_name.as_str();
+    let short = resolved.rsplit('/').next().unwrap_or(resolved);
+    group.nodes.iter().any(|n| n == resolved || n == short)
 }
 
 type Vars = BTreeMap<&'static str, String>;
@@ -669,5 +711,26 @@ build = ["west build -b {board} -d build/mcu {self}"]
         let err = resolve_deploy_config(&path).unwrap_err().to_string();
         assert!(err.contains("direct-mode node config"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 172.K.5: [[domain]] group → node matching ---
+
+    #[test]
+    fn node_in_group_matches_resolved_or_short_name() {
+        let node = orchestration::plan::PlanNode {
+            id: "demo.talker.0/node_talker".to_string(),
+            source_node: "node_talker".to_string(),
+            resolved_name: "/talker".to_string(),
+            namespace: "/".to_string(),
+            entities: Vec::new(),
+            domain_id: None,
+        };
+        let group = |nodes: &[&str]| DomainGroup {
+            id: 5,
+            nodes: nodes.iter().map(|s| s.to_string()).collect(),
+        };
+        assert!(node_in_group(&node, &group(&["/talker"])), "resolved name");
+        assert!(node_in_group(&node, &group(&["talker"])), "short name");
+        assert!(!node_in_group(&node, &group(&["/listener"])), "no match");
     }
 }
