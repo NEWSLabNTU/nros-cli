@@ -1634,3 +1634,20 @@ package = ["echo packaged {{target}}"]
     })
     .expect("vendor-lib deploy dry-run resolves + substitutes the var-set");
 }
+
+/// Phase 172 W.4 (step 1) — the Zephyr **vendor-module** `[deploy.zephyr-mod]`
+/// target in the orchestration_e2e fixture resolves + the runner substitutes
+/// `{board}` / `{entry_src}` into the `west build` step, host-side via
+/// `--dry-run` (parse → resolve → substitute; no `west` invocation). The real
+/// `west` cross-build + native_sim boot is the toolchain-gated follow-up (W.4
+/// step 2/3). Exercises emit = source (vendor-module default), no vendor pin.
+#[test]
+fn deploy_zephyr_vendor_module_dry_run_resolves_and_substitutes() {
+    deploy::run(deploy::Args {
+        name: Some("zephyr-mod".to_string()),
+        config: fixture_workspace().join("nros.toml"),
+        nano_ros_workspace: None, // dry-run skips the entry-lib emit pipeline
+        dry_run: true,
+    })
+    .expect("zephyr vendor-module deploy dry-run resolves + substitutes the var-set");
+}

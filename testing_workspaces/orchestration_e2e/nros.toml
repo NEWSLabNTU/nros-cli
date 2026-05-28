@@ -18,3 +18,23 @@ domain_id = 0
 [deploy.native]
 kind = "self"
 target = "x86_64-unknown-linux-gnu"
+
+# Phase 172 W.4 — vendor-module ownership model: the vendor (Zephyr/`west`)
+# owns the build. nano-ros emits the *source* form — for Zephyr the generated
+# entry crate IS a west-buildable app (a `rustapp` staticlib + Zephyr
+# CMakeLists calling `rust_cargo_application()` + prj.conf), so the build[]
+# step just points `west` at `{entry_src}`. native_sim is the net-capable sim
+# (matches examples/zephyr/rust/talker); the target triple is the host arch
+# native_sim compiles to.
+[deploy.zephyr-mod]
+kind = "vendor-module"
+board = "native_sim/native/64"
+target = "x86_64-unknown-linux-gnu"
+self = "deploy/zephyr-mod"   # vendor glue: west manifest import + overlays
+# emit defaults to "source" for vendor-module.
+build = [
+  "west build -b {board} -d build/zephyr-mod {entry_src}",
+]
+package = [
+  "echo zephyr-mod image: build/zephyr-mod/zephyr/zephyr.exe",
+]
