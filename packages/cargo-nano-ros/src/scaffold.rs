@@ -288,22 +288,21 @@ path = "src/main.rs"
     fs::write(dir.join("Cargo.toml"), cargo_toml)?;
 
     let main_rs = if is_embedded {
-        format!(
-            r#"#![no_std]
+        r#"#![no_std]
 #![no_main]
 
 use nros::prelude::*;
 // TODO: import your board crate
-// use nros_board_mps2_an385_freertos::{{Config, run, println}};
+// use nros_board_mps2_an385_freertos::{Config, run, println};
 use panic_semihosting as _;
 
 #[unsafe(no_mangle)]
-extern "C" fn _start() -> ! {{
+extern "C" fn _start() -> ! {
     // TODO: replace with your board crate's run()
-    loop {{}}
-}}
+    loop {}
+}
 "#
-        )
+        .to_string()
     } else {
         format!(
             r#"fn main() {{

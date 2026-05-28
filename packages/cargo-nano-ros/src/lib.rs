@@ -56,10 +56,8 @@ use std::{
 fn write_if_changed<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> std::io::Result<()> {
     let path = path.as_ref();
     let new = contents.as_ref();
-    if let Ok(existing) = std::fs::read(path) {
-        if existing == new {
-            return Ok(());
-        }
+    if std::fs::read(path).is_ok_and(|existing| existing == new) {
+        return Ok(());
     }
     std::fs::write(path, new)
 }

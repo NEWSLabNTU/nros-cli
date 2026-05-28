@@ -15,8 +15,10 @@ use rosidl_codegen::{
     generate_nros_service_package,
     utils::{extract_dependencies, to_snake_case},
 };
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 /// Idempotent write — skip the rewrite when content matches so the file's
 /// mtime doesn't bump on every codegen run (cmake's mtime-driven rebuilds
@@ -24,10 +26,8 @@ use std::path::{Path, PathBuf};
 fn write_if_changed<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> std::io::Result<()> {
     let path = path.as_ref();
     let new = contents.as_ref();
-    if let Ok(existing) = std::fs::read(path) {
-        if existing == new {
-            return Ok(());
-        }
+    if std::fs::read(path).is_ok_and(|existing| existing == new) {
+        return Ok(());
     }
     std::fs::write(path, new)
 }
