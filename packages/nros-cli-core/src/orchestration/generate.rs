@@ -2320,7 +2320,9 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     }
     out.push_str("    }\n");
     out.push_str("}\n\n");
-    out.push_str("#[allow(dead_code)]\nunsafe extern \"C\" fn noop_raw_subscription(_data: *const u8, _len: usize, _context: *mut core::ffi::c_void) {}\n");
+    // Subscriber placeholders now use the Phase 189 builder closure
+    // (no C-fn-ptr noop). Services/actions keep their C-fn-ptr noops
+    // until their builders land (M3).
     out.push_str("#[allow(dead_code)]\nunsafe extern \"C\" fn noop_raw_service(_req: *const u8, _req_len: usize, _resp: *mut u8, _resp_cap: usize, resp_len: *mut usize, _context: *mut core::ffi::c_void) -> bool {\n");
     out.push_str("    if !resp_len.is_null() { unsafe { *resp_len = 0; } }\n");
     out.push_str("    true\n");
@@ -2778,8 +2780,10 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                     out.push(format!(
                         "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
                     ));
+                    // Phase 189.M1 entity builder (the `clone` tier) — no
+                    // more `register_subscription_raw_with_qos_sized_on`.
                     out.push(format!(
-                        "    let handle_{callback_index} = executor.register_subscription_raw_with_qos_sized_on::<1024>(node_handle_{callback_index}, {topic:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::default().keep_last(1), noop_raw_subscription, core::ptr::null_mut())?;\n",
+                        "    let handle_{callback_index} = executor.node_mut(node_handle_{callback_index}).subscription({topic:?}).generic({type_name:?}, {type_hash:?}).qos(nros::QosSettings::default().keep_last(1)).rx_buffer::<1024>().build(|_data: &[u8]| {{}})?;\n",
                         topic = resolved_name,
                         type_name = interface_type_name(interface),
                         type_hash = interface_type_hash(interface),
