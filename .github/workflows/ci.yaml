@@ -53,8 +53,10 @@ jobs:
           -p nros-cli-core -p nros-cli -p nros-codegen-c -p colcon-nano-ros
           -- --check
 
+      # +stable explicitly: the nightly toolchain (installed for rustfmt) becomes
+      # the rustup default, and it has no clippy component.
       - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo +stable clippy --workspace -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo +stable test --workspace
