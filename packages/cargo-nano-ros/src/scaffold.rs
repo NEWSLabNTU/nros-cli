@@ -398,6 +398,8 @@ fn write_default_config_toml(dir: &Path) -> Result<()> {
 [node]
 domain_id = 0
 
+# CONFIGURE ME: these defaults target QEMU slirp (10.0.2.0/24, gateway/router
+# at 10.0.2.2). Set ip/gateway/locator to your board's network + zenoh router.
 [[transport]]
 kind    = "ethernet"
 ip      = "10.0.2.20/24"
