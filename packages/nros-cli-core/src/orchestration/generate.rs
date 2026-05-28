@@ -4,7 +4,7 @@
 //! Agent A owns the final plan schema; generated package `build.rs` is the
 //! host-side adapter that will be tightened once that schema lands.
 
-use eyre::{Context, Result};
+use eyre::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
     fs,
@@ -116,7 +116,15 @@ pub fn generate_package(options: &GenerateOptions) -> Result<GeneratedPackage> {
             )?;
         }
     } else {
-        write_if_changed(&src_dir.join("main.rs"), &render_main(&plan))?;
+        // Phase 172 flip: every supported platform routes through the entry
+        // lib (Zephyr above; all others via `emits_entry_lib`). A plan that
+        // reaches here has an unsupported board/target the planner should have
+        // rejected.
+        bail!(
+            "unsupported board/target for code generation: {} / {}",
+            plan.build.board,
+            plan.build.target
+        );
     }
     if let Some(cargo_config) = cargo_config {
         let cargo_dir = options.output_dir.join(".cargo");
@@ -220,100 +228,18 @@ fn render_build_dependencies(plan: &NrosPlan) -> String {
     }
 }
 
-/// Phase 173.2b — crate-root preamble shared by every generated
-/// `src/main.rs`: the `nros_generated` include module plus the two
-/// always-present `use`s. Board-specific crate-root items
-/// (`crate_root_extra`) and the no_std/no_main attrs are layered on by
-/// `render_main`.
-const MAIN_PREAMBLE: &str = "\
-mod nros_generated {
-    core::include!(core::concat!(core::env!(\"OUT_DIR\"), \"/nros_generated.rs\"));
+/// Phase 172 WP-B — the generated package's Rust crate identifier (its `[lib]`
+/// name): the package name with every non-alphanumeric char folded to `_`.
+fn crate_ident(package_name: &str) -> String {
+    package_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
-use nros::prelude::*;";
-
-/// Phase 173.2b — the `run_system` helper, emitted verbatim into every
-/// non-Zephyr `src/main.rs` (formerly `main.rs.jinja` lines 49-78). It is
-/// platform-agnostic: each entry shape just builds an `ExecutorConfig`
-/// and hands it to `run_system`.
-const RUN_SYSTEM: &str = "\
-fn run_system(config: ExecutorConfig<'_>) -> core::result::Result<(), nros::NodeError> {
-    run_executor(nros_generated::build_executor(&config)?)
-}
-
-fn run_executor(mut executor: Executor) -> core::result::Result<(), nros::NodeError> {
-    // Phase 172 WP-B — registration moved into the entry lib
-    // (`nros_generated::register_all`), the unit the entry-lib C ABI wraps;
-    // the per-platform entry now only opens + spins.
-    nros_generated::register_all(&mut executor)?;
-
-    #[cfg(feature = \"std\")]
-    return executor.spin_blocking(SpinOptions::default());
-
-    #[cfg(not(feature = \"std\"))]
-    executor.spin_default()
-}";
-
-/// Phase 173.5 — bridge entry helper, emitted only in bridge mode. Opens
-/// every declared transport's RMW session via `Executor::open_multi`,
-/// then runs the same post-open flow as `run_system`.
-const RUN_SYSTEM_BRIDGE: &str = "\
-fn run_system_bridge() -> core::result::Result<(), nros::NodeError> {
-    run_executor(nros_generated::build_executor_bridge()?)
-}";
-
-/// Phase 173.2b — render the generated `src/main.rs` from the resolved
-/// `profile()`, replacing the static `main.rs.jinja` (which shipped every
-/// platform's `#[cfg(feature = \"platform-X\")]` entry block). One entry
-/// shape is chosen by the profile's `board_entry`:
-///
-/// * `None` — hosted native/posix `fn main` that builds
-///   `ExecutorConfig::from_env()` (std) / `default_const()` (no_std) and
-///   calls `run_system`.
-/// * `Some(entry)` — `<board>::run(<board>::Config::default(), closure)`
-///   where the closure threads the board `Config` into `ExecutorConfig`.
-///   no_std/no_main is emitted when the entry is a bare-metal `BoardRun`
-///   (threadx-linux is a `HostedMain` board host and stays std).
-///
-/// The `nros-orchestration` import is unused on Zephyr's staticlib path,
-/// so this is only invoked for the binary-crate (`main.rs`) platforms.
-/// Parse `"10.0.2.50/24"` (or bare `"10.0.2.50"`, prefix defaults 24)
-/// into octets + prefix. `None` on malformed input.
-fn parse_ipv4_cidr(s: &str) -> Option<([u8; 4], u8)> {
-    let (addr, prefix) = s.split_once('/').unwrap_or((s, "24"));
-    let prefix: u8 = prefix.parse().ok()?;
-    let mut octets = [0u8; 4];
-    let mut n = 0;
-    for part in addr.split('.') {
-        if n == 4 {
-            return None;
-        }
-        octets[n] = part.parse().ok()?;
-        n += 1;
-    }
-    (n == 4).then_some((octets, prefix))
-}
-
-/// Parse `"02:00:00:00:00:01"` (colon- or dash-separated hex) into 6
-/// octets. `None` on malformed input.
-fn parse_mac(s: &str) -> Option<[u8; 6]> {
-    let mut octets = [0u8; 6];
-    let mut n = 0;
-    for part in s.split([':', '-']) {
-        if n == 6 {
-            return None;
-        }
-        octets[n] = u8::from_str_radix(part, 16).ok()?;
-        n += 1;
-    }
-    (n == 6).then_some(octets)
-}
-
-/// Phase 173.5 / 172.J — the `BoardTransportConfig` setter calls the
-/// generated `apply_transport_config` emits, derived from `[[transport]]`:
-/// a static ethernet `ip` → `set_ipv4`, `mac` → `set_mac`, `gateway` →
-/// `set_gateway`, a serial `baudrate` → `set_baudrate`. `dhcp` and
-/// missing/malformed values emit nothing.
+/// The `c.set_*` board-`Config` setter calls derived from `[[transport]]`
+/// (Phase 173.5/.K.4) — IP/MAC/gateway/baud/wifi. Empty ⇒ no transport
+/// override (the board uses its `Config::default()`).
 fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
     let mut calls = Vec::new();
     for t in &build.transports {
@@ -341,8 +267,6 @@ fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
         if let Some(baud) = t.baudrate {
             calls.push(format!("    c.set_baudrate({baud});"));
         }
-        // Phase 172.K.4 — wifi credentials. `{:?}` quotes + escapes the string
-        // literal for the generated Rust.
         if let Some(ssid) = t.ssid.as_deref() {
             calls.push(format!("    c.set_ssid({ssid:?});"));
         }
@@ -353,11 +277,38 @@ fn transport_config_setter_calls(build: &PlanBuildOptions) -> Vec<String> {
     calls
 }
 
-/// Whether the generator emits an `apply_transport_config` fn + the
-/// board-entry mutation: only for `NanoRosOwned` board platforms (the
-/// board owns the net stack) that declare a static IP or baud. RtosOwned
-/// targets route IP into a config fragment instead (Phase 173.7); hosted
-/// (posix) has no board `Config`.
+/// Parse `a.b.c.d[/prefix]` (default /24) into octets + prefix.
+fn parse_ipv4_cidr(s: &str) -> Option<([u8; 4], u8)> {
+    let (addr, prefix) = s.split_once('/').unwrap_or((s, "24"));
+    let prefix: u8 = prefix.parse().ok()?;
+    let mut octets = [0u8; 4];
+    let mut n = 0;
+    for part in addr.split('.') {
+        if n == 4 {
+            return None;
+        }
+        octets[n] = part.parse().ok()?;
+        n += 1;
+    }
+    (n == 4).then_some((octets, prefix))
+}
+
+/// Parse a `:`/`-`-separated 6-octet MAC.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut octets = [0u8; 6];
+    let mut n = 0;
+    for part in s.split([':', '-']) {
+        if n == 6 {
+            return None;
+        }
+        octets[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    (n == 6).then_some(octets)
+}
+
+/// Whether the board owns the net stack + the plan carries transport config to
+/// bake into its `Config` (drives the shim's `apply_transport_config` call).
 fn emits_transport_config_override(plan: &NrosPlan) -> bool {
     let Some(p) = profile(&plan.build.board, &plan.build.target) else {
         return false;
@@ -365,87 +316,6 @@ fn emits_transport_config_override(plan: &NrosPlan) -> bool {
     p.board_entry.is_some()
         && p.net_stack == NetStack::NanoRosOwned
         && !transport_config_setter_calls(&plan.build).is_empty()
-}
-
-fn render_main(plan: &NrosPlan) -> String {
-    let profile = profile(&plan.build.board, &plan.build.target);
-    let board_entry = profile.and_then(|p| p.board_entry);
-    let no_std = matches!(
-        profile,
-        Some(PlatformProfile {
-            entry_kind: EntryKind::BoardRun,
-            board_entry: Some(_),
-            ..
-        })
-    );
-
-    let mut out = String::new();
-    if no_std {
-        out.push_str("#![no_std]\n#![no_main]\n\n");
-    }
-    out.push_str(MAIN_PREAMBLE);
-    out.push('\n');
-
-    if let Some(entry) = board_entry
-        && !entry.crate_root_extra.is_empty()
-    {
-        out.push('\n');
-        out.push_str(entry.crate_root_extra);
-        out.push('\n');
-    }
-
-    out.push('\n');
-    out.push_str(RUN_SYSTEM);
-    out.push('\n');
-
-    let bridge = plan.build.is_bridge();
-    if bridge {
-        out.push('\n');
-        out.push_str(RUN_SYSTEM_BRIDGE);
-        out.push('\n');
-    }
-
-    let apply_config = emits_transport_config_override(plan);
-
-    out.push('\n');
-    match board_entry {
-        None => out.push_str(if bridge {
-            HOSTED_MAIN_BRIDGE
-        } else {
-            HOSTED_MAIN
-        }),
-        Some(entry) => out.push_str(&render_board_entry(&entry, bridge, apply_config)),
-    }
-    out.push('\n');
-
-    out
-}
-
-/// Hosted native/posix entry (formerly `main.rs.jinja` lines 88-95).
-const HOSTED_MAIN: &str = "\
-fn main() -> core::result::Result<(), nros::NodeError> {
-    #[cfg(feature = \"std\")]
-    let config = ExecutorConfig::from_env().node_name(nros_generated::SYSTEM.default_node_name());
-    #[cfg(not(feature = \"std\"))]
-    let config =
-        ExecutorConfig::default_const().node_name(nros_generated::SYSTEM.default_node_name());
-    run_system(config)
-}";
-
-/// Phase 173.5 — hosted bridge entry: the per-transport sessions come
-/// from `SESSION_SPECS`, so the `ExecutorConfig` is bypassed entirely.
-const HOSTED_MAIN_BRIDGE: &str = "\
-fn main() -> core::result::Result<(), nros::NodeError> {
-    run_system_bridge()
-}";
-
-/// Phase 172 WP-B — the generated package's Rust crate identifier (its `[lib]`
-/// name): the package name with every non-alphanumeric char folded to `_`.
-fn crate_ident(package_name: &str) -> String {
-    package_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 /// Phase 172 WP-B — the system identifier in the entry-lib C ABI symbol prefix
@@ -467,9 +337,6 @@ fn system_ident(plan: &NrosPlan) -> String {
 /// boots. Board, Zephyr, no_std-hosted, and bridge entries keep their current
 /// emitter until later WP-B slices generalize the lib + add the source form.
 fn emits_entry_lib(plan: &NrosPlan) -> bool {
-    if plan.build.is_bridge() {
-        return false;
-    }
     match profile(&plan.build.board, &plan.build.target) {
         // Hosted `self`: the std entry lib + a hosted shim.
         Some(p) if p.entry_kind == EntryKind::HostedMain => uses_std(&plan.build),
@@ -514,11 +381,15 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
     // Re-export the wiring the board `self` shim needs (`TRANSPORT_LOCATOR`
     // for the baked locator; `apply_transport_config` when the board owns the
     // net stack) alongside the core API.
-    let reexports = if emits_transport_config_override(plan) {
-        "SYSTEM, TRANSPORT_LOCATOR, apply_transport_config, build_executor, register_all"
-    } else {
-        "SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all"
-    };
+    let mut reexports = String::from("SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all");
+    if emits_transport_config_override(plan) {
+        reexports.push_str(", apply_transport_config");
+    }
+    // Bridge mode: the open_multi path uses `build_executor_bridge` (no
+    // ExecutorConfig; sessions come from baked SESSION_SPECS).
+    if plan.build.is_bridge() {
+        reexports.push_str(", build_executor_bridge");
+    }
     out.push_str(&format!("pub use nros_generated::{{{reexports}}};\n\n"));
 
     if !c_abi {
@@ -601,8 +472,27 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
 /// Phase 172 WP-B — the thin `self` startup shim `src/main.rs`: opens +
 /// registers the system through the entry lib, then spins. All wiring lives in
 /// `lib.rs`; the shim only exists so a `self` deploy produces a runnable binary.
-fn render_hosted_shim_main(options: &GenerateOptions, _plan: &NrosPlan) -> String {
+fn render_hosted_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String {
     let krate = crate_ident(&options.package_name);
+    // Bridge: the open_multi path opens sessions from baked SESSION_SPECS —
+    // no `ExecutorConfig`. Same cfg-gated spin as the non-bridge shim.
+    if plan.build.is_bridge() {
+        return format!(
+            "//! Generated bridge `self` startup shim (Phase 172 entry-lib). The entry\n\
+             //! lib's `build_executor_bridge` opens every SESSION_SPEC; we just\n\
+             //! register + spin.\n\n\
+             use nros::prelude::*;\n\
+             use {krate}::{{build_executor_bridge, register_all}};\n\n\
+             fn main() -> core::result::Result<(), nros::NodeError> {{\n\
+             \x20   let mut executor = build_executor_bridge()?;\n\
+             \x20   register_all(&mut executor)?;\n\
+             \x20   #[cfg(feature = \"std\")]\n\
+             \x20   return executor.spin_blocking(SpinOptions::default());\n\
+             \x20   #[cfg(not(feature = \"std\"))]\n\
+             \x20   executor.spin_default()\n\
+             }}\n"
+        );
+    }
     // The std / no_std splits are cfg-gated like the legacy `HOSTED_MAIN`, so
     // a single shim covers std-hosted (native/posix), BoardRun-with-no-board-
     // entry (nuttx, orin-spe — they boot via libc `main` but compile no_std at
@@ -665,6 +555,7 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
         .and_then(|p| p.board_entry)
         .expect("render_board_shim_main: board_entry present (gated by emits_entry_lib)");
     let apply_config = emits_transport_config_override(plan);
+    let bridge = plan.build.is_bridge();
     let cfg_expr = if apply_config {
         format!(
             "{{\n            let mut cfg = {b}::Config::default();\n\
@@ -684,9 +575,12 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
          //! spins via the entry lib (`lib.rs`).\n\n",
     );
     out.push_str("use nros::prelude::*;\n");
-    out.push_str(&format!(
-        "use {krate}::{{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all}};\n"
-    ));
+    let imports = if bridge {
+        format!("use {krate}::{{build_executor_bridge, register_all}};\n")
+    } else {
+        format!("use {krate}::{{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all}};\n")
+    };
+    out.push_str(&imports);
     if !entry.crate_root_extra.is_empty() {
         out.push_str(entry.crate_root_extra);
         out.push('\n');
@@ -697,18 +591,32 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
         out.push('\n');
     }
     out.push_str(entry.signature);
-    out.push_str(&format!(
-        " {{\n    {b}::run(\n        {cfg_expr},\n        |board_config| -> core::result::Result<(), nros::NodeError> {{\n\
-         \x20           let config = ExecutorConfig::new(TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n\
-         \x20               .domain_id(board_config.domain_id)\n\
-         \x20               .node_name(SYSTEM.default_node_name()){extra};\n\
-         \x20           let mut executor = build_executor(&config)?;\n\
-         \x20           register_all(&mut executor)?;\n\
-         \x20           executor.spin_default()\n\
-         \x20       }},\n    )\n}}\n",
-        b = entry.crate_name,
-        extra = entry.closure_extra,
-    ));
+    if bridge {
+        // Bridge mode: hardware bring-up via `<board>::run`, then the entry
+        // lib's `build_executor_bridge` opens every SESSION_SPEC; the per-run
+        // ExecutorConfig is unused.
+        out.push_str(&format!(
+            " {{\n    {b}::run(\n        {cfg_expr},\n        |_board_config| -> core::result::Result<(), nros::NodeError> {{\n\
+             \x20           let mut executor = build_executor_bridge()?;\n\
+             \x20           register_all(&mut executor)?;\n\
+             \x20           executor.spin_default()\n\
+             \x20       }},\n    )\n}}\n",
+            b = entry.crate_name,
+        ));
+    } else {
+        out.push_str(&format!(
+            " {{\n    {b}::run(\n        {cfg_expr},\n        |board_config| -> core::result::Result<(), nros::NodeError> {{\n\
+             \x20           let config = ExecutorConfig::new(TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n\
+             \x20               .domain_id(board_config.domain_id)\n\
+             \x20               .node_name(SYSTEM.default_node_name()){extra};\n\
+             \x20           let mut executor = build_executor(&config)?;\n\
+             \x20           register_all(&mut executor)?;\n\
+             \x20           executor.spin_default()\n\
+             \x20       }},\n    )\n}}\n",
+            b = entry.crate_name,
+            extra = entry.closure_extra,
+        ));
+    }
     out
 }
 
@@ -769,48 +677,6 @@ fn render_entry_cmake(options: &GenerateOptions, plan: &NrosPlan) -> String {
          target_link_libraries({sys}_entry INTERFACE {krate})\n\
          target_include_directories({sys}_entry INTERFACE \"${{CMAKE_CURRENT_LIST_DIR}}/include\")\n"
     )
-}
-
-/// Render the `<board>::run(..)` entry for a board-driven platform. The
-/// `ExecutorConfig` builder chain is identical across boards apart from
-/// the board crate name and the per-board `closure_extra` suffix.
-fn render_board_entry(entry: &BoardEntry, bridge: bool, apply_config: bool) -> String {
-    let mut out = String::new();
-    if !entry.comment.is_empty() {
-        out.push_str(entry.comment);
-        out.push('\n');
-    }
-    out.push_str(entry.signature);
-    out.push_str(" {\n");
-
-    // The board `Config` handed to `run`: either a plain default, or a
-    // default with the nros.toml transport IP / baud applied (NanoRosOwned
-    // — Phase 173.5). Either way `run` drives hardware init from it.
-    let cfg_expr = if apply_config {
-        format!(
-            "{{\n            let mut cfg = {crate}::Config::default();\n            nros_generated::apply_transport_config(&mut cfg);\n            cfg\n        }}",
-            crate = entry.crate_name,
-        )
-    } else {
-        format!("{crate}::Config::default()", crate = entry.crate_name)
-    };
-
-    if bridge {
-        // Bridge mode: the board `run` still drives hardware init, but the
-        // sessions come from `SESSION_SPECS` via `run_system_bridge` — the
-        // single-session `ExecutorConfig` is unused.
-        out.push_str(&format!(
-            "    {crate}::run(\n        {cfg_expr},\n        |_board_config| {{\n            run_system_bridge()\n        }},\n    )\n}}",
-            crate = entry.crate_name,
-        ));
-    } else {
-        out.push_str(&format!(
-            "    {crate}::run(\n        {cfg_expr},\n        |board_config| {{\n            let config = ExecutorConfig::new(nros_generated::TRANSPORT_LOCATOR.unwrap_or(board_config.zenoh_locator))\n                .domain_id(board_config.domain_id)\n                .node_name(nros_generated::SYSTEM.default_node_name()){extra};\n            run_system(config)\n        }},\n    )\n}}",
-            crate = entry.crate_name,
-            extra = entry.closure_extra,
-        ));
-    }
-    out
 }
 
 fn render_zephyr_cmake(options: &GenerateOptions) -> String {
@@ -3406,6 +3272,45 @@ mod net_fragment_tests {
         assert!(
             !lib.contains("nros_demo_build_executor"),
             "no C-ABI fns:\n{lib}"
+        );
+    }
+
+    #[test]
+    fn bridge_routes_through_entry_lib_via_build_executor_bridge() {
+        // A bridge (>1 transport) routes through the entry lib: the lib
+        // re-exports `build_executor_bridge` and the shim opens via it (no
+        // per-run ExecutorConfig — sessions come from baked SESSION_SPECS).
+        let mut plan = plan_with_param_persistence(None);
+        plan.build = build_with(vec![
+            serde_json::from_value(serde_json::json!({ "kind": "ethernet", "rmw": "zenoh" }))
+                .unwrap(),
+            serde_json::from_value(serde_json::json!({ "kind": "ethernet", "rmw": "cyclonedds" }))
+                .unwrap(),
+        ]);
+        assert!(plan.build.is_bridge(), "two transports ⇒ bridge");
+        assert!(
+            emits_entry_lib(&plan),
+            "bridge routes through the entry lib"
+        );
+
+        let lib = render_entry_lib_rs(&plan);
+        assert!(
+            lib.contains(", build_executor_bridge}"),
+            "bridge lib re-exports build_executor_bridge:\n{lib}"
+        );
+
+        let opts = GenerateOptions {
+            package_name: "demo".into(),
+            output_dir: PathBuf::from("/x"),
+            plan_path: PathBuf::from("/x/nros-plan.json"),
+            nros_path: PathBuf::from("/n"),
+            nros_orchestration_path: PathBuf::from("/no"),
+            component_workspace: None,
+        };
+        let shim = render_hosted_shim_main(&opts, &plan);
+        assert!(
+            shim.contains("build_executor_bridge()") && !shim.contains("from_env"),
+            "bridge shim opens via build_executor_bridge, no per-run config:\n{shim}"
         );
     }
 
