@@ -18,6 +18,7 @@ pub fn run(cmd: cmd::Cmd) -> Result<()> {
         cmd::Cmd::New(args) => cmd::new::run(args),
         cmd::Cmd::Generate(args) => cmd::generate::run(args),
         cmd::Cmd::GenerateRust(args) => cmd::generate::run_rust(args),
+        cmd::Cmd::Codegen(args) => cmd::codegen::run(args),
         cmd::Cmd::Metadata(args) => cmd::metadata::run(args),
         cmd::Cmd::Plan(args) => cmd::plan::run(args),
         cmd::Cmd::Check(args) => cmd::check::run(args),

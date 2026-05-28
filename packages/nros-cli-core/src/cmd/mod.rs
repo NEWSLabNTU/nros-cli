@@ -12,6 +12,7 @@ use clap::Subcommand;
 pub mod board;
 pub mod build;
 pub mod check;
+pub mod codegen;
 pub mod completions;
 pub mod config;
 pub mod deploy;
@@ -41,6 +42,11 @@ pub enum Cmd {
     /// Generate Rust message bindings from `package.xml`
     #[command(name = "generate-rust")]
     GenerateRust(generate::RustArgs),
+
+    /// Build-tool C/C++ binding generation (`--args-file` / `resolve-deps`).
+    /// The interface the cmake / build.rs consumers speak (Phase 195.A — folds
+    /// in the former standalone `nros-codegen` binary).
+    Codegen(codegen::Args),
 
     /// Collect component source metadata for orchestration planning
     Metadata(metadata::Args),
