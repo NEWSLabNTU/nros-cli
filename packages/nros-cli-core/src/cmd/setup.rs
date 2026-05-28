@@ -5,7 +5,7 @@
 //!
 //! See `docs/design/nros-setup-toolchain-management.md`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 use eyre::{Result, WrapErr, bail};
@@ -120,6 +120,76 @@ pub fn run(args: Args) -> Result<()> {
         eprintln!("nros setup: {board} — all packages already present");
     }
     Ok(())
+}
+
+/// Phase 187.6 — lazy install for `nros build` / `nros deploy`: resolve the
+/// board's index tools and install any not already in the store, so a first
+/// build/deploy needs no separate `nros setup` (the PlatformIO auto-install
+/// ergonomic). Only `[tool.*]` packages are installed; `[source.*]` build with
+/// the app and `[gated.*]` are user-provided. Opt out with `NROS_NO_AUTO_SETUP`.
+/// No-op (Ok) when no index is found; an unavailable tool warns rather than
+/// fails so the downstream build surfaces the real miss (e.g. a system-installed
+/// toolchain the index doesn't host).
+pub fn ensure_tools(board: &str, target: Option<&str>, workspace: Option<&Path>) -> Result<()> {
+    if std::env::var_os("NROS_NO_AUTO_SETUP").is_some() {
+        return Ok(());
+    }
+    let Some(index_path) = locate_index(workspace) else {
+        return Ok(());
+    };
+    let index = SdkIndex::load(&index_path)?;
+    let host = host_key();
+    let root = store_root();
+    let lock_path = PathBuf::from("nros-sdk.lock");
+    let mut lock = SdkLock::load(&lock_path)?;
+    let mut installed = false;
+
+    for name in resolve_packages(board, target) {
+        let Some(tool) = index.tool.get(name) else {
+            continue; // source / gated / not-in-index — not a store tool
+        };
+        let prefix = tool_prefix(&root, name, &tool.version);
+        match plan_install(tool, &host, &prefix) {
+            InstallAction::Present => {}
+            InstallAction::Unavailable => {
+                eprintln!(
+                    "nros: {name} {} unavailable for {host} (no prebuilt, no source) — \
+                     install it yourself if the build needs it",
+                    tool.version
+                );
+            }
+            action => {
+                eprintln!(
+                    "nros: auto-installing {name} {} (set NROS_NO_AUTO_SETUP to skip)",
+                    tool.version
+                );
+                let prov = execute(&action, name, &tool.version, &prefix)
+                    .wrap_err_with(|| format!("auto-setup {name} {}", tool.version))?;
+                lock.record(name, &prov);
+                installed = true;
+                eprintln!("    → {}", prefix.display());
+            }
+        }
+    }
+    if installed {
+        lock.save(&lock_path)?;
+    }
+    Ok(())
+}
+
+/// Locate the SDK index for auto-setup: cwd, then the passed workspace, then
+/// `$NROS_WORKSPACE`. `None` ⇒ auto-setup is a no-op (not every build runs near
+/// a nano-ros workspace).
+fn locate_index(workspace: Option<&Path>) -> Option<PathBuf> {
+    let cwd = PathBuf::from("nros-sdk-index.toml");
+    if cwd.is_file() {
+        return Some(cwd);
+    }
+    let ws = workspace
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("NROS_WORKSPACE").map(PathBuf::from));
+    ws.map(|w| w.join("nros-sdk-index.toml"))
+        .filter(|p| p.is_file())
 }
 
 /// One-line description of the planned action (mirrors `disposition`, but for an
@@ -280,6 +350,36 @@ mod tests {
 
         let orin = resolve_packages("orin-spe", Some("armv7r-none-eabihf"));
         assert!(orin.contains(&"arm-none-eabi-gcc") && orin.contains(&"nv-spe-fsp"));
+    }
+
+    #[test]
+    fn locate_index_falls_back_to_workspace() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ws = std::env::temp_dir().join(format!("nros_idx_{n}"));
+        std::fs::create_dir_all(&ws).unwrap();
+        // No index in the workspace yet → None (cwd has none under `cargo test`).
+        assert_eq!(locate_index(Some(&ws)), None);
+        // With one present → resolves to the workspace copy.
+        let idx = ws.join("nros-sdk-index.toml");
+        std::fs::write(&idx, "[tool.qemu]\nversion=\"1\"\n").unwrap();
+        assert_eq!(locate_index(Some(&ws)), Some(idx));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn ensure_tools_noop_without_index() {
+        // No index near a temp workspace ⇒ Ok no-op.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ws = std::env::temp_dir().join(format!("nros_noidx_{n}"));
+        std::fs::create_dir_all(&ws).unwrap();
+        assert!(ensure_tools("native", None, Some(&ws)).is_ok());
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]

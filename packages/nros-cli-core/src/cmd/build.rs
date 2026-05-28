@@ -107,6 +107,10 @@ pub fn run(args: Args) -> Result<()> {
         });
     }
 
+    // Phase 187.6: lazy-install host tools a native build needs (zenohd for the
+    // host router); no-op away from a nano-ros workspace / with NROS_NO_AUTO_SETUP.
+    crate::cmd::setup::ensure_tools("native", None, args.nano_ros_workspace.as_deref())?;
+
     let flavor = detect_flavor(&root)?;
     eprintln!("nros build: flavor = {flavor:?} ({})", root.display());
 

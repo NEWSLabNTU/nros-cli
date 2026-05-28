@@ -1558,6 +1558,10 @@ fn temp_output(name: &str) -> PathBuf {
 /// driver, WP-A `6bdd945`) → plan → compiled entry lib → self-shim binary.
 #[test]
 fn deploy_native_self_from_root_nros_toml() {
+    // Keep the deploy hermetic: don't let Phase 187.6 auto-setup fetch the
+    // board's host tools from the SDK index over the network during the test.
+    // Safe here — nextest runs each test in its own process.
+    unsafe { std::env::set_var("NROS_NO_AUTO_SETUP", "1") };
     let fixture = fixture_workspace();
     // Scope to this deploy's own subdir — a sibling deploy (e.g. zephyr-mod)
     // may build into `build/<name>` concurrently.
@@ -1663,6 +1667,8 @@ fn deploy_zephyr_vendor_module_dry_run_resolves_and_substitutes() {
 /// additionally needs host TAP networking (native_sim `zeth`), out of scope here.
 #[test]
 fn deploy_zephyr_vendor_module_real_west_build() {
+    // Hermetic: no Phase 187.6 auto-setup network fetch during the test.
+    unsafe { std::env::set_var("NROS_NO_AUTO_SETUP", "1") };
     if std::env::var_os("ZEPHYR_BASE").is_none() {
         eprintln!(
             "[SKIPPED] ZEPHYR_BASE not set — run `just zephyr setup` and export \

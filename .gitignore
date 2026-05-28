@@ -175,3 +175,6 @@ log/
 testing_workspaces/*/build/
 testing_workspaces/*/install/
 testing_workspaces/*/log/
+
+# nros setup auto-install lockfile (written in cwd by `nros setup` / auto-setup)
+nros-sdk.lock
