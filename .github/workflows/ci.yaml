@@ -13,6 +13,11 @@ jobs:
   rust-test:
     name: Rust Tests
     runs-on: ubuntu-latest
+    # The Cargo workspace lives in packages/ (no root Cargo.toml — the repo is a
+    # multi-dir layout). Run every cargo step there.
+    defaults:
+      run:
+        working-directory: packages
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,6 +34,8 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages
 
       # rustfmt.toml enables nightly-only options (imports_granularity,
       # format_code_in_doc_comments) — must check with nightly rustfmt.
