@@ -2975,7 +2975,7 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
                     ));
                     out.push(format!(
-                        "    let handle_{callback_index} = executor.register_service_raw_sized_on::<1024, 1024>(node_handle_{callback_index}, {service:?}, {type_name:?}, {type_hash:?}, noop_raw_service, core::ptr::null_mut())?;\n",
+                        "    let handle_{callback_index} = executor.register_service_raw_sized_on::<1024, 1024>(node_handle_{callback_index}, {service:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::services_default(), noop_raw_service, core::ptr::null_mut())?;\n",
                         service = resolved_name,
                         type_name = interface_type_name(interface),
                         type_hash = interface_type_hash(interface),
