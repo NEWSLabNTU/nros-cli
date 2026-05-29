@@ -127,16 +127,29 @@ fn generated_package_writes_manifest_build_script_and_main() {
     // generated `nros_generated` module (emitted into build.rs), not main.rs.
     assert!(build_rs.contains("pub fn build_executor("));
     assert!(build_rs.contains("pub fn register_all("));
+    // W.5.6 — std build with a rust executable component: the tick machinery is
+    // emitted and a per-instance tick entry is registered. The component's `tick`
+    // is driven each spin via `run_tick_loop` between dispatch.
+    assert!(build_rs.contains("static TICK_ENTRIES:"));
+    assert!(build_rs.contains("impl nros::ActionExecutor for GenActionExec"));
+    assert!(build_rs.contains("pub fn run_tick_loop("));
+    assert!(build_rs.contains("executor.spin_once("));
+    assert!(build_rs.contains("as nros::ExecutableComponent>::tick("));
+    assert!(build_rs.contains("TICK_ENTRIES.with("));
 
     // Phase 172 WP-B — native/posix `self` is now the compiled-form entry lib:
     // a thin `src/main.rs` shim over the lib's `build_executor` + `register_all`.
     let main_rs = fs::read_to_string(output_dir.join("src/main.rs")).expect("read main.rs");
     assert!(main_rs.contains("fn main() -> core::result::Result<(), nros::NodeError> {"));
-    assert!(main_rs.contains("use nros_generated_test::{SYSTEM, build_executor, register_all};"));
+    assert!(main_rs.contains(
+        "use nros_generated_test::{SYSTEM, build_executor, register_all, run_tick_loop};"
+    ));
     assert!(main_rs.contains("ExecutorConfig::from_env()"));
     assert!(main_rs.contains("build_executor(&config)?"));
     assert!(main_rs.contains("register_all(&mut executor)?"));
-    assert!(main_rs.contains("spin_blocking(SpinOptions::default())"));
+    // W.5.6 — the std arm spins via the manual tick loop (not plain spin_blocking).
+    assert!(main_rs.contains("return run_tick_loop(&mut executor);"));
+    assert!(!main_rs.contains("spin_blocking(SpinOptions::default())"));
     // The wiring lives in the lib now, not main.
     assert!(!main_rs.contains("nros_generated::register_backends();"));
     assert!(!main_rs.contains("#![no_std]"));
@@ -148,7 +161,7 @@ fn generated_package_writes_manifest_build_script_and_main() {
     // The entry lib re-exports the wiring the self shim / board shim needs
     // (TRANSPORT_LOCATOR rides along for the baked locator).
     assert!(lib_rs.contains(
-        "pub use nros_generated::{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all};"
+        "pub use nros_generated::{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all, run_tick_loop};"
     ));
     // C ABI symbol prefix is the system name (`demo_system`), not the crate.
     assert!(lib_rs.contains("pub extern \"C\" fn nros_demo_system_build_executor("));
