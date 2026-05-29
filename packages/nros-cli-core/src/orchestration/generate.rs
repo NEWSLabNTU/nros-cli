@@ -2391,21 +2391,41 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    out.push(format!(
-                        "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
-                    out.push(format!(
-                        "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
-                    out.push(format!(
-                        "    let handle_{callback_index} = executor.register_service_raw_sized_on::<1024, 1024>(node_handle_{callback_index}, {service:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::services_default(), noop_raw_service, core::ptr::null_mut())?;\n",
-                        service = resolved_name,
-                        type_name = interface_type_name(interface),
-                        type_hash = interface_type_hash(interface),
-                    ));
-                    out.push(format!(
-                        "    handles.set({callback_index}, handle_{callback_index}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
+                    // W.5.3 — a rust executable component on a std target runs its
+                    // service body via a generated `extern "C"` trampoline reading a
+                    // `Box::leak`'d `(state, resolver)` context (raw service callbacks
+                    // can't capture a closure). no_std / non-executable keeps the noop.
+                    if uses_std(&plan.build)
+                        && let Some(comp_path) = rust_executable_component_path(plan, instance)
+                    {
+                        emit_executable_service(
+                            &mut out,
+                            callback_index,
+                            &comp_path,
+                            callback.source_callback.as_str(),
+                            node_id,
+                            resolved_name,
+                            &interface_type_name(interface),
+                            &interface_type_hash(interface),
+                            instance,
+                        );
+                    } else {
+                        out.push(format!(
+                            "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                        out.push(format!(
+                            "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                        out.push(format!(
+                            "    let handle_{callback_index} = executor.register_service_raw_sized_on::<1024, 1024>(node_handle_{callback_index}, {service:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::services_default(), noop_raw_service, core::ptr::null_mut())?;\n",
+                            service = resolved_name,
+                            type_name = interface_type_name(interface),
+                            type_hash = interface_type_hash(interface),
+                        ));
+                        out.push(format!(
+                            "    handles.set({callback_index}, handle_{callback_index}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                    }
                 }
                 Some((
                     node_id,
@@ -2605,6 +2625,70 @@ fn emit_executable_subscription(
         "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut state{idx}, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
     ));
     out.push("    })?;\n".to_string());
+    out.push(format!(
+        "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.3 — a service callback that runs a real `ExecutableComponent` body.
+/// Raw service callbacks are non-capturing `extern "C"` fn pointers, so state +
+/// resolver live behind a `Box::leak`'d `'static` context the trampoline reads
+/// (std/alloc — gated by `uses_std`). The body reads the request via
+/// `ctx.message::<Req>()` and writes the reply via `ctx.reply::<Reply, N>()`.
+#[allow(clippy::too_many_arguments)]
+fn emit_executable_service(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    node_id: &str,
+    service: &str,
+    type_name: &str,
+    type_hash: &str,
+    instance: &PlanInstance,
+) {
+    // Resolver + publishers + `state{idx}` (moved into the boxed context below).
+    emit_executable_prelude(out, idx, comp_path, instance);
+    out.push(format!(
+        "    struct SvcCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+    ));
+    out.push(format!(
+        "    unsafe extern \"C\" fn svc_tramp_{idx}(req: *const u8, req_len: usize, resp: *mut u8, resp_cap: usize, resp_len: *mut usize, ctx: *mut core::ffi::c_void) -> bool {{\n"
+    ));
+    out.push(format!(
+        "        let sctx = unsafe {{ &mut *(ctx as *mut SvcCtx{idx}) }};\n"
+    ));
+    out.push(
+        "        let req_slice = unsafe { core::slice::from_raw_parts(req, req_len) };\n"
+            .to_string(),
+    );
+    out.push(
+        "        let resp_slice = unsafe { core::slice::from_raw_parts_mut(resp, resp_cap) };\n"
+            .to_string(),
+    );
+    out.push("        let mut written = 0usize;\n".to_string());
+    out.push(
+        "        let mut cb_ctx = nros::CallbackCtx::with_reply(req_slice, &sctx.resolver, resp_slice, &mut written);\n"
+            .to_string(),
+    );
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut sctx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("        unsafe { *resp_len = written; }\n".to_string());
+    out.push("        true\n    }\n".to_string());
+    // Box the (state, resolver) into a leaked 'static context the trampoline reads.
+    out.push(format!(
+        "    let svcctx{idx}: *mut core::ffi::c_void = ::std::boxed::Box::into_raw(::std::boxed::Box::new(SvcCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }})) as *mut core::ffi::c_void;\n"
+    ));
+    out.push(format!(
+        "    let svcnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let svcnh_{idx} = executor.node_id_by_name(svcnode_{idx}.node_name, svcnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let handle_{idx} = executor.register_service_raw_sized_on::<1024, 1024>(svcnh_{idx}, {service:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::services_default(), svc_tramp_{idx}, svcctx{idx})?;\n"
+    ));
     out.push(format!(
         "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
     ));

@@ -4,7 +4,7 @@ pub mod talker {
     use nros::{
         CallbackCtx, CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult,
         DeserError, Deserialize, EntityId, ExecutableComponent, NodeId, NodeOptions, RosMessage,
-        SerError, Serialize, TimerDuration,
+        RosService, SerError, Serialize, TimerDuration,
     };
 
     pub struct Component;
@@ -28,6 +28,13 @@ pub mod talker {
                 EntityId::new("sub_echo"),
                 CallbackId::new("cb_echo"),
                 "chatter",
+            )?;
+            // W.5.3 — a service whose body reads the request + writes a reply
+            // (exercises the generated service trampoline + CallbackCtx reply).
+            let _srv = node.create_service_server::<EchoSrv>(
+                EntityId::new("srv_echo"),
+                CallbackId::new("cb_srv"),
+                "echo",
             )?;
             Ok(())
         }
@@ -55,8 +62,22 @@ pub mod talker {
                 if ctx.message::<StringMsg>().is_ok() {
                     *state = state.wrapping_add(10);
                 }
+            } else if callback.as_str() == "cb_srv" {
+                // Service body: read the request, write a reply.
+                let _req = ctx.message::<StringMsg>();
+                let _ = ctx.reply::<StringMsg, 64>(&StringMsg);
             }
         }
+    }
+
+    /// W.5.3 service type for the demo (request + reply are both `StringMsg`).
+    pub struct EchoSrv;
+
+    impl RosService for EchoSrv {
+        type Request = StringMsg;
+        type Reply = StringMsg;
+        const SERVICE_NAME: &'static str = "std_srvs::srv::dds_::Echo_";
+        const SERVICE_HASH: &'static str = "std_srvs/Echo";
     }
 
     pub struct StringMsg;
