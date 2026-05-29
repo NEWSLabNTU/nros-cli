@@ -507,15 +507,21 @@ fn generated_package_registers_service_and_action_callbacks() {
     let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
 
     assert!(build_rs.contains("pub const CALLBACK_COUNT: usize = 2;"));
-    assert!(build_rs.contains("noop_raw_service"));
-    assert!(build_rs.contains("noop_raw_goal"));
-    assert!(build_rs.contains("noop_raw_cancel"));
-    assert!(build_rs.contains("noop_raw_accepted"));
+    // W.5.3/.5 — rust executable component on a std target: service + action emit
+    // real dispatch (trampolines reading a Box::leak'd ctx), not the C-fn-ptr noops.
+    assert!(build_rs.contains("svc_tramp_"));
+    assert!(build_rs.contains("nros::CallbackCtx::with_reply"));
+    assert!(build_rs.contains("goal_tramp_"));
+    assert!(build_rs.contains("cancel_tramp_"));
+    assert!(build_rs.contains("nros::CallbackCtx::with_goal_decision"));
+    assert!(build_rs.contains("nros::CallbackCtx::with_cancel_decision"));
+    assert!(build_rs.contains("as nros::ExecutableComponent>::on_callback"));
     assert!(build_rs.contains("register_service_raw_sized_on::<1024, 1024>"));
     assert!(build_rs.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>"));
-    assert!(build_rs.contains("nros::RawActionServerSpec { node_id: Some(node_handle_1)"));
+    // Accepted stays the noop until the W.5.6 tick hook drives execution.
+    assert!(build_rs.contains("noop_raw_accepted"));
     assert!(build_rs.contains("qos: nros::QosSettings::services_default()"));
-    assert!(build_rs.contains("action_1.handle_id()"));
+    assert!(build_rs.contains(".handle_id()"));
     assert!(!build_rs.contains("unsupported generated callback"));
 }
 

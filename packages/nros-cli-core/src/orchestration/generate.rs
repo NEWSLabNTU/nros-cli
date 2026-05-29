@@ -2435,21 +2435,40 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    out.push(format!(
-                        "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
-                    out.push(format!(
-                        "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
-                    out.push(format!(
-                        "    let action_{callback_index} = executor.register_action_server_raw_sized::<1024, 1024, 1024, 4>(nros::RawActionServerSpec {{ node_id: Some(node_handle_{callback_index}), action_name: {action:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, qos: nros::QosSettings::services_default(), goal_callback: noop_raw_goal, cancel_callback: noop_raw_cancel, accepted_callback: Some(noop_raw_accepted), context: core::ptr::null_mut() }})?;\n",
-                        action = resolved_name,
-                        type_name = interface_type_name(interface),
-                        type_hash = interface_type_hash(interface),
-                    ));
-                    out.push(format!(
-                        "    handles.set({callback_index}, action_{callback_index}.handle_id()).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
+                    // W.5.5 — rust executable component on a std target runs the
+                    // goal/cancel decision bodies; no_std / non-executable keeps the
+                    // noop. (Execution — feedback/result — rides the W.5.6 tick hook.)
+                    if uses_std(&plan.build)
+                        && let Some(comp_path) = rust_executable_component_path(plan, instance)
+                    {
+                        emit_executable_action(
+                            &mut out,
+                            callback_index,
+                            &comp_path,
+                            callback.source_callback.as_str(),
+                            node_id,
+                            resolved_name,
+                            &interface_type_name(interface),
+                            &interface_type_hash(interface),
+                            instance,
+                        );
+                    } else {
+                        out.push(format!(
+                            "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                        out.push(format!(
+                            "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                        out.push(format!(
+                            "    let action_{callback_index} = executor.register_action_server_raw_sized::<1024, 1024, 1024, 4>(nros::RawActionServerSpec {{ node_id: Some(node_handle_{callback_index}), action_name: {action:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, qos: nros::QosSettings::services_default(), goal_callback: noop_raw_goal, cancel_callback: noop_raw_cancel, accepted_callback: Some(noop_raw_accepted), context: core::ptr::null_mut() }})?;\n",
+                            action = resolved_name,
+                            type_name = interface_type_name(interface),
+                            type_hash = interface_type_hash(interface),
+                        ));
+                        out.push(format!(
+                            "    handles.set({callback_index}, action_{callback_index}.handle_id()).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                    }
                 }
                 _ => {
                     out.push(format!(
@@ -2513,11 +2532,17 @@ fn instance_publishers(instance: &PlanInstance) -> Vec<(String, String, String, 
 /// publishers, the publishers created via the builder, and the component
 /// `State`. Both the timer + subscription emitters move `resolver{idx}` +
 /// `state{idx}` into their dispatch closure (no statics, no_std-clean).
+/// `state_mut` controls the mutability of the `state{idx}` binding. Timer/sub
+/// callbacks capture state by `move` into the closure and mutate it in place, so
+/// the captured binding must be `mut`. Service/action move state into a leaked
+/// ctx struct and mutate through a fresh `&mut` field, so the outer binding stays
+/// immutable (declaring it `mut` would warn).
 fn emit_executable_prelude(
     out: &mut Vec<String>,
     idx: usize,
     comp_path: &str,
     instance: &PlanInstance,
+    state_mut: bool,
 ) {
     let pubs = instance_publishers(instance);
     let fields = pubs
@@ -2530,18 +2555,28 @@ fn emit_executable_prelude(
     out.push(format!(
         "    impl nros::PublisherResolver for Resolver{idx} {{\n"
     ));
-    out.push(
-        "        fn publish_raw(&self, entity_id: &str, data: &[u8]) -> nros::ComponentResult<()> {\n"
-            .to_string(),
-    );
-    out.push("            match entity_id {\n".to_string());
-    for (i, (entity_id, ..)) in pubs.iter().enumerate() {
-        out.push(format!(
-            "                {entity_id:?} => self.p{i}.publish_raw(data).map_err(|_| nros::ComponentError::Runtime),\n"
-        ));
+    if pubs.is_empty() {
+        // No publishers on this instance — params unused, prefix to stay
+        // warning-clean and return the unsupported error directly.
+        out.push(
+            "        fn publish_raw(&self, _entity_id: &str, _data: &[u8]) -> nros::ComponentResult<()> {\n"
+                .to_string(),
+        );
+        out.push("            Err(nros::ComponentError::Runtime)\n        }\n    }\n".to_string());
+    } else {
+        out.push(
+            "        fn publish_raw(&self, entity_id: &str, data: &[u8]) -> nros::ComponentResult<()> {\n"
+                .to_string(),
+        );
+        out.push("            match entity_id {\n".to_string());
+        for (i, (entity_id, ..)) in pubs.iter().enumerate() {
+            out.push(format!(
+                "                {entity_id:?} => self.p{i}.publish_raw(data).map_err(|_| nros::ComponentError::Runtime),\n"
+            ));
+        }
+        out.push("                _ => Err(nros::ComponentError::Runtime),\n".to_string());
+        out.push("            }\n        }\n    }\n".to_string());
     }
-    out.push("                _ => Err(nros::ComponentError::Runtime),\n".to_string());
-    out.push("            }\n        }\n    }\n".to_string());
     for (i, (_entity_id, topic, type_name, type_hash, node_id)) in pubs.iter().enumerate() {
         out.push(format!(
             "    let pubnode_{idx}_{i} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
@@ -2562,8 +2597,9 @@ fn emit_executable_prelude(
     out.push(format!(
         "    let resolver{idx} = Resolver{idx} {{ {init} }};\n"
     ));
+    let mut_kw = if state_mut { "mut " } else { "" };
     out.push(format!(
-        "    let mut state{idx} = <{comp_path} as nros::ExecutableComponent>::init();\n"
+        "    let {mut_kw}state{idx} = <{comp_path} as nros::ExecutableComponent>::init();\n"
     ));
 }
 
@@ -2577,7 +2613,7 @@ fn emit_executable_timer(
     period_ms: u64,
     instance: &PlanInstance,
 ) {
-    emit_executable_prelude(out, idx, comp_path, instance);
+    emit_executable_prelude(out, idx, comp_path, instance, true);
     out.push(format!(
         "    let handle_{idx} = executor.register_timer(nros::TimerDuration::from_millis({period_ms}), move || {{\n"
     ));
@@ -2614,7 +2650,7 @@ fn emit_executable_subscription(
     out.push(format!(
         "    let subnh_{idx} = executor.node_id_by_name(subnode_{idx}.node_name, subnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
     ));
-    emit_executable_prelude(out, idx, comp_path, instance);
+    emit_executable_prelude(out, idx, comp_path, instance, true);
     out.push(format!(
         "    let handle_{idx} = executor.node_mut(subnh_{idx}).subscription({topic:?}).generic({type_name:?}, {type_hash:?}).qos(nros::QosSettings::default().keep_last(1)).rx_buffer::<1024>().build(move |data: &[u8]| {{\n"
     ));
@@ -2648,7 +2684,7 @@ fn emit_executable_service(
     instance: &PlanInstance,
 ) {
     // Resolver + publishers + `state{idx}` (moved into the boxed context below).
-    emit_executable_prelude(out, idx, comp_path, instance);
+    emit_executable_prelude(out, idx, comp_path, instance, false);
     out.push(format!(
         "    struct SvcCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
     ));
@@ -2691,6 +2727,83 @@ fn emit_executable_service(
     ));
     out.push(format!(
         "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.5 — an action server whose goal/cancel **decisions** run a real
+/// `ExecutableComponent` body (the execution half — feedback/result — rides the
+/// W.5.6 tick hook, not these trampolines). Goal/cancel are non-capturing
+/// `extern "C"` fn-ptrs, so `(state, resolver)` lives behind a `Box::leak`'d
+/// `'static` `ActionCtx` (std/alloc — `uses_std`-gated). The body sets accept/reject
+/// via `CallbackCtx::set_goal_response` / `set_cancel_response`; the same callback
+/// id serves both phases (the ctx sink kind disambiguates). Accepted stays the
+/// noop until the tick hook drives execution.
+#[allow(clippy::too_many_arguments)]
+fn emit_executable_action(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    node_id: &str,
+    action: &str,
+    type_name: &str,
+    type_hash: &str,
+    instance: &PlanInstance,
+) {
+    emit_executable_prelude(out, idx, comp_path, instance, false);
+    out.push(format!(
+        "    struct ActionCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+    ));
+    // goal-decision trampoline
+    out.push(format!(
+        "    unsafe extern \"C\" fn goal_tramp_{idx}(_goal_id: *const nros::GoalId, goal_data: *const u8, goal_len: usize, ctx: *mut core::ffi::c_void) -> nros::GoalResponse {{\n"
+    ));
+    out.push(format!(
+        "        let actx = unsafe {{ &mut *(ctx as *mut ActionCtx{idx}) }};\n"
+    ));
+    out.push(
+        "        let goal_slice = unsafe { core::slice::from_raw_parts(goal_data, goal_len) };\n"
+            .to_string(),
+    );
+    out.push("        let mut resp = nros::GoalResponse::Reject;\n".to_string());
+    out.push(
+        "        let mut cb_ctx = nros::CallbackCtx::with_goal_decision(goal_slice, &actx.resolver, &mut resp);\n"
+            .to_string(),
+    );
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("        resp\n    }\n".to_string());
+    // cancel-decision trampoline
+    out.push(format!(
+        "    unsafe extern \"C\" fn cancel_tramp_{idx}(_goal_id: *const nros::GoalId, _status: nros::GoalStatus, ctx: *mut core::ffi::c_void) -> nros::CancelResponse {{\n"
+    ));
+    out.push(format!(
+        "        let actx = unsafe {{ &mut *(ctx as *mut ActionCtx{idx}) }};\n"
+    ));
+    out.push("        let mut resp = nros::CancelResponse::Rejected;\n".to_string());
+    out.push(
+        "        let mut cb_ctx = nros::CallbackCtx::with_cancel_decision(&[], &actx.resolver, &mut resp);\n"
+            .to_string(),
+    );
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("        resp\n    }\n".to_string());
+    out.push(format!(
+        "    let actctx{idx}: *mut core::ffi::c_void = ::std::boxed::Box::into_raw(::std::boxed::Box::new(ActionCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }})) as *mut core::ffi::c_void;\n"
+    ));
+    out.push(format!(
+        "    let actnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let actnh_{idx} = executor.node_id_by_name(actnode_{idx}.node_name, actnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let action_{idx} = executor.register_action_server_raw_sized::<1024, 1024, 1024, 4>(nros::RawActionServerSpec {{ node_id: Some(actnh_{idx}), action_name: {action:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, qos: nros::QosSettings::services_default(), goal_callback: goal_tramp_{idx}, cancel_callback: cancel_tramp_{idx}, accepted_callback: Some(noop_raw_accepted), context: actctx{idx} }})?;\n"
+    ));
+    out.push(format!(
+        "    handles.set({idx}, action_{idx}.handle_id()).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
     ));
 }
 

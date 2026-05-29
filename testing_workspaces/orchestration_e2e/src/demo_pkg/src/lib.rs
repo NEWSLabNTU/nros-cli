@@ -2,9 +2,9 @@
 
 pub mod talker {
     use nros::{
-        CallbackCtx, CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult,
-        DeserError, Deserialize, EntityId, ExecutableComponent, NodeId, NodeOptions, RosMessage,
-        RosService, SerError, Serialize, TimerDuration,
+        CallbackCtx, CallbackId, CancelResponse, CdrReader, CdrWriter, ComponentContext,
+        ComponentResult, DeserError, Deserialize, EntityId, ExecutableComponent, GoalResponse,
+        NodeId, NodeOptions, RosAction, RosMessage, RosService, SerError, Serialize, TimerDuration,
     };
 
     pub struct Component;
@@ -36,6 +36,13 @@ pub mod talker {
                 CallbackId::new("cb_srv"),
                 "echo",
             )?;
+            // W.5.5 — an action whose goal/cancel decision bodies run (exercises
+            // the generated action goal/cancel decision trampolines).
+            let _act = node.create_action_server::<EchoAction>(
+                EntityId::new("act_echo"),
+                CallbackId::new("cb_act"),
+                "echo_action",
+            )?;
             Ok(())
         }
     }
@@ -66,6 +73,11 @@ pub mod talker {
                 // Service body: read the request, write a reply.
                 let _req = ctx.message::<StringMsg>();
                 let _ = ctx.reply::<StringMsg, 64>(&StringMsg);
+            } else if callback.as_str() == "cb_act" {
+                // Action goal/cancel decision body: the ctx sink kind selects which
+                // setter applies (one succeeds, the other is a no-op here).
+                let _ = ctx.set_goal_response(GoalResponse::AcceptAndExecute);
+                let _ = ctx.set_cancel_response(CancelResponse::Ok);
             }
         }
     }
@@ -80,6 +92,18 @@ pub mod talker {
         const SERVICE_HASH: &'static str = "std_srvs/Echo";
     }
 
+    /// W.5.5 action type for the demo (goal/result/feedback all `StringMsg`).
+    pub struct EchoAction;
+
+    impl RosAction for EchoAction {
+        type Goal = StringMsg;
+        type Result = StringMsg;
+        type Feedback = StringMsg;
+        const ACTION_NAME: &'static str = "nros_test::action::dds_::Echo_";
+        const ACTION_HASH: &'static str = "nros_test/Echo";
+    }
+
+    #[derive(Default)]
     pub struct StringMsg;
 
     impl Serialize for StringMsg {
