@@ -283,7 +283,25 @@ name = "{name}"
 path = "src/main.rs"
 
 [dependencies]
-{deps}"#
+{deps}
+
+# Phase 204.15 inc 3 — named size/speed profiles so the plain-cargo path honours
+# the same intent as `nros build`'s `[build].optimize` (`cargo build --profile
+# size|speed`), no hand-editing. (panic is left to the target/profile — embedded
+# triples are already abort; host keeps its default.)
+[profile.size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.speed]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+"#
     );
     fs::write(dir.join("Cargo.toml"), cargo_toml)?;
 

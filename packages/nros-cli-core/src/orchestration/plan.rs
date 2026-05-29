@@ -513,6 +513,14 @@ pub struct PlanBuildOptions {
     /// the `optimize` baseline alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo: Option<PlanCargoOverrides>,
+    /// Phase 204.15 (increment 3) — per-layer `[build.cc]` override for the C/C++
+    /// layer. `debug`/`cflags` are exported as `CFLAGS`/`CXXFLAGS` which `cc-rs`
+    /// *appends* to its computed flags (every zenoh-pico/XRCE/net.c/lwIP
+    /// `cc::Build`, no build.rs edit): `debug = true` adds `-g` without disturbing
+    /// the opt level → the C-side of the "debug one layer" case. `opt_level` →
+    /// `NROS_CC_OPT` (build scripts that honor it override their hardcoded opt; 204.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc: Option<PlanCcOverrides>,
     /// Phase 195.C — workspace root, populated at generate time (NOT part of
     /// the plan wire format). Lets `profile()` load board descriptors from
     /// `<workspace>/packages/boards/*/nros-board.toml` so the CLI carries no
@@ -542,6 +550,20 @@ pub struct PlanCargoOverrides {
     pub codegen_units: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panic: Option<serde_json::Value>,
+}
+
+/// Phase 204.15 (increment 3) — `[build.cc]` per-layer override for the C/C++
+/// toolchain. Applied via `CFLAGS`/`CXXFLAGS` env (cc-rs appends) + `NROS_CC_OPT`,
+/// so it reaches every `cc::Build` without a build.rs edit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanCcOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cflags: Vec<String>,
 }
 
 impl PlanBuildOptions {
@@ -624,6 +646,22 @@ mod transport_tests {
         assert!(build.transports.is_empty());
         assert!(!build.is_bridge());
         assert!(build.validate_transports().is_empty());
+    }
+
+    #[test]
+    fn build_cc_override_parses() {
+        // Phase 204.15 inc 3 — `[build.cc]` deserializes; absent ⇒ None.
+        assert!(build_with("").cc.is_none());
+        let json = r#"{
+            "target": "x", "board": "native", "rmw": "zenoh", "profile": "release",
+            "features": [], "cfg": {},
+            "cc": { "debug": true, "opt_level": "s", "cflags": ["-fno-plt"] }
+        }"#;
+        let b: PlanBuildOptions = serde_json::from_str(json).expect("parses");
+        let cc = b.cc.expect("cc present");
+        assert_eq!(cc.debug, Some(true));
+        assert_eq!(cc.opt_level.as_deref(), Some("s"));
+        assert_eq!(cc.cflags, vec!["-fno-plt".to_string()]);
     }
 
     #[test]

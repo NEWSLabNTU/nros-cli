@@ -102,6 +102,34 @@ pub fn build_generated_package(options: &BuildOptions) -> Result<GeneratedPackag
     // against the generated package's overrides.
     cmd.env_remove("RUSTUP_TOOLCHAIN");
 
+    // Phase 204.15 inc 3 — `[build.cc]` fans out to the C/C++ layer via env that
+    // `cc-rs` *appends* to its computed flags (every zenoh-pico/XRCE/net.c/lwIP
+    // `cc::Build`), no build.rs edit. `debug=true` adds `-g` without disturbing
+    // the opt level → the C-side "debug one layer" case (Rust stays stripped via
+    // its profile). `opt_level` → `NROS_CC_OPT` for build scripts that honor it
+    // (204.9). Appended to any inherited CFLAGS/CXXFLAGS.
+    if let Some(cc) = &plan.build.cc {
+        let mut extra: Vec<String> = Vec::new();
+        if cc.debug == Some(true) {
+            extra.push("-g".to_string());
+        }
+        extra.extend(cc.cflags.iter().cloned());
+        if !extra.is_empty() {
+            let suffix = extra.join(" ");
+            for var in ["CFLAGS", "CXXFLAGS"] {
+                let mut v = std::env::var(var).unwrap_or_default();
+                if !v.is_empty() {
+                    v.push(' ');
+                }
+                v.push_str(&suffix);
+                cmd.env(var, v);
+            }
+        }
+        if let Some(opt) = &cc.opt_level {
+            cmd.env("NROS_CC_OPT", opt);
+        }
+    }
+
     let status = cmd
         .status()
         .wrap_err("failed to invoke generated cargo build")?;
