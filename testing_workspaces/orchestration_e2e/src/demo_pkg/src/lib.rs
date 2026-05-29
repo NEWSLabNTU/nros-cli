@@ -22,6 +22,13 @@ pub mod talker {
                 CallbackId::new("cb_timer"),
                 TimerDuration::from_millis(100),
             )?;
+            // W.5.3 — a subscription whose body reads the message (exercises the
+            // generated subscription dispatch + CallbackCtx payload).
+            let _sub = node.create_subscription::<StringMsg>(
+                EntityId::new("sub_echo"),
+                CallbackId::new("cb_echo"),
+                "chatter",
+            )?;
             Ok(())
         }
     }
@@ -43,6 +50,11 @@ pub mod talker {
             if callback.as_str() == "cb_timer" {
                 *state = state.wrapping_add(1);
                 let _ = ctx.publish::<StringMsg, 64>(EntityId::new("pub_chatter"), &StringMsg);
+            } else if callback.as_str() == "cb_echo" {
+                // Read the incoming message (CDR payload) from the ctx.
+                if ctx.message::<StringMsg>().is_ok() {
+                    *state = state.wrapping_add(10);
+                }
             }
         }
     }

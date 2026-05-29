@@ -2351,23 +2351,37 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    out.push(format!(
-                        "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
-                    out.push(format!(
-                        "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
-                    // Phase 189.M1 entity builder (the `clone` tier) — no
-                    // more `register_subscription_raw_with_qos_sized_on`.
-                    out.push(format!(
-                        "    let handle_{callback_index} = executor.node_mut(node_handle_{callback_index}).subscription({topic:?}).generic({type_name:?}, {type_hash:?}).qos(nros::QosSettings::default().keep_last(1)).rx_buffer::<1024>().build(|_data: &[u8]| {{}})?;\n",
-                        topic = resolved_name,
-                        type_name = interface_type_name(interface),
-                        type_hash = interface_type_hash(interface),
-                    ));
-                    out.push(format!(
-                        "    handles.set({callback_index}, handle_{callback_index}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
+                    // W.5.3 — a rust executable component dispatches the message
+                    // into its body (payload = CDR `data`); else the noop builder.
+                    if let Some(comp_path) = rust_executable_component_path(plan, instance) {
+                        emit_executable_subscription(
+                            &mut out,
+                            callback_index,
+                            &comp_path,
+                            callback.source_callback.as_str(),
+                            node_id,
+                            resolved_name,
+                            &interface_type_name(interface),
+                            &interface_type_hash(interface),
+                            instance,
+                        );
+                    } else {
+                        out.push(format!(
+                            "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                        out.push(format!(
+                            "    let node_handle_{callback_index} = executor.node_id_by_name(node_{callback_index}.node_name, node_{callback_index}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                        out.push(format!(
+                            "    let handle_{callback_index} = executor.node_mut(node_handle_{callback_index}).subscription({topic:?}).generic({type_name:?}, {type_hash:?}).qos(nros::QosSettings::default().keep_last(1)).rx_buffer::<1024>().build(|_data: &[u8]| {{}})?;\n",
+                            topic = resolved_name,
+                            type_name = interface_type_name(interface),
+                            type_hash = interface_type_hash(interface),
+                        ));
+                        out.push(format!(
+                            "    handles.set({callback_index}, handle_{callback_index}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                    }
                 }
                 Some((
                     node_id,
@@ -2474,21 +2488,18 @@ fn instance_publishers(instance: &PlanInstance) -> Vec<(String, String, String, 
     pubs
 }
 
-/// W.5.3 — emit a timer callback that runs a real `ExecutableComponent` body.
-/// The move-closure owns the component `State` + a generated `PublisherResolver`
-/// owning the instance's publishers, so the body publishes immediately with no
-/// statics (no_std-clean). Single-callback-per-state model; shared state across
-/// a component's callbacks is a follow-up.
-fn emit_executable_timer(
+/// W.5.3 — emit the shared prelude for an executable callback: a generated
+/// `PublisherResolver` (keyed on source entity ids) owning the instance's
+/// publishers, the publishers created via the builder, and the component
+/// `State`. Both the timer + subscription emitters move `resolver{idx}` +
+/// `state{idx}` into their dispatch closure (no statics, no_std-clean).
+fn emit_executable_prelude(
     out: &mut Vec<String>,
     idx: usize,
     comp_path: &str,
-    callback_id: &str,
-    period_ms: u64,
     instance: &PlanInstance,
 ) {
     let pubs = instance_publishers(instance);
-    // Generated resolver struct + impl owning this callback's publishers.
     let fields = pubs
         .iter()
         .enumerate()
@@ -2511,7 +2522,6 @@ fn emit_executable_timer(
     }
     out.push("                _ => Err(nros::ComponentError::Runtime),\n".to_string());
     out.push("            }\n        }\n    }\n".to_string());
-    // Create each publisher on its owning node.
     for (i, (_entity_id, topic, type_name, type_hash, node_id)) in pubs.iter().enumerate() {
         out.push(format!(
             "    let pubnode_{idx}_{i} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
@@ -2535,11 +2545,61 @@ fn emit_executable_timer(
     out.push(format!(
         "    let mut state{idx} = <{comp_path} as nros::ExecutableComponent>::init();\n"
     ));
+}
+
+/// W.5.3 — a timer callback that runs a real `ExecutableComponent` body (empty
+/// payload). Single-callback-per-state model; shared state is a follow-up.
+fn emit_executable_timer(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    period_ms: u64,
+    instance: &PlanInstance,
+) {
+    emit_executable_prelude(out, idx, comp_path, instance);
     out.push(format!(
         "    let handle_{idx} = executor.register_timer(nros::TimerDuration::from_millis({period_ms}), move || {{\n"
     ));
     out.push(format!(
         "        let mut cb_ctx = nros::CallbackCtx::new(&[], &resolver{idx});\n"
+    ));
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut state{idx}, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("    })?;\n".to_string());
+    out.push(format!(
+        "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.3 — a subscription callback that runs a real `ExecutableComponent` body.
+/// The build closure receives the message CDR `data`, which becomes the
+/// `CallbackCtx` payload (`ctx.message::<M>()` in the body).
+#[allow(clippy::too_many_arguments)]
+fn emit_executable_subscription(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    node_id: &str,
+    topic: &str,
+    type_name: &str,
+    type_hash: &str,
+    instance: &PlanInstance,
+) {
+    out.push(format!(
+        "    let subnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let subnh_{idx} = executor.node_id_by_name(subnode_{idx}.node_name, subnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    emit_executable_prelude(out, idx, comp_path, instance);
+    out.push(format!(
+        "    let handle_{idx} = executor.node_mut(subnh_{idx}).subscription({topic:?}).generic({type_name:?}, {type_hash:?}).qos(nros::QosSettings::default().keep_last(1)).rx_buffer::<1024>().build(move |data: &[u8]| {{\n"
+    ));
+    out.push(format!(
+        "        let mut cb_ctx = nros::CallbackCtx::new(data, &resolver{idx});\n"
     ));
     out.push(format!(
         "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut state{idx}, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
