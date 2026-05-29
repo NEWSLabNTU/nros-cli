@@ -42,6 +42,20 @@ pub struct SdkIndex {
     /// `nros setup <board>`.
     #[serde(default)]
     pub board: BTreeMap<String, BoardEntry>,
+    /// Named source groupings not tied to a single board/rmw (Phase 197.2) —
+    /// e.g. `[reference.px4]`. Consumed by `tools/setup.sh --with-reference`,
+    /// NOT by `nros setup`.
+    #[serde(default)]
+    pub reference: BTreeMap<String, ReferenceEntry>,
+}
+
+/// A named `[reference.*]` source grouping (Phase 197.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceEntry {
+    /// `[source.*]` names this reference set pulls.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 /// An RMW's host package set — the orthogonal RMW axis (Phase 191.6.a).
@@ -52,6 +66,14 @@ pub struct RmwEntry {
     /// side needs — e.g. `["zenohd"]`, `["xrce-agent"]`, `["cyclonedds"]`.
     #[serde(default)]
     pub packages: Vec<String>,
+    /// `[source.*]` names built with the app for this RMW (Phase 197.2). Consumed
+    /// by `tools/setup.sh` (the local dev provisioner), NOT by `nros setup` —
+    /// recorded here so the index is the single source manifest.
+    #[serde(default)]
+    pub build_sources: Vec<String>,
+    /// Opt-in dev `[source.*]` (full upstream repos, for hacking on the RMW).
+    #[serde(default)]
+    pub dev_sources: Vec<String>,
 }
 
 /// A prebuilt host tool: a per-host `dist` map + an optional `source` fallback.
@@ -89,6 +111,15 @@ pub struct BoardEntry {
     /// ESP32-C3 board whose riscv32 toolchain is rustup-managed).
     #[serde(default)]
     pub packages: Vec<String>,
+    /// `[source.*]` names built with the app for this board (Phase 197.2).
+    /// Consumed by `tools/setup.sh`, NOT by `nros setup <board>` (they're
+    /// target-compiled with the app, not host tools) — recorded here so the
+    /// index is the single source manifest.
+    #[serde(default)]
+    pub build_sources: Vec<String>,
+    /// Opt-in dev `[source.*]` (full upstream repos, for in-tree development).
+    #[serde(default)]
+    pub dev_sources: Vec<String>,
 }
 
 /// A prebuilt artifact for one host.
