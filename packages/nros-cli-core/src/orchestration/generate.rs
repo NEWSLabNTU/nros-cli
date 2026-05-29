@@ -198,6 +198,25 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
             ),
         )
         .replace("{{ build_dependencies }}", &render_build_dependencies(plan))
+        .replace("{{ profile_section }}", &render_profile_section(&plan.build))
+}
+
+/// Phase 204.15 — render the generated package's `[profile.release]` from the
+/// `optimize` intent. Writing cargo *profile* fields (not RUSTFLAGS) is the safe
+/// fan-out: it never clobbers an embedded example's `.cargo/config`
+/// `[target] rustflags` (the `-Tlink.x` linker script — RUSTFLAGS env would
+/// replace, not merge). `None`/unknown ⇒ empty (cargo's default release).
+fn render_profile_section(build: &PlanBuildOptions) -> String {
+    let body = match build.optimize.as_deref() {
+        Some("size") => {
+            "opt-level = \"z\"\nlto = \"fat\"\ncodegen-units = 1\nstrip = true\npanic = \"abort\""
+        }
+        Some("speed") => "opt-level = 3\nlto = \"fat\"\ncodegen-units = 1",
+        Some("balanced") => "opt-level = \"s\"",
+        Some("debug") => "opt-level = 1\ndebug = true",
+        _ => return String::new(),
+    };
+    format!("\n[profile.release]\n{body}\n")
 }
 
 /// Phase 126.M5.zephyr — zephyr-lang-rust's
@@ -3711,6 +3730,26 @@ mod net_fragment_tests {
         build.transports = transports;
         build.workspace_root = Some(test_workspace_root());
         build
+    }
+
+    #[test]
+    fn profile_section_fans_out_optimize_intent() {
+        let mut b = build_with(vec![]);
+        // Default (no optimize) → no [profile], cargo's default release.
+        assert_eq!(render_profile_section(&b), "");
+        b.optimize = Some("size".to_string());
+        let s = render_profile_section(&b);
+        assert!(s.contains("[profile.release]"), "{s}");
+        assert!(s.contains("opt-level = \"z\""), "{s}");
+        assert!(s.contains("lto = \"fat\""), "{s}");
+        assert!(s.contains("strip = true"), "{s}");
+        b.optimize = Some("speed".to_string());
+        assert!(render_profile_section(&b).contains("opt-level = 3"));
+        b.optimize = Some("balanced".to_string());
+        assert!(render_profile_section(&b).contains("opt-level = \"s\""));
+        // Unknown intent is inert (no profile), not an error.
+        b.optimize = Some("bogus".to_string());
+        assert_eq!(render_profile_section(&b), "");
     }
 
     fn eth(ip: &str) -> PlanTransport {

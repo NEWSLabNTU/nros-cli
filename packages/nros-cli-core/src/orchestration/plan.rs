@@ -496,6 +496,14 @@ pub struct PlanBuildOptions {
     /// builds) round-trip without an empty `"transports": []`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<PlanTransport>,
+    /// Phase 204.15 — coherent size/speed *intent* (`size` | `speed` |
+    /// `balanced` | `debug`). `nros build` fans it out to RUSTFLAGS (`-C
+    /// opt-level/lto/codegen-units/strip`) on top of the cargo profile, so one
+    /// knob tunes the Rust layer without per-crate `[profile.*]` edits. `None` ⇒
+    /// today's behaviour (profile only). Per-layer overrides + the cc/CMake
+    /// fan-out are tracked follow-ups (204.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<String>,
     /// Phase 195.C — workspace root, populated at generate time (NOT part of
     /// the plan wire format). Lets `profile()` load board descriptors from
     /// `<workspace>/packages/boards/*/nros-board.toml` so the CLI carries no
