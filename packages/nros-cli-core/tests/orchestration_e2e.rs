@@ -1653,7 +1653,11 @@ fn deploy_vendor_lib_real_build_with_stub_lib() {
     unsafe { std::env::set_var("NROS_NO_AUTO_SETUP", "1") };
     // Precondition: host gcc + ar (the link step + stub archive need them).
     for tool in ["gcc", "ar"] {
-        if std::process::Command::new(tool).arg("--version").output().is_err() {
+        if std::process::Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("[SKIPPED] deploy_vendor_lib_real_build_with_stub_lib: `{tool}` not found");
             return;
         }
