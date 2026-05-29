@@ -2529,7 +2529,9 @@ fn emit_executable_timer(
         .map(|(i, _)| format!("p{i}: p{i}_{idx}"))
         .collect::<Vec<_>>()
         .join(", ");
-    out.push(format!("    let resolver{idx} = Resolver{idx} {{ {init} }};\n"));
+    out.push(format!(
+        "    let resolver{idx} = Resolver{idx} {{ {init} }};\n"
+    ));
     out.push(format!(
         "    let mut state{idx} = <{comp_path} as nros::ExecutableComponent>::init();\n"
     ));

@@ -164,7 +164,10 @@ fn generated_package_writes_manifest_build_script_and_main() {
 /// created via the builder, and the dispatch using the *source* callback id.
 #[test]
 fn executable_timer_emits_on_callback_dispatch() {
-    let output_dir = generate_fixture("executable_timer_emits_on_callback_dispatch", "plan_pub_sub.json");
+    let output_dir = generate_fixture(
+        "executable_timer_emits_on_callback_dispatch",
+        "plan_pub_sub.json",
+    );
     let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
 
     // Real dispatch into the component body (replaces the noop tick).
