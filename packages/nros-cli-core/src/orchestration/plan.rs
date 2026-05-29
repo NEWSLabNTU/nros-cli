@@ -504,12 +504,44 @@ pub struct PlanBuildOptions {
     /// fan-out are tracked follow-ups (204.15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optimize: Option<String>,
+    /// Phase 204.15 (increment 2) — per-layer `[build.cargo]` override table.
+    /// Refines the Rust/cargo layer *on top of* the `optimize` baseline
+    /// (precedence: `optimize` baseline → `[build.cargo]` field). Lets a build
+    /// tune one cargo-profile field without disturbing the coherent intent —
+    /// e.g. `optimize = "size"` + `[build.cargo] debug = true, strip = false`
+    /// keeps Rust debuginfo while everything else stays size-tuned. `None` ⇒
+    /// the `optimize` baseline alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo: Option<PlanCargoOverrides>,
     /// Phase 195.C — workspace root, populated at generate time (NOT part of
     /// the plan wire format). Lets `profile()` load board descriptors from
     /// `<workspace>/packages/boards/*/nros-board.toml` so the CLI carries no
     /// baked-in board layout. `None` outside a generate run.
     #[serde(skip)]
     pub workspace_root: Option<std::path::PathBuf>,
+}
+
+/// Phase 204.15 (increment 2) — `[build.cargo]` per-layer override fields. Each
+/// maps to a cargo `[profile.release]` key and, when present, replaces the value
+/// the `optimize` intent produced. Values are kept as raw JSON so `opt_level`
+/// accepts both `3` (number) and `"z"` (string); `lto`/`strip` accept a bool or
+/// string; rendering picks the right TOML literal. Unknown JSON shapes are
+/// dropped at render time (never panic).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanCargoOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_level: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lto: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codegen_units: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panic: Option<serde_json::Value>,
 }
 
 impl PlanBuildOptions {

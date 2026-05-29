@@ -628,7 +628,9 @@ fn schema_build_json(overlays: &[Value]) -> Value {
     let obj = build.as_object_mut().expect("build is an object");
     for overlay in overlays {
         if let Some(Value::Object(b)) = overlay.get("build") {
-            for key in ["target", "board", "rmw", "profile", "features", "cfg", "optimize"] {
+            for key in [
+                "target", "board", "rmw", "profile", "features", "cfg", "optimize", "cargo",
+            ] {
                 if let Some(v) = b.get(key) {
                     obj.insert(key.to_string(), v.clone());
                 }

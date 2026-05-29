@@ -17,8 +17,8 @@ use super::{
         BoardCatalog, BoardDescriptor, EntryKind, LinkKind, NetStack, PlatformKind, Toolchain,
     },
     plan::{
-        LifecycleAutostart, PlanBuildOptions, PlanEntity, PlanInstance, PlanSchedContext,
-        TransportKind,
+        LifecycleAutostart, PlanBuildOptions, PlanCargoOverrides, PlanEntity, PlanInstance,
+        PlanSchedContext, TransportKind,
     },
     schema::{DeadlinePolicy, ParameterValue, SchedClass},
 };
@@ -198,7 +198,10 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
             ),
         )
         .replace("{{ build_dependencies }}", &render_build_dependencies(plan))
-        .replace("{{ profile_section }}", &render_profile_section(&plan.build))
+        .replace(
+            "{{ profile_section }}",
+            &render_profile_section(&plan.build),
+        )
 }
 
 /// Phase 204.15 — render the generated package's `[profile.release]` from the
@@ -207,16 +210,81 @@ fn render_cargo_toml(options: &GenerateOptions, plan: &NrosPlan) -> String {
 /// `[target] rustflags` (the `-Tlink.x` linker script — RUSTFLAGS env would
 /// replace, not merge). `None`/unknown ⇒ empty (cargo's default release).
 fn render_profile_section(build: &PlanBuildOptions) -> String {
-    let body = match build.optimize.as_deref() {
-        Some("size") => {
-            "opt-level = \"z\"\nlto = \"fat\"\ncodegen-units = 1\nstrip = true\npanic = \"abort\""
-        }
-        Some("speed") => "opt-level = 3\nlto = \"fat\"\ncodegen-units = 1",
-        Some("balanced") => "opt-level = \"s\"",
-        Some("debug") => "opt-level = 1\ndebug = true",
-        _ => return String::new(),
+    // Baseline from the `optimize` intent — an ordered (key, TOML-literal) list
+    // so the rendered profile is deterministic.
+    let mut fields: Vec<(&'static str, String)> = match build.optimize.as_deref() {
+        Some("size") => vec![
+            ("opt-level", "\"z\"".into()),
+            ("lto", "\"fat\"".into()),
+            ("codegen-units", "1".into()),
+            ("strip", "true".into()),
+            ("panic", "\"abort\"".into()),
+        ],
+        Some("speed") => vec![
+            ("opt-level", "3".into()),
+            ("lto", "\"fat\"".into()),
+            ("codegen-units", "1".into()),
+        ],
+        Some("balanced") => vec![("opt-level", "\"s\"".into())],
+        Some("debug") => vec![("opt-level", "1".into()), ("debug", "true".into())],
+        // Unknown intent is inert; with no `[build.cargo]` overrides either, the
+        // generated package keeps cargo's default release profile.
+        _ => Vec::new(),
     };
+
+    // Phase 204.15 (increment 2) — merge `[build.cargo]` over the baseline:
+    // replace a baseline field in place (keep its position), else append.
+    if let Some(cargo) = &build.cargo {
+        for (key, value) in cargo_override_fields(cargo) {
+            match fields.iter_mut().find(|(k, _)| *k == key) {
+                Some(slot) => slot.1 = value,
+                None => fields.push((key, value)),
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        return String::new();
+    }
+    let body = fields
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!("\n[profile.release]\n{body}\n")
+}
+
+/// Phase 204.15 (increment 2) — lower a `[build.cargo]` override table to an
+/// ordered list of `(cargo-profile-key, TOML-literal)`. Each present field that
+/// renders to a literal contributes; unrenderable JSON shapes are skipped (never
+/// panic — an out-of-shape value just leaves the baseline untouched).
+fn cargo_override_fields(cargo: &PlanCargoOverrides) -> Vec<(&'static str, String)> {
+    [
+        ("opt-level", &cargo.opt_level),
+        ("lto", &cargo.lto),
+        ("debug", &cargo.debug),
+        ("strip", &cargo.strip),
+        ("codegen-units", &cargo.codegen_units),
+        ("panic", &cargo.panic),
+    ]
+    .into_iter()
+    .filter_map(|(key, v)| {
+        v.as_ref()
+            .and_then(json_to_toml_literal)
+            .map(|lit| (key, lit))
+    })
+    .collect()
+}
+
+/// Render a JSON scalar as a TOML value literal: string→quoted, bool/number→bare.
+/// Non-scalars (array/object/null) yield `None` so the field is dropped.
+fn json_to_toml_literal(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(format!("\"{s}\"")),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// Phase 126.M5.zephyr — zephyr-lang-rust's
@@ -3750,6 +3818,61 @@ mod net_fragment_tests {
         // Unknown intent is inert (no profile), not an error.
         b.optimize = Some("bogus".to_string());
         assert_eq!(render_profile_section(&b), "");
+    }
+
+    #[test]
+    fn build_cargo_overrides_merge_over_optimize_baseline() {
+        use serde_json::json;
+        let mut b = build_with(vec![]);
+
+        // Override alone (no `optimize`) still renders a profile.
+        b.optimize = None;
+        b.cargo = Some(PlanCargoOverrides {
+            opt_level: Some(json!("z")),
+            ..Default::default()
+        });
+        let s = render_profile_section(&b);
+        assert!(s.contains("[profile.release]"), "{s}");
+        assert!(s.contains("opt-level = \"z\""), "{s}");
+
+        // The motivating case (acceptance b, Rust side): size baseline, but keep
+        // debuginfo — `debug = true` + `strip = false` override the size fields
+        // *in place* while the rest of the size profile stays.
+        b.optimize = Some("size".to_string());
+        b.cargo = Some(PlanCargoOverrides {
+            debug: Some(json!(true)),
+            strip: Some(json!(false)),
+            ..Default::default()
+        });
+        let s = render_profile_section(&b);
+        assert!(s.contains("opt-level = \"z\""), "{s}"); // baseline kept
+        assert!(s.contains("lto = \"fat\""), "{s}");
+        assert!(s.contains("strip = false"), "{s}"); // replaced in place
+        assert!(s.contains("debug = true"), "{s}"); // appended
+        // `strip` appears once (replaced, not duplicated).
+        assert_eq!(s.matches("strip =").count(), 1, "{s}");
+
+        // Numeric opt-level renders bare; string stays quoted.
+        b.optimize = None;
+        b.cargo = Some(PlanCargoOverrides {
+            opt_level: Some(json!(3)),
+            codegen_units: Some(json!(16)),
+            lto: Some(json!("thin")),
+            ..Default::default()
+        });
+        let s = render_profile_section(&b);
+        assert!(s.contains("opt-level = 3"), "{s}");
+        assert!(s.contains("codegen-units = 16"), "{s}");
+        assert!(s.contains("lto = \"thin\""), "{s}");
+
+        // Out-of-shape JSON (array) is dropped, not panicked, leaving baseline.
+        b.optimize = Some("balanced".to_string());
+        b.cargo = Some(PlanCargoOverrides {
+            opt_level: Some(json!(["nonsense"])),
+            ..Default::default()
+        });
+        let s = render_profile_section(&b);
+        assert!(s.contains("opt-level = \"s\""), "{s}"); // balanced baseline intact
     }
 
     fn eth(ip: &str) -> PlanTransport {
