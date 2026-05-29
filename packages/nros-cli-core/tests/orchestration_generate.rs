@@ -158,10 +158,12 @@ fn generated_package_writes_manifest_build_script_and_main() {
     assert!(output_dir.join("include/demo_system.h").is_file());
 }
 
-/// Phase 172 W.5.3 — a rust component's timer callback generates a real
-/// `ExecutableComponent::on_callback` dispatch (not the noop `|| {}`): a
-/// generated `PublisherResolver` keyed on the *source* entity id, the publisher
-/// created via the builder, and the dispatch using the *source* callback id.
+/// Phase 172 W.5.3 + W.5.7 — a rust component's timer callback generates a real
+/// `ExecutableComponent::on_callback` dispatch (not the noop `|| {}`). On a std
+/// target the instance shares one `State` across its callbacks via the
+/// per-instance `Rc<RefCell>` shared prelude (`Resolveri0`/`state_i0`); the
+/// resolver is keyed on the *source* entity id and dispatch uses the *source*
+/// callback id.
 #[test]
 fn executable_timer_emits_on_callback_dispatch() {
     let output_dir = generate_fixture(
@@ -177,10 +179,19 @@ fn executable_timer_emits_on_callback_dispatch() {
     );
     assert!(build_rs.contains("nros::CallbackCtx::new"));
     assert!(build_rs.contains("as nros::ExecutableComponent>::init()"));
+    // W.5.7 — per-instance shared state: one `Rc<RefCell<State>>` cloned into the
+    // callback closure, borrowed mutably on dispatch.
+    assert!(
+        build_rs.contains("::std::rc::Rc::new(::core::cell::RefCell::new(")
+            && build_rs.contains("let state_i0 ="),
+        "instance state shared via Rc<RefCell>:\n{build_rs}"
+    );
+    assert!(build_rs.contains("::std::rc::Rc::clone(&state_i0)"));
+    assert!(build_rs.contains(".borrow_mut()"));
     // Generated resolver keyed on the SOURCE entity id (`pub_chatter`), not the
     // plan-prefixed `talker_1/pub_chatter`.
     assert!(
-        build_rs.contains("impl nros::PublisherResolver for Resolver0")
+        build_rs.contains("impl nros::PublisherResolver for Resolveri0")
             && build_rs.contains("\\\"pub_chatter\\\" =>"),
         "resolver keyed on source entity id:\n{build_rs}"
     );

@@ -2310,27 +2310,43 @@ fn render_parameters(out: &mut String, plan: &NrosPlan) {
 fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
     let mut out = Vec::new();
     let mut callback_index = 0usize;
-    for instance in &plan.instances {
-        for callback in &instance.callbacks {
-            match find_callback_entity(
+    let std_build = uses_std(&plan.build);
+    for (inst_idx, instance) in plan.instances.iter().enumerate() {
+        // W.5.7 — a rust executable component on a std target shares one `State`
+        // across all of the instance's callbacks via `Rc<RefCell>` (the per-instance
+        // shared prelude); no_std keeps the per-callback move/noop path (shared
+        // no_std state needs a `'static`, tracked as W.5.8).
+        let comp_path = rust_executable_component_path(plan, instance);
+        let shared = std_build && comp_path.is_some();
+        if shared && instance_has_executable_callback(instance) {
+            emit_shared_prelude(
+                &mut out,
+                inst_idx,
+                comp_path.as_deref().expect("shared implies rust component"),
                 instance,
-                callback.id.as_str(),
-                callback.source_callback.as_str(),
-            ) {
+            );
+        }
+        for callback in &instance.callbacks {
+            // The component matches the *source* CallbackId it declared
+            // (`cb_timer`), not the plan-prefixed id.
+            let cb_id = callback.source_callback.as_str();
+            match find_callback_entity(instance, callback.id.as_str(), cb_id) {
                 Some((_node_id, PlanEntity::Timer { period_ms, .. })) => {
-                    // W.5.3 — a rust component with an `ExecutableComponent` impl
-                    // dispatches a real body; the closure owns the component
-                    // `State` + a resolver owning the instance's publishers (no
-                    // statics, no_std-clean). Non-rust / non-executable timers
-                    // keep the noop tick.
-                    if let Some(comp_path) = rust_executable_component_path(plan, instance) {
+                    if shared {
+                        emit_shared_timer(
+                            &mut out,
+                            callback_index,
+                            inst_idx,
+                            comp_path.as_deref().unwrap(),
+                            cb_id,
+                            *period_ms,
+                        );
+                    } else if let Some(comp_path) = &comp_path {
                         emit_executable_timer(
                             &mut out,
                             callback_index,
-                            &comp_path,
-                            // The component matches the *source* CallbackId it
-                            // declared (`cb_timer`), not the plan-prefixed id.
-                            callback.source_callback.as_str(),
+                            comp_path,
+                            cb_id,
                             *period_ms,
                             instance,
                         );
@@ -2351,14 +2367,24 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    // W.5.3 — a rust executable component dispatches the message
-                    // into its body (payload = CDR `data`); else the noop builder.
-                    if let Some(comp_path) = rust_executable_component_path(plan, instance) {
+                    if shared {
+                        emit_shared_subscription(
+                            &mut out,
+                            callback_index,
+                            inst_idx,
+                            comp_path.as_deref().unwrap(),
+                            cb_id,
+                            node_id,
+                            resolved_name,
+                            &interface_type_name(interface),
+                            &interface_type_hash(interface),
+                        );
+                    } else if let Some(comp_path) = &comp_path {
                         emit_executable_subscription(
                             &mut out,
                             callback_index,
-                            &comp_path,
-                            callback.source_callback.as_str(),
+                            comp_path,
+                            cb_id,
                             node_id,
                             resolved_name,
                             &interface_type_name(interface),
@@ -2391,23 +2417,20 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    // W.5.3 — a rust executable component on a std target runs its
-                    // service body via a generated `extern "C"` trampoline reading a
-                    // `Box::leak`'d `(state, resolver)` context (raw service callbacks
-                    // can't capture a closure). no_std / non-executable keeps the noop.
-                    if uses_std(&plan.build)
-                        && let Some(comp_path) = rust_executable_component_path(plan, instance)
-                    {
-                        emit_executable_service(
+                    // Service bodies need the `Box::leak`'d ctx (raw service
+                    // callbacks can't capture) — std only; no_std / non-executable
+                    // keeps the noop.
+                    if shared {
+                        emit_shared_service(
                             &mut out,
                             callback_index,
-                            &comp_path,
-                            callback.source_callback.as_str(),
+                            inst_idx,
+                            comp_path.as_deref().unwrap(),
+                            cb_id,
                             node_id,
                             resolved_name,
                             &interface_type_name(interface),
                             &interface_type_hash(interface),
-                            instance,
                         );
                     } else {
                         out.push(format!(
@@ -2435,22 +2458,19 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    // W.5.5 — rust executable component on a std target runs the
-                    // goal/cancel decision bodies; no_std / non-executable keeps the
-                    // noop. (Execution — feedback/result — rides the W.5.6 tick hook.)
-                    if uses_std(&plan.build)
-                        && let Some(comp_path) = rust_executable_component_path(plan, instance)
-                    {
-                        emit_executable_action(
+                    // W.5.5 — goal/cancel decision bodies (std only). Execution —
+                    // feedback/result — rides the W.5.6 tick hook.
+                    if shared {
+                        emit_shared_action(
                             &mut out,
                             callback_index,
-                            &comp_path,
-                            callback.source_callback.as_str(),
+                            inst_idx,
+                            comp_path.as_deref().unwrap(),
+                            cb_id,
                             node_id,
                             resolved_name,
                             &interface_type_name(interface),
                             &interface_type_hash(interface),
-                            instance,
                         );
                     } else {
                         out.push(format!(
@@ -2527,37 +2547,26 @@ fn instance_publishers(instance: &PlanInstance) -> Vec<(String, String, String, 
     pubs
 }
 
-/// W.5.3 — emit the shared prelude for an executable callback: a generated
-/// `PublisherResolver` (keyed on source entity ids) owning the instance's
-/// publishers, the publishers created via the builder, and the component
-/// `State`. Both the timer + subscription emitters move `resolver{idx}` +
-/// `state{idx}` into their dispatch closure (no statics, no_std-clean).
-/// `state_mut` controls the mutability of the `state{idx}` binding. Timer/sub
-/// callbacks capture state by `move` into the closure and mutate it in place, so
-/// the captured binding must be `mut`. Service/action move state into a leaked
-/// ctx struct and mutate through a fresh `&mut` field, so the outer binding stays
-/// immutable (declaring it `mut` would warn).
-fn emit_executable_prelude(
+/// Emit `struct Resolver{key}` + its `PublisherResolver` impl (publish_raw
+/// dispatches on the source entity id). Shared by the per-callback prelude (no_std)
+/// and the per-instance shared prelude (std). With no publishers the params are
+/// prefixed to stay warning-clean.
+fn emit_resolver_struct(
     out: &mut Vec<String>,
-    idx: usize,
-    comp_path: &str,
-    instance: &PlanInstance,
-    state_mut: bool,
+    key: &str,
+    pubs: &[(String, String, String, String, String)],
 ) {
-    let pubs = instance_publishers(instance);
     let fields = pubs
         .iter()
         .enumerate()
         .map(|(i, _)| format!("p{i}: nros::EmbeddedRawPublisher"))
         .collect::<Vec<_>>()
         .join(", ");
-    out.push(format!("    struct Resolver{idx} {{ {fields} }}\n"));
+    out.push(format!("    struct Resolver{key} {{ {fields} }}\n"));
     out.push(format!(
-        "    impl nros::PublisherResolver for Resolver{idx} {{\n"
+        "    impl nros::PublisherResolver for Resolver{key} {{\n"
     ));
     if pubs.is_empty() {
-        // No publishers on this instance — params unused, prefix to stay
-        // warning-clean and return the unsupported error directly.
         out.push(
             "        fn publish_raw(&self, _entity_id: &str, _data: &[u8]) -> nros::ComponentResult<()> {\n"
                 .to_string(),
@@ -2577,17 +2586,45 @@ fn emit_executable_prelude(
         out.push("                _ => Err(nros::ComponentError::Runtime),\n".to_string());
         out.push("            }\n        }\n    }\n".to_string());
     }
+}
+
+/// Emit the publisher builders `p{i}_{key}` for an instance's publishers.
+fn emit_publisher_builders(
+    out: &mut Vec<String>,
+    key: &str,
+    pubs: &[(String, String, String, String, String)],
+) {
     for (i, (_entity_id, topic, type_name, type_hash, node_id)) in pubs.iter().enumerate() {
         out.push(format!(
-            "    let pubnode_{idx}_{i} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+            "    let pubnode_{key}_{i} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
         ));
         out.push(format!(
-            "    let pubnh_{idx}_{i} = executor.node_id_by_name(pubnode_{idx}_{i}.node_name, pubnode_{idx}_{i}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+            "    let pubnh_{key}_{i} = executor.node_id_by_name(pubnode_{key}_{i}.node_name, pubnode_{key}_{i}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
         ));
         out.push(format!(
-            "    let p{i}_{idx} = executor.node_mut(pubnh_{idx}_{i}).publisher({topic:?}).generic({type_name:?}, {type_hash:?}).build()?;\n"
+            "    let p{i}_{key} = executor.node_mut(pubnh_{key}_{i}).publisher({topic:?}).generic({type_name:?}, {type_hash:?}).build()?;\n"
         ));
     }
+}
+
+/// W.5.3 — per-callback prelude (no_std executable path): a `Resolver{idx}`
+/// owning the instance's publishers + a fresh component `State`, both moved into
+/// the timer/sub dispatch closure (no statics, no_std-clean). Each callback owns
+/// its own state — the *std* path shares one state across callbacks via
+/// `emit_shared_prelude` (W.5.7). `state_mut` controls the `state{idx}`
+/// mutability: timer/sub capture by `move` and mutate in place, so the binding
+/// must be `mut`.
+fn emit_executable_prelude(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    instance: &PlanInstance,
+    state_mut: bool,
+) {
+    let pubs = instance_publishers(instance);
+    let key = idx.to_string();
+    emit_resolver_struct(out, &key, &pubs);
+    emit_publisher_builders(out, &key, &pubs);
     let init = pubs
         .iter()
         .enumerate()
@@ -2601,6 +2638,53 @@ fn emit_executable_prelude(
     out.push(format!(
         "    let {mut_kw}state{idx} = <{comp_path} as nros::ExecutableComponent>::init();\n"
     ));
+}
+
+/// W.5.7 — per-instance shared prelude (std/alloc). Builds the instance's
+/// publishers once into a `Resolveri{inst}`, then wraps both the resolver and the
+/// component `State` in `Rc` so every callback on the instance shares one state:
+/// timer/sub clone the `Rc` into their move-closure; service/action clone it into
+/// the leaked ctx. `RefCell` gives interior mutability across the shared borrows
+/// (the executor spins single-threaded, so the borrows never overlap).
+fn emit_shared_prelude(
+    out: &mut Vec<String>,
+    inst: usize,
+    comp_path: &str,
+    instance: &PlanInstance,
+) {
+    let pubs = instance_publishers(instance);
+    let key = format!("i{inst}");
+    emit_resolver_struct(out, &key, &pubs);
+    emit_publisher_builders(out, &key, &pubs);
+    let init = pubs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("p{i}: p{i}_i{inst}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(format!(
+        "    let resolver_i{inst} = ::std::rc::Rc::new(Resolveri{inst} {{ {init} }});\n"
+    ));
+    out.push(format!(
+        "    let state_i{inst} = ::std::rc::Rc::new(::core::cell::RefCell::new(<{comp_path} as nros::ExecutableComponent>::init()));\n"
+    ));
+}
+
+/// True if the instance has at least one timer/sub/service/action callback (so
+/// the shared prelude's `state_i{inst}`/`resolver_i{inst}` are actually used).
+fn instance_has_executable_callback(instance: &PlanInstance) -> bool {
+    instance.callbacks.iter().any(|cb| {
+        matches!(
+            find_callback_entity(instance, cb.id.as_str(), cb.source_callback.as_str()),
+            Some((
+                _,
+                PlanEntity::Timer { .. }
+                    | PlanEntity::Subscriber { .. }
+                    | PlanEntity::ServiceServer { .. }
+                    | PlanEntity::ActionServer { .. }
+            ))
+        )
+    })
 }
 
 /// W.5.3 — a timer callback that runs a real `ExecutableComponent` body (empty
@@ -2666,33 +2750,105 @@ fn emit_executable_subscription(
     ));
 }
 
-/// W.5.3 — a service callback that runs a real `ExecutableComponent` body.
-/// Raw service callbacks are non-capturing `extern "C"` fn pointers, so state +
-/// resolver live behind a `Box::leak`'d `'static` context the trampoline reads
-/// (std/alloc — gated by `uses_std`). The body reads the request via
-/// `ctx.message::<Req>()` and writes the reply via `ctx.reply::<Reply, N>()`.
-#[allow(clippy::too_many_arguments)]
-fn emit_executable_service(
+/// W.5.7 — a timer callback that shares the instance's `Rc<RefCell<State>>`
+/// (`state_i{inst}`) + `Rc<Resolveri{inst}>`. Clones the `Rc`s into the
+/// move-closure; dispatch borrows the shared state mutably (single-threaded spin
+/// ⇒ no overlap).
+fn emit_shared_timer(
     out: &mut Vec<String>,
     idx: usize,
+    inst: usize,
+    comp_path: &str,
+    callback_id: &str,
+    period_ms: u64,
+) {
+    out.push(format!(
+        "    let state_cb{idx} = ::std::rc::Rc::clone(&state_i{inst});\n"
+    ));
+    out.push(format!(
+        "    let resolver_cb{idx} = ::std::rc::Rc::clone(&resolver_i{inst});\n"
+    ));
+    out.push(format!(
+        "    let handle_{idx} = executor.register_timer(nros::TimerDuration::from_millis({period_ms}), move || {{\n"
+    ));
+    out.push(format!(
+        "        let mut cb_ctx = nros::CallbackCtx::new(&[], resolver_cb{idx}.as_ref());\n"
+    ));
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut *state_cb{idx}.borrow_mut(), nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("    })?;\n".to_string());
+    out.push(format!(
+        "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.7 — a subscription callback sharing the instance state (payload = CDR
+/// `data`). Mirrors `emit_shared_timer`.
+#[allow(clippy::too_many_arguments)]
+fn emit_shared_subscription(
+    out: &mut Vec<String>,
+    idx: usize,
+    inst: usize,
+    comp_path: &str,
+    callback_id: &str,
+    node_id: &str,
+    topic: &str,
+    type_name: &str,
+    type_hash: &str,
+) {
+    out.push(format!(
+        "    let subnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let subnh_{idx} = executor.node_id_by_name(subnode_{idx}.node_name, subnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let state_cb{idx} = ::std::rc::Rc::clone(&state_i{inst});\n"
+    ));
+    out.push(format!(
+        "    let resolver_cb{idx} = ::std::rc::Rc::clone(&resolver_i{inst});\n"
+    ));
+    out.push(format!(
+        "    let handle_{idx} = executor.node_mut(subnh_{idx}).subscription({topic:?}).generic({type_name:?}, {type_hash:?}).qos(nros::QosSettings::default().keep_last(1)).rx_buffer::<1024>().build(move |data: &[u8]| {{\n"
+    ));
+    out.push(format!(
+        "        let mut cb_ctx = nros::CallbackCtx::new(data, resolver_cb{idx}.as_ref());\n"
+    ));
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut *state_cb{idx}.borrow_mut(), nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("    })?;\n".to_string());
+    out.push(format!(
+        "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.7 — a service callback that runs a real `ExecutableComponent` body.
+/// Raw service callbacks are non-capturing `extern "C"` fn pointers, so the
+/// shared `Rc<RefCell<State>>` + `Rc<Resolveri{inst}>` clones live behind a
+/// `Box::leak`'d `'static` ctx the trampoline reads (std/alloc — `uses_std`-gated).
+/// Body reads the request via `ctx.message::<Req>()`, writes via `ctx.reply::<Reply, N>()`.
+#[allow(clippy::too_many_arguments)]
+fn emit_shared_service(
+    out: &mut Vec<String>,
+    idx: usize,
+    inst: usize,
     comp_path: &str,
     callback_id: &str,
     node_id: &str,
     service: &str,
     type_name: &str,
     type_hash: &str,
-    instance: &PlanInstance,
 ) {
-    // Resolver + publishers + `state{idx}` (moved into the boxed context below).
-    emit_executable_prelude(out, idx, comp_path, instance, false);
     out.push(format!(
-        "    struct SvcCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+        "    struct SvcCtx{idx} {{ state: ::std::rc::Rc<::core::cell::RefCell<<{comp_path} as nros::ExecutableComponent>::State>>, resolver: ::std::rc::Rc<Resolveri{inst}> }}\n"
     ));
     out.push(format!(
         "    unsafe extern \"C\" fn svc_tramp_{idx}(req: *const u8, req_len: usize, resp: *mut u8, resp_cap: usize, resp_len: *mut usize, ctx: *mut core::ffi::c_void) -> bool {{\n"
     ));
     out.push(format!(
-        "        let sctx = unsafe {{ &mut *(ctx as *mut SvcCtx{idx}) }};\n"
+        "        let sctx = unsafe {{ &*(ctx as *const SvcCtx{idx}) }};\n"
     ));
     out.push(
         "        let req_slice = unsafe { core::slice::from_raw_parts(req, req_len) };\n"
@@ -2704,17 +2860,16 @@ fn emit_executable_service(
     );
     out.push("        let mut written = 0usize;\n".to_string());
     out.push(
-        "        let mut cb_ctx = nros::CallbackCtx::with_reply(req_slice, &sctx.resolver, resp_slice, &mut written);\n"
+        "        let mut cb_ctx = nros::CallbackCtx::with_reply(req_slice, sctx.resolver.as_ref(), resp_slice, &mut written);\n"
             .to_string(),
     );
     out.push(format!(
-        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut sctx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut *sctx.state.borrow_mut(), nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
     ));
     out.push("        unsafe { *resp_len = written; }\n".to_string());
     out.push("        true\n    }\n".to_string());
-    // Box the (state, resolver) into a leaked 'static context the trampoline reads.
     out.push(format!(
-        "    let svcctx{idx}: *mut core::ffi::c_void = ::std::boxed::Box::into_raw(::std::boxed::Box::new(SvcCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }})) as *mut core::ffi::c_void;\n"
+        "    let svcctx{idx}: *mut core::ffi::c_void = ::std::boxed::Box::into_raw(::std::boxed::Box::new(SvcCtx{idx} {{ state: ::std::rc::Rc::clone(&state_i{inst}), resolver: ::std::rc::Rc::clone(&resolver_i{inst}) }})) as *mut core::ffi::c_void;\n"
     ));
     out.push(format!(
         "    let svcnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
@@ -2730,36 +2885,34 @@ fn emit_executable_service(
     ));
 }
 
-/// W.5.5 — an action server whose goal/cancel **decisions** run a real
-/// `ExecutableComponent` body (the execution half — feedback/result — rides the
-/// W.5.6 tick hook, not these trampolines). Goal/cancel are non-capturing
-/// `extern "C"` fn-ptrs, so `(state, resolver)` lives behind a `Box::leak`'d
-/// `'static` `ActionCtx` (std/alloc — `uses_std`-gated). The body sets accept/reject
-/// via `CallbackCtx::set_goal_response` / `set_cancel_response`; the same callback
-/// id serves both phases (the ctx sink kind disambiguates). Accepted stays the
-/// noop until the tick hook drives execution.
+/// W.5.5 + W.5.7 — an action server whose goal/cancel **decisions** run a real
+/// `ExecutableComponent` body (execution — feedback/result — rides the W.5.6 tick
+/// hook). Goal/cancel are non-capturing `extern "C"` fn-ptrs, so the shared
+/// `Rc<RefCell<State>>` + `Rc<Resolveri{inst}>` clones live behind a `Box::leak`'d
+/// `'static` `ActionCtx` (std/alloc — `uses_std`-gated). Body sets accept/reject via
+/// `set_goal_response` / `set_cancel_response`; the same callback id serves both
+/// phases (the ctx sink kind disambiguates). Accepted stays the noop until the tick.
 #[allow(clippy::too_many_arguments)]
-fn emit_executable_action(
+fn emit_shared_action(
     out: &mut Vec<String>,
     idx: usize,
+    inst: usize,
     comp_path: &str,
     callback_id: &str,
     node_id: &str,
     action: &str,
     type_name: &str,
     type_hash: &str,
-    instance: &PlanInstance,
 ) {
-    emit_executable_prelude(out, idx, comp_path, instance, false);
     out.push(format!(
-        "    struct ActionCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+        "    struct ActionCtx{idx} {{ state: ::std::rc::Rc<::core::cell::RefCell<<{comp_path} as nros::ExecutableComponent>::State>>, resolver: ::std::rc::Rc<Resolveri{inst}> }}\n"
     ));
     // goal-decision trampoline
     out.push(format!(
         "    unsafe extern \"C\" fn goal_tramp_{idx}(_goal_id: *const nros::GoalId, goal_data: *const u8, goal_len: usize, ctx: *mut core::ffi::c_void) -> nros::GoalResponse {{\n"
     ));
     out.push(format!(
-        "        let actx = unsafe {{ &mut *(ctx as *mut ActionCtx{idx}) }};\n"
+        "        let actx = unsafe {{ &*(ctx as *const ActionCtx{idx}) }};\n"
     ));
     out.push(
         "        let goal_slice = unsafe { core::slice::from_raw_parts(goal_data, goal_len) };\n"
@@ -2767,11 +2920,11 @@ fn emit_executable_action(
     );
     out.push("        let mut resp = nros::GoalResponse::Reject;\n".to_string());
     out.push(
-        "        let mut cb_ctx = nros::CallbackCtx::with_goal_decision(goal_slice, &actx.resolver, &mut resp);\n"
+        "        let mut cb_ctx = nros::CallbackCtx::with_goal_decision(goal_slice, actx.resolver.as_ref(), &mut resp);\n"
             .to_string(),
     );
     out.push(format!(
-        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut *actx.state.borrow_mut(), nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
     ));
     out.push("        resp\n    }\n".to_string());
     // cancel-decision trampoline
@@ -2779,19 +2932,19 @@ fn emit_executable_action(
         "    unsafe extern \"C\" fn cancel_tramp_{idx}(_goal_id: *const nros::GoalId, _status: nros::GoalStatus, ctx: *mut core::ffi::c_void) -> nros::CancelResponse {{\n"
     ));
     out.push(format!(
-        "        let actx = unsafe {{ &mut *(ctx as *mut ActionCtx{idx}) }};\n"
+        "        let actx = unsafe {{ &*(ctx as *const ActionCtx{idx}) }};\n"
     ));
     out.push("        let mut resp = nros::CancelResponse::Rejected;\n".to_string());
     out.push(
-        "        let mut cb_ctx = nros::CallbackCtx::with_cancel_decision(&[], &actx.resolver, &mut resp);\n"
+        "        let mut cb_ctx = nros::CallbackCtx::with_cancel_decision(&[], actx.resolver.as_ref(), &mut resp);\n"
             .to_string(),
     );
     out.push(format!(
-        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut *actx.state.borrow_mut(), nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
     ));
     out.push("        resp\n    }\n".to_string());
     out.push(format!(
-        "    let actctx{idx}: *mut core::ffi::c_void = ::std::boxed::Box::into_raw(::std::boxed::Box::new(ActionCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }})) as *mut core::ffi::c_void;\n"
+        "    let actctx{idx}: *mut core::ffi::c_void = ::std::boxed::Box::into_raw(::std::boxed::Box::new(ActionCtx{idx} {{ state: ::std::rc::Rc::clone(&state_i{inst}), resolver: ::std::rc::Rc::clone(&resolver_i{inst}) }})) as *mut core::ffi::c_void;\n"
     ));
     out.push(format!(
         "    let actnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
