@@ -1801,6 +1801,13 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
             "    fn publish_feedback_raw(&mut self, action_entity: &str, goal_id: &nros::GoalId, feedback: &[u8]) -> nros::ComponentResult<()> {\n        \
              let handle = self.handle(action_entity)?;\n        \
              handle.publish_feedback_raw(self.executor, goal_id, feedback).map_err(|_| nros::ComponentError::Runtime)\n    \
+             }\n",
+        );
+        out.push_str(
+            "    fn for_each_active_goal(&self, action_entity: &str, visit: &mut dyn FnMut(&nros::GoalId, nros::GoalStatus)) {\n        \
+             if let Ok(handle) = self.handle(action_entity) {\n            \
+             handle.for_each_active_goal(&*self.executor, |g| visit(&g.goal_id, g.status));\n        \
+             }\n    \
              }\n}\n\n",
         );
     }
