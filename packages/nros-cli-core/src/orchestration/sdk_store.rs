@@ -305,17 +305,27 @@ pub enum SourceDisposition {
 /// already-present `dest` is left untouched. Two modes (see
 /// [`SourcePackage::provision`]):
 ///
-/// - **Clone:** `git clone <git> <workspace>/<dest>` then `git checkout <ref>`
-///   (full clone — `ref` may be a sha, so `--branch` is not used).
-/// - **Submodule:** `git -C <workspace> submodule update --init -- <submodule>`
-///   (inherently idempotent; checks out the superproject's recorded commit,
-///   kept in lockstep with the index ref via the SSOT rule).
+/// Both modes honor the source's `shallow` (default true → `--depth 1`,
+/// fetch-by-SHA so a lagging pin is still a real depth-1 checkout) and
+/// `recursive` (default true → descend the source's own nested submodules).
+///
+/// - **Clone:** shallow → `git init` + `git fetch --depth 1 origin <ref>` +
+///   `git checkout FETCH_HEAD` (`ref` may be a sha, so `--branch` can't be
+///   used); full → `git clone <git> <dest>` + `git checkout <ref>`. Then, if
+///   recursive, `git submodule update --init --recursive [--depth 1]`.
+/// - **Submodule:** `git -C <workspace> submodule update --init [--recursive]
+///   [--depth 1] -- <submodule>` (inherently idempotent; checks out the
+///   superproject's recorded commit, kept in lockstep with the index ref via
+///   the SSOT rule).
 pub fn provision_source(
     name: &str,
     src: &SourcePackage,
     workspace: &Path,
     dry_run: bool,
+    shallow_override: Option<bool>,
 ) -> Result<SourceDisposition> {
+    // `--full` / `--shallow` (per-invocation) wins over the index `shallow`.
+    let shallow = shallow_override.unwrap_or(src.shallow);
     match src.provision() {
         SourceProvision::None => Ok(SourceDisposition::NoFetch),
         SourceProvision::Submodule => {
@@ -323,20 +333,24 @@ pub fn provision_source(
             if dry_run {
                 return Ok(SourceDisposition::Planned);
             }
-            sh(
-                &[
-                    "git",
-                    "-C",
-                    &workspace.to_string_lossy(),
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--",
-                    path,
-                ],
-                None,
-            )
-            .wrap_err_with(|| format!("git submodule update {path} (source {name})"))?;
+            // `--depth 1` does a fetch-by-SHA, so it is a true depth-1 checkout
+            // of the pinned commit even when the pin lags the branch tip (a
+            // `.gitmodules` `shallow=true` alone would deepen back to full).
+            // `--recursive` only descends a source's own nested submodules.
+            let workspace = workspace.to_string_lossy();
+            let mut args: Vec<&str> =
+                vec!["git", "-C", &workspace, "submodule", "update", "--init"];
+            if src.recursive {
+                args.push("--recursive");
+            }
+            if shallow {
+                args.push("--depth");
+                args.push("1");
+            }
+            args.push("--");
+            args.push(path);
+            sh(&args, None)
+                .wrap_err_with(|| format!("git submodule update {path} (source {name})"))?;
             Ok(SourceDisposition::Provisioned)
         }
         SourceProvision::Clone => {
@@ -362,10 +376,55 @@ pub fn provision_source(
                     .wrap_err_with(|| format!("create source dest parent {}", parent.display()))?;
             }
             let dest_str = dest_abs.to_string_lossy();
-            sh(&["git", "clone", git, &dest_str], None)
-                .wrap_err_with(|| format!("git clone {git} (source {name})"))?;
-            sh(&["git", "-C", &dest_str, "checkout", git_ref], None)
-                .wrap_err_with(|| format!("git checkout {git_ref} (source {name})"))?;
+            if shallow {
+                // Shallow clone of a possibly-SHA `ref`: `git clone --branch`
+                // can't take a sha, so init + fetch-by-ref at depth 1 (works for
+                // sha/tag/branch via the server's reachable-SHA support) + check
+                // out the fetched commit (detached, same as a sha checkout).
+                sh(&["git", "init", "-q", &dest_str], None)
+                    .wrap_err_with(|| format!("git init {dest_str} (source {name})"))?;
+                sh(
+                    &["git", "-C", &dest_str, "remote", "add", "origin", git],
+                    None,
+                )
+                .wrap_err_with(|| format!("git remote add (source {name})"))?;
+                sh(
+                    &[
+                        "git", "-C", &dest_str, "fetch", "-q", "--depth", "1", "origin", git_ref,
+                    ],
+                    None,
+                )
+                .wrap_err_with(|| format!("git fetch --depth 1 {git_ref} (source {name})"))?;
+                sh(
+                    &["git", "-C", &dest_str, "checkout", "-q", "FETCH_HEAD"],
+                    None,
+                )
+                .wrap_err_with(|| format!("git checkout FETCH_HEAD (source {name})"))?;
+            } else {
+                sh(&["git", "clone", git, &dest_str], None)
+                    .wrap_err_with(|| format!("git clone {git} (source {name})"))?;
+                sh(&["git", "-C", &dest_str, "checkout", git_ref], None)
+                    .wrap_err_with(|| format!("git checkout {git_ref} (source {name})"))?;
+            }
+            if src.recursive {
+                // A cloned source may carry its own nested submodules.
+                let mut sub: Vec<&str> = vec![
+                    "git",
+                    "-C",
+                    &dest_str,
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                ];
+                if shallow {
+                    sub.push("--depth");
+                    sub.push("1");
+                }
+                sh(&sub, None).wrap_err_with(|| {
+                    format!("git submodule update --recursive (source {name})")
+                })?;
+            }
             Ok(SourceDisposition::Provisioned)
         }
     }
@@ -490,7 +549,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            provision_source("x", &none, Path::new("/ws"), false).unwrap(),
+            provision_source("x", &none, Path::new("/ws"), false, None).unwrap(),
             SourceDisposition::NoFetch
         );
 
@@ -506,9 +565,11 @@ mod tests {
             git_ref: Some("STABLE-2_2_0".into()),
             dest: Some(dest_rel.into()),
             submodule: None,
+            shallow: true,
+            recursive: true,
         };
         assert_eq!(
-            provision_source("lwip", &clone, &ws, false).unwrap(),
+            provision_source("lwip", &clone, &ws, false, None).unwrap(),
             SourceDisposition::AlreadyPresent
         );
 
@@ -518,7 +579,7 @@ mod tests {
             ..clone.clone()
         };
         assert_eq!(
-            provision_source("lwip", &empty, &ws, true).unwrap(),
+            provision_source("lwip", &empty, &ws, true, None).unwrap(),
             SourceDisposition::Planned
         );
         std::fs::remove_dir_all(&ws).ok();

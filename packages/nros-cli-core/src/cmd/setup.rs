@@ -64,6 +64,32 @@ pub struct Args {
     /// Resolve + print the plan without fetching/building anything.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Provision full git history instead of the per-source shallow default
+    /// (`--depth 1`). Use when you want `git log` / `blame` / branching in a
+    /// provisioned source or submodule. Overrides the index `shallow` for this
+    /// invocation only — no shared-file edit. (An already-shallow checkout is
+    /// deepened in place with `git -C <path> fetch --unshallow`.)
+    #[arg(long, conflicts_with = "shallow")]
+    pub full: bool,
+
+    /// Force shallow (`--depth 1`) even for sources that set `shallow = false`
+    /// in the index. The inverse of `--full`.
+    #[arg(long)]
+    pub shallow: bool,
+}
+
+/// Per-invocation shallow override from `--full` / `--shallow`: `None` = use the
+/// per-source index default, `Some(false)` = full history, `Some(true)` = force
+/// shallow.
+fn shallow_override(args: &Args) -> Option<bool> {
+    if args.full {
+        Some(false)
+    } else if args.shallow {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -84,7 +110,13 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     if !args.sources.is_empty() {
-        return provision_named_sources(&index, &args.index, &args.sources, args.dry_run);
+        return provision_named_sources(
+            &index,
+            &args.index,
+            &args.sources,
+            args.dry_run,
+            shallow_override(&args),
+        );
     }
 
     let board = match args.board.as_deref() {
@@ -113,8 +145,9 @@ pub fn run(args: Args) -> Result<()> {
         // `[gated.*]` are user-installed.
         let Some(tool) = index.tool.get(*name) else {
             if let Some(src) = index.source.get(*name) {
-                let disp = provision_source(name, src, &workspace, args.dry_run)
-                    .wrap_err_with(|| format!("provision source {name}"))?;
+                let disp =
+                    provision_source(name, src, &workspace, args.dry_run, shallow_override(&args))
+                        .wrap_err_with(|| format!("provision source {name}"))?;
                 eprintln!("  {:<22} {}", name, describe_source(src, &disp));
                 if matches!(disp, SourceDisposition::Provisioned) {
                     installed = true;
@@ -226,6 +259,7 @@ fn provision_named_sources(
     index_path: &Path,
     names: &[String],
     dry_run: bool,
+    shallow_override: Option<bool>,
 ) -> Result<()> {
     let workspace = index_workspace(index_path);
     for name in names {
@@ -233,7 +267,7 @@ fn provision_named_sources(
             .source
             .get(name.as_str())
             .ok_or_else(|| eyre::eyre!("nros setup --source: no [source.{name}] in the index"))?;
-        let disp = provision_source(name, src, &workspace, dry_run)
+        let disp = provision_source(name, src, &workspace, dry_run, shallow_override)
             .wrap_err_with(|| format!("provision source {name}"))?;
         eprintln!(
             "nros setup --source {name}: {}",
@@ -291,7 +325,9 @@ pub fn ensure_tools(board: &str, workspace: Option<&Path>) -> Result<Vec<PathBuf
             // Phase 195.B — provision `[source.*]` into its index `dest` so a
             // first build/deploy gets the kernel/lib source with no `just`.
             if let Some(src) = index.source.get(name) {
-                match provision_source(name, src, &ws, false) {
+                // Lazy auto-setup uses the index per-source default (no
+                // `--full`/`--shallow` to thread here).
+                match provision_source(name, src, &ws, false, None) {
                     Ok(SourceDisposition::Provisioned) => {
                         eprintln!(
                             "nros: provisioned source {name} → {}",

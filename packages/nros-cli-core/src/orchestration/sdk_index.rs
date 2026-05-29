@@ -161,7 +161,7 @@ pub struct ToolSource {
 ///
 /// A source with no fetch fields at all has no provisioning step (e.g. a
 /// host-built package whose tree already lives in the workspace).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcePackage {
     pub version: String,
@@ -181,6 +181,41 @@ pub struct SourcePackage {
     /// fresh clone. `git`/`ref` still record the pin (SSOT) in this mode.
     #[serde(default)]
     pub submodule: Option<String>,
+    /// Shallow-fetch the submodule (`--depth 1`). Default `true` — pins lag the
+    /// upstream branch tip, and `git submodule update --depth 1` fetches the
+    /// pinned SHA directly (fetch-by-SHA), so this is a true depth-1 checkout,
+    /// not a deepen-to-reach-pin. Set `shallow = false` for a source whose
+    /// upstream rejects reachable-SHA shallow fetches. Submodule mode only.
+    #[serde(default = "default_true")]
+    pub shallow: bool,
+    /// Recurse into the source's own nested submodules (`--recursive`). Default
+    /// `true`. Only affects a source that *has* nested submodules; it never
+    /// pulls sibling top-level sources (e.g. PX4-Autopilot is a separate
+    /// `[source.*]`, not nested in `px4-rs`). Set `recursive = false` to pin a
+    /// source to its top tree only. Submodule mode only.
+    #[serde(default = "default_true")]
+    pub recursive: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// Hand-rolled so `SourcePackage::default()` matches the serde defaults
+// (`shallow`/`recursive` default to `true`); a `#[derive(Default)]` would make
+// the bools `false` and silently diverge from a TOML-parsed entry.
+impl Default for SourcePackage {
+    fn default() -> Self {
+        Self {
+            version: String::new(),
+            git: None,
+            git_ref: None,
+            dest: None,
+            submodule: None,
+            shallow: true,
+            recursive: true,
+        }
+    }
 }
 
 /// How a [`SourcePackage`] is provisioned (Phase 195.B).
