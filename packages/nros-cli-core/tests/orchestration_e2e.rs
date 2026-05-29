@@ -1197,18 +1197,17 @@ fn fibonacci_action_tick_drives_example_client_exchange() {
     );
 }
 
-/// Resolve the prebuilt native zenoh `action-client` example, building it on
-/// demand (incremental) if `just native build-fixture-rust` hasn't run. The
-/// vendored `example_interfaces` Fibonacci CDR matches the generated server's
-/// hand-mirrored types, so the two interoperate on the wire.
-fn ensure_action_client_binary() -> PathBuf {
-    let client_dir = nano_ros_workspace().join("examples/native/rust/action-client");
-    let binary = client_dir.join("target-zenoh/release/action-client");
+/// Resolve a prebuilt native zenoh example binary (`examples/native/rust/<dir>`,
+/// bin `<bin>`), building it on demand (incremental) if `just native
+/// build-fixture-rust` hasn't run.
+fn ensure_example_binary(dir: &str, bin: &str) -> PathBuf {
+    let ex_dir = nano_ros_workspace().join(format!("examples/native/rust/{dir}"));
+    let binary = ex_dir.join(format!("target-zenoh/release/{bin}"));
     if binary.is_file() {
         return binary;
     }
     let status = Command::new(env!("CARGO"))
-        .current_dir(&client_dir)
+        .current_dir(&ex_dir)
         .args([
             "build",
             "--release",
@@ -1219,17 +1218,23 @@ fn ensure_action_client_binary() -> PathBuf {
             "target-zenoh",
         ])
         .status()
-        .unwrap_or_else(|e| panic!("build action-client example: {e}"));
+        .unwrap_or_else(|e| panic!("build {dir} example: {e}"));
     assert!(
         status.success(),
-        "building the action-client example failed; run `just native build-fixture-rust`"
+        "building the {dir} example failed; run `just native build-fixture-rust`"
     );
     assert!(
         binary.is_file(),
-        "action-client binary missing after build at {}",
+        "{bin} binary missing after build at {}",
         binary.display()
     );
     binary
+}
+
+/// The `action-client` example — its vendored `example_interfaces` Fibonacci CDR
+/// matches the generated server's hand-mirrored types, so they interoperate.
+fn ensure_action_client_binary() -> PathBuf {
+    ensure_example_binary("action-client", "action-client")
 }
 
 /// Poll `child` until it exits or `timeout` elapses (killing it on timeout),
@@ -1254,6 +1259,124 @@ fn wait_capture(mut child: Child, timeout: Duration) -> (bool, String) {
     let mut transcript = String::from_utf8_lossy(&out.stdout).into_owned();
     transcript.push_str(&String::from_utf8_lossy(&out.stderr));
     (exited, transcript)
+}
+
+/// Rewrite the bridge plan's two zenoh locators (both `build.transports` and the
+/// `[[bridge]]` endpoints) to the test's actual router addresses — the generated
+/// `SESSION_SPECS` bake these at codegen time.
+fn bridge_set_locators(plan: &mut NrosPlan, loc_a: &str, loc_b: &str) {
+    assert_eq!(
+        plan.build.transports.len(),
+        2,
+        "bridge plan has 2 transports"
+    );
+    plan.build.transports[0].locator = Some(loc_a.to_string());
+    plan.build.transports[1].locator = Some(loc_b.to_string());
+    assert_eq!(plan.bridges.len(), 1, "bridge plan has 1 bridge");
+    let connect = &mut plan.bridges[0].connect;
+    assert_eq!(connect.len(), 2, "bridge connects 2 endpoints");
+    connect[0].locator = Some(loc_a.to_string());
+    connect[1].locator = Some(loc_b.to_string());
+}
+
+/// Phase 172 — bridge topic-forwarding runtime exchange. The generated bridge
+/// package opens two zenoh sessions (router A + router B); its own
+/// `chatter_talker` component publishes `std_msgs/Int32` on `/chatter` over
+/// endpoint 0 (router A), and the generated `register_bridges` relay forwards it
+/// to endpoint 1 (router B), where the prebuilt `listener` example receives it.
+/// Proves the cross-session relay (`register_bridges`: generic-sub →
+/// generic-pub `publish_raw_with_attachment` with `bridge_origin` echo
+/// suppression) actually forwards data over the wire.
+#[test]
+fn bridge_forwards_chatter_across_two_zenoh_routers() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_bridge");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-bridge");
+    let plan_path = out_dir.join("nros-plan-bridge.json");
+    fs::create_dir_all(&out_dir).expect("create bridge output dir");
+
+    let port_a = free_local_port();
+    let mut port_b = free_local_port();
+    while port_b == port_a {
+        port_b = free_local_port();
+    }
+    let loc_a = format!("tcp/127.0.0.1:{port_a}");
+    let loc_b = format!("tcp/127.0.0.1:{port_b}");
+
+    let mut plan = fixture_plan("plan_bridge_forward.json");
+    bridge_set_locators(&mut plan, &loc_a, &loc_b);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize bridge plan"),
+    )
+    .expect("write bridge plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated bridge plan");
+    build_generated_package(&BuildOptions {
+        package_name: "nros-e2e-generated-bridge".to_string(),
+        output_dir: generated_dir.clone(),
+        plan_path,
+        workspace_root: nano_ros_workspace(),
+        component_workspace: Some(fixture),
+        release: true,
+        target: None,
+        cargo_args: Vec::new(),
+        force: false,
+    })
+    .expect("build command compiles generated bridge package");
+
+    // The generated bridge build.rs carries the relay (sanity — the unit test
+    // covers emission in detail).
+    let build_rs =
+        fs::read_to_string(generated_dir.join("build.rs")).expect("read generated build.rs");
+    assert!(build_rs.contains("pub fn register_bridges("));
+    assert!(build_rs.contains("publish_raw_with_attachment"));
+
+    let bridge_bin = out_dir
+        .join("target")
+        .join("x86_64-unknown-linux-gnu")
+        .join("release")
+        .join("nros-e2e-generated-bridge");
+    assert!(
+        bridge_bin.is_file(),
+        "generated bridge binary exists at {}",
+        bridge_bin.display()
+    );
+
+    let listener_bin = ensure_example_binary("listener", "listener");
+
+    // Two independent routers — without the bridge, A and B are isolated.
+    let _zenohd_a = start_zenohd(port_a);
+    let _zenohd_b = start_zenohd(port_b);
+
+    // The bridge bakes both locators in SESSION_SPECS — no env needed.
+    let bridge = Command::new(&bridge_bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn bridge {}: {e}", bridge_bin.display()));
+    let _bridge_guard = ChildGuard(bridge);
+    thread::sleep(Duration::from_secs(3));
+
+    // Listener on router B: it only receives `/chatter` if the bridge forwarded
+    // it from router A. Runs until killed, so scrape its output over a window.
+    let listener = Command::new(&listener_bin)
+        .env("NROS_LOCATOR", &loc_b)
+        .env("NROS_SESSION_MODE", "client")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn listener {}: {e}", listener_bin.display()));
+    let (_exited, transcript) = wait_capture(listener, Duration::from_secs(12));
+    assert!(
+        transcript.contains("Received:"),
+        "listener on router B never received bridged /chatter:\n{transcript}"
+    );
 }
 
 /// Phase 172.E driver — compile the `demo_pkg::talker` component in metadata

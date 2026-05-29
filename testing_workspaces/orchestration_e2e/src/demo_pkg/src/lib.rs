@@ -318,3 +318,74 @@ pub mod fib_server {
         const ACTION_HASH: &'static str = "TypeHashNotSupported";
     }
 }
+
+/// Bridge-test source: a minimal `std_msgs/Int32` talker on `/chatter` (one node,
+/// one publisher, one timer). Used by the bridge topic-forwarding runtime test as
+/// the generated bridge package's own component — it publishes on the primary
+/// session (endpoint 0 / router A); the generated `register_bridges` relay then
+/// forwards `/chatter` to endpoint 1 (router B), where the prebuilt `listener`
+/// example receives it. CDR matches `std_msgs::msg::Int32` byte-for-byte.
+pub mod chatter_talker {
+    use nros::{
+        CallbackCtx, CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult,
+        DeserError, Deserialize, EntityId, ExecutableComponent, NodeId, NodeOptions, RosMessage,
+        SerError, Serialize, TimerDuration,
+    };
+
+    pub struct Component;
+
+    impl nros::Component for Component {
+        const NAME: &'static str = "chatter_talker";
+
+        fn register(context: &mut ComponentContext<'_>) -> ComponentResult<()> {
+            let mut node =
+                context.create_node(NodeId::new("node_chatter"), NodeOptions::new("chatter_talker"))?;
+            let _publisher =
+                node.create_publisher::<Int32Msg>(EntityId::new("pub_chatter"), "chatter")?;
+            let _timer = node.create_timer(
+                EntityId::new("timer_publish"),
+                CallbackId::new("cb_pub"),
+                TimerDuration::from_millis(100),
+            )?;
+            Ok(())
+        }
+    }
+
+    impl ExecutableComponent for Component {
+        /// Monotonic counter published as the Int32 payload.
+        type State = i32;
+
+        fn init() -> Self::State {
+            0
+        }
+
+        fn on_callback(state: &mut Self::State, callback: CallbackId<'_>, ctx: &mut CallbackCtx<'_>) {
+            if callback.as_str() == "cb_pub" {
+                *state = state.wrapping_add(1);
+                let _ = ctx.publish::<Int32Msg, 16>(EntityId::new("pub_chatter"), &Int32Msg(*state));
+            }
+        }
+    }
+
+    /// `std_msgs/Int32` — CDR is a single `int32` field.
+    #[derive(Default)]
+    pub struct Int32Msg(pub i32);
+
+    impl Serialize for Int32Msg {
+        fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+            writer.write_i32(self.0)?;
+            Ok(())
+        }
+    }
+
+    impl Deserialize for Int32Msg {
+        fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+            Ok(Self(reader.read_i32()?))
+        }
+    }
+
+    impl RosMessage for Int32Msg {
+        const TYPE_NAME: &'static str = "std_msgs::msg::dds_::Int32_";
+        const TYPE_HASH: &'static str = "TypeHashNotSupported";
+    }
+}
