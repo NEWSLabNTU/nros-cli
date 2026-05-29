@@ -289,9 +289,14 @@ path = "src/main.rs"
 # the same intent as `nros build`'s `[build].optimize` (`cargo build --profile
 # size|speed`), no hand-editing. (panic is left to the target/profile — embedded
 # triples are already abort; host keeps its default.)
+#
+# Phase 204.3 — `opt-level = "s"`, NOT `"z"`: on smoltcp/IP examples `-Oz`'s
+# weaker DCE keeps a non-inlined socket-buffer accessor that defeats opt-3's
+# per-socket dead-buffer elimination (grew `.bss` +24 KB on a measured talker);
+# `"s"` shrinks `.text` *more* and preserves the DCE.
 [profile.size]
 inherits = "release"
-opt-level = "z"
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = true
@@ -333,8 +338,65 @@ extern "C" fn _start() -> ! {
 
     if is_embedded {
         write_default_config_toml(dir)?;
+        write_cargo_config(dir, platform)?;
     }
 
+    Ok(())
+}
+
+/// Scaffold `.cargo/config.toml` for the cortex-m cargo-built platforms
+/// (bare-metal / FreeRTOS on the QEMU mps2-an385). Carries the Phase 204
+/// size knobs by default: `--gc-sections` at link (204.8) plus a documented,
+/// commented block for the serial-only IP-stack opt-out (204.7) and the
+/// per-backend static-heap size (204.5). Other embedded platforms (Zephyr,
+/// NuttX, ESP-IDF, ThreadX) build through their own toolchains and don't use
+/// a cargo target triple here, so they get no `.cargo/config.toml`.
+fn write_cargo_config(dir: &Path, platform: &str) -> Result<()> {
+    let triple = match platform {
+        "baremetal" | "freertos" => "thumbv7m-none-eabi",
+        // Non-cargo-target build flows — leave the build config to the
+        // platform's own toolchain integration.
+        _ => return Ok(()),
+    };
+
+    let config = format!(
+        r#"[build]
+target = "{triple}"
+
+[target.{triple}]
+# QEMU mps2-an385 (cortex-m3) + semihosting. Adjust `-machine`/`-cpu` for your board.
+runner = "qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -kernel"
+rustflags = [
+    # Phase 204.8 — drop unreferenced fns/data at link. `rust-lld` is invoked
+    # directly (no gcc driver), so the bare `--gc-sections`, NOT `-Wl,...`.
+    # `cortex-m-rt`'s `link.x` KEEPs the vector table, so gc is safe.
+    "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=-Tlink.x",
+]
+
+[env]
+# Phase 204.7 — serial-only node: uncomment to drop the IP link layer
+# (zenoh-pico TCP/UDP link C via `Z_FEATURE_LINK_TCP/UDP=0`; `--gc-sections`
+# above then strips the smoltcp residue). Also switch the board to its
+# `serial` feature and use a serial `locator` in `nros.toml`.
+# NROS_LINK_IP = "0"
+# ZPICO_NO_SMOLTCP = "1"
+#
+# Phase 204.5 — size the static heap to the backend's working set
+# (zenoh-pico ~24 KB, XRCE ~8 KB); default is the per-board value (64 KB on
+# mps2-an385). Decimal bytes.
+# NROS_HEAP_SIZE = "24576"
+#
+# Phase 204.2 — a brokered (zenoh/XRCE) client multiplexes over one session;
+# drop the spare smoltcp socket buffers (sized for DDS RTPS by default).
+# NROS_SMOLTCP_MAX_SOCKETS = "1"
+# NROS_SMOLTCP_MAX_UDP_SOCKETS = "1"
+"#
+    );
+
+    let cargo_dir = dir.join(".cargo");
+    fs::create_dir_all(&cargo_dir)?;
+    fs::write(cargo_dir.join("config.toml"), config)?;
     Ok(())
 }
 
