@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-nano-ros"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "nros-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "clap",
  "clap_complete",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "nros-cli-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "cargo-nano-ros",
  "cargo_metadata",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "rosidl-bindgen"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "askama",
  "clap",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "rosidl-codegen"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "askama",
  "criterion",
@@ -1203,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "rosidl-parser"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "chumsky",
  "logos",
