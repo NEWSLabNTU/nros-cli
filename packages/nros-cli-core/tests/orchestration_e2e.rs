@@ -1026,6 +1026,174 @@ fn fixture_workspace_builds_generated_service_action_package() {
     );
 }
 
+/// Phase 172 W.5.10 — the tick-driven action runtime exchange. Builds a generated
+/// Fibonacci action server (the `demo_pkg` component accepts the goal in
+/// `on_callback`, then its `tick` iterates `for_each_active_goal`, publishes
+/// growing-sequence feedback, and `complete_goal`s) and runs the prebuilt
+/// `examples/native/rust/action-client` against it over a zenohd router. Proves
+/// the W.5.6 `run_tick_loop` + `GenActionExec` drive a real goal end-to-end over
+/// the wire — the client must observe goal acceptance + feedback.
+#[test]
+fn fibonacci_action_tick_drives_example_client_exchange() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_fib_action");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-fibonacci");
+    let plan_path = out_dir.join("nros-plan-fibonacci.json");
+    fs::create_dir_all(&out_dir).expect("create fibonacci output dir");
+
+    // The plan already targets the dedicated `demo_pkg::fib_server` component
+    // (single node + single action), so its `MAX_ENTITIES` matches what the
+    // component declares — no `retarget_plan_to_fixture_component`.
+    let plan = fixture_plan("plan_fibonacci_action.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize fibonacci plan"),
+    )
+    .expect("write fibonacci plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated fibonacci plan");
+    build_generated_package(&BuildOptions {
+        package_name: "nros-e2e-generated-fibonacci".to_string(),
+        output_dir: generated_dir.clone(),
+        plan_path,
+        workspace_root: nano_ros_workspace(),
+        component_workspace: Some(fixture),
+        release: true,
+        target: None,
+        cargo_args: Vec::new(),
+        force: false,
+    })
+    .expect("build command compiles generated fibonacci server");
+
+    let server_bin = out_dir
+        .join("target")
+        .join("x86_64-unknown-linux-gnu")
+        .join("release")
+        .join("nros-e2e-generated-fibonacci");
+    assert!(
+        server_bin.is_file(),
+        "generated fibonacci server binary exists at {}",
+        server_bin.display()
+    );
+
+    let client_bin = ensure_action_client_binary();
+
+    let port = free_local_port();
+    let _zenohd = start_zenohd(port);
+    let locator = format!("tcp/127.0.0.1:{port}");
+
+    // Server first; it has no stdout markers, so give discovery a moment.
+    let mut server = Command::new(&server_bin)
+        .env("NROS_LOCATOR", &locator)
+        .env("NROS_SESSION_MODE", "client")
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn fibonacci server {}: {e}", server_bin.display()));
+    // Fail fast if the server died on boot (registration error, etc.).
+    thread::sleep(Duration::from_secs(3));
+    if let Some(status) = server.try_wait().expect("poll server status") {
+        let out = server.wait_with_output().expect("collect server output");
+        panic!(
+            "fibonacci server exited early ({status})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _server_guard = ChildGuard(server);
+
+    let client = Command::new(&client_bin)
+        .env("NROS_LOCATOR", &locator)
+        .env("NROS_SESSION_MODE", "client")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn action client {}: {e}", client_bin.display()));
+
+    let (exited, transcript) = wait_capture(client, Duration::from_secs(30));
+    assert!(
+        exited,
+        "action client did not finish within 30s; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Goal accepted!"),
+        "client never saw goal acceptance (generated tick path):\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Feedback #"),
+        "client never received tick-published feedback:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("Action client finished"),
+        "client did not finish cleanly:\n{transcript}"
+    );
+}
+
+/// Resolve the prebuilt native zenoh `action-client` example, building it on
+/// demand (incremental) if `just native build-fixture-rust` hasn't run. The
+/// vendored `example_interfaces` Fibonacci CDR matches the generated server's
+/// hand-mirrored types, so the two interoperate on the wire.
+fn ensure_action_client_binary() -> PathBuf {
+    let client_dir = nano_ros_workspace().join("examples/native/rust/action-client");
+    let binary = client_dir.join("target-zenoh/release/action-client");
+    if binary.is_file() {
+        return binary;
+    }
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&client_dir)
+        .args([
+            "build",
+            "--release",
+            "--no-default-features",
+            "--features",
+            "rmw-zenoh",
+            "--target-dir",
+            "target-zenoh",
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("build action-client example: {e}"));
+    assert!(
+        status.success(),
+        "building the action-client example failed; run `just native build-fixture-rust`"
+    );
+    assert!(
+        binary.is_file(),
+        "action-client binary missing after build at {}",
+        binary.display()
+    );
+    binary
+}
+
+/// Poll `child` until it exits or `timeout` elapses (killing it on timeout),
+/// then collect its full stdout+stderr. Returns `(exited_on_its_own, transcript)`.
+fn wait_capture(mut child: Child, timeout: Duration) -> (bool, String) {
+    let deadline = Instant::now() + timeout;
+    let exited = loop {
+        if child
+            .try_wait()
+            .expect("poll client process status")
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let out = child.wait_with_output().expect("collect client output");
+    let mut transcript = String::from_utf8_lossy(&out.stdout).into_owned();
+    transcript.push_str(&String::from_utf8_lossy(&out.stderr));
+    (exited, transcript)
+}
+
 /// Phase 172.E driver — compile the `demo_pkg::talker` component in metadata
 /// mode, run it against the in-memory recorder, and assert the emitted JSON is
 /// valid source-metadata describing the node + publisher + timer it declares.

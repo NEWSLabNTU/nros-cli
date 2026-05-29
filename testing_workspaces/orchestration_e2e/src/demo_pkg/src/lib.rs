@@ -103,6 +103,7 @@ pub mod talker {
         const ACTION_HASH: &'static str = "nros_test/Echo";
     }
 
+
     #[derive(Default)]
     pub struct StringMsg;
 
@@ -121,5 +122,199 @@ pub mod talker {
     impl RosMessage for StringMsg {
         const TYPE_NAME: &'static str = "std_msgs::msg::dds_::String_";
         const TYPE_HASH: &'static str = "std_msgs/String";
+    }
+}
+
+/// W.5.10 — a dedicated Fibonacci action-server component for the tick-driven
+/// runtime exchange test. Declares exactly one node + one action server (so the
+/// generated package's `MAX_ENTITIES` matches the single-entity plan), accepts
+/// the goal in `on_callback`, and drives it to completion in `tick`:
+/// `for_each_active_goal` → publish growing-sequence feedback → `complete_goal`.
+/// The Fibonacci message types mirror `example_interfaces` CDR byte-for-byte so
+/// the prebuilt `action-client` example interoperates with this generated server.
+pub mod fib_server {
+    use nros::{
+        CallbackCtx, CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult,
+        DeserError, Deserialize, EntityId, ExecutableComponent, GoalResponse, GoalStatus, NodeId,
+        NodeOptions, RosAction, RosMessage, SerError, Serialize, TickCtx,
+    };
+
+    pub struct Component;
+
+    impl nros::Component for Component {
+        const NAME: &'static str = "fib_server";
+
+        fn register(context: &mut ComponentContext<'_>) -> ComponentResult<()> {
+            let mut node =
+                context.create_node(NodeId::new("node_fib"), NodeOptions::new("fib_server"))?;
+            let _act = node.create_action_server::<FibonacciAction>(
+                EntityId::new("fib"),
+                CallbackId::new("cb_fib_goal"),
+                "fibonacci",
+            )?;
+            Ok(())
+        }
+    }
+
+    impl ExecutableComponent for Component {
+        /// Ticks since the active goal appeared (drives the sequence length).
+        type State = u32;
+
+        fn init() -> Self::State {
+            0
+        }
+
+        fn on_callback(_state: &mut Self::State, callback: CallbackId<'_>, ctx: &mut CallbackCtx<'_>) {
+            if callback.as_str() == "cb_fib_goal" {
+                // Accept + execute; `tick` drives feedback + result.
+                let _ = ctx.set_goal_response(GoalResponse::AcceptAndExecute);
+            }
+        }
+
+        fn tick(state: &mut Self::State, ctx: &mut TickCtx<'_>) {
+            let mut goal: Option<nros::GoalId> = None;
+            ctx.for_each_active_goal(EntityId::new("fib"), &mut |g, _status| {
+                if goal.is_none() {
+                    goal = Some(*g);
+                }
+            });
+            let Some(goal_id) = goal else {
+                return;
+            };
+            *state = state.wrapping_add(1);
+            let n = (*state as usize).min(11);
+            let mut sequence: nros::heapless::Vec<i32, 64> = nros::heapless::Vec::new();
+            let (mut a, mut b) = (0i32, 1i32);
+            for _ in 0..n {
+                let _ = sequence.push(a);
+                let next = a + b;
+                a = b;
+                b = next;
+            }
+            let feedback = FibonacciFeedback {
+                sequence: sequence.clone(),
+            };
+            let _ = ctx.publish_feedback::<FibonacciFeedback, 512>(
+                EntityId::new("fib"),
+                &goal_id,
+                &feedback,
+            );
+            if n >= 11 {
+                let result = FibonacciResult { sequence };
+                let _ = ctx.complete_goal::<FibonacciResult, 512>(
+                    EntityId::new("fib"),
+                    &goal_id,
+                    GoalStatus::Succeeded,
+                    &result,
+                );
+                *state = 0;
+            }
+        }
+    }
+
+    // Fibonacci message types — byte-for-byte the `example_interfaces` generated
+    // CDR (`write_u32(len)` + `write_i32` per element). Vendored here (not a
+    // path-dep into the superproject `examples/`) to keep the codegen clone
+    // standalone, but wire-identical so the example client interoperates.
+    #[derive(Default)]
+    pub struct FibonacciGoal {
+        pub order: i32,
+    }
+
+    impl Serialize for FibonacciGoal {
+        fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+            writer.write_i32(self.order)?;
+            Ok(())
+        }
+    }
+
+    impl Deserialize for FibonacciGoal {
+        fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+            Ok(Self {
+                order: reader.read_i32()?,
+            })
+        }
+    }
+
+    impl RosMessage for FibonacciGoal {
+        const TYPE_NAME: &'static str = "example_interfaces::action::dds_::Fibonacci_Goal_";
+        const TYPE_HASH: &'static str = "TypeHashNotSupported";
+    }
+
+    #[derive(Default)]
+    pub struct FibonacciResult {
+        pub sequence: nros::heapless::Vec<i32, 64>,
+    }
+
+    impl Serialize for FibonacciResult {
+        fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+            writer.write_u32(self.sequence.len() as u32)?;
+            for item in &self.sequence {
+                writer.write_i32(*item)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Deserialize for FibonacciResult {
+        fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+            let len = reader.read_u32()? as usize;
+            let mut sequence = nros::heapless::Vec::new();
+            for _ in 0..len {
+                sequence
+                    .push(reader.read_i32()?)
+                    .map_err(|_| DeserError::CapacityExceeded)?;
+            }
+            Ok(Self { sequence })
+        }
+    }
+
+    impl RosMessage for FibonacciResult {
+        const TYPE_NAME: &'static str = "example_interfaces::action::dds_::Fibonacci_Result_";
+        const TYPE_HASH: &'static str = "TypeHashNotSupported";
+    }
+
+    #[derive(Default)]
+    pub struct FibonacciFeedback {
+        pub sequence: nros::heapless::Vec<i32, 64>,
+    }
+
+    impl Serialize for FibonacciFeedback {
+        fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+            writer.write_u32(self.sequence.len() as u32)?;
+            for item in &self.sequence {
+                writer.write_i32(*item)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Deserialize for FibonacciFeedback {
+        fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+            let len = reader.read_u32()? as usize;
+            let mut sequence = nros::heapless::Vec::new();
+            for _ in 0..len {
+                sequence
+                    .push(reader.read_i32()?)
+                    .map_err(|_| DeserError::CapacityExceeded)?;
+            }
+            Ok(Self { sequence })
+        }
+    }
+
+    impl RosMessage for FibonacciFeedback {
+        const TYPE_NAME: &'static str = "example_interfaces::action::dds_::Fibonacci_Feedback_";
+        const TYPE_HASH: &'static str = "TypeHashNotSupported";
+    }
+
+    /// Matches `example_interfaces::action::Fibonacci`.
+    pub struct FibonacciAction;
+
+    impl RosAction for FibonacciAction {
+        type Goal = FibonacciGoal;
+        type Result = FibonacciResult;
+        type Feedback = FibonacciFeedback;
+        const ACTION_NAME: &'static str = "example_interfaces::action::dds_::Fibonacci_";
+        const ACTION_HASH: &'static str = "TypeHashNotSupported";
     }
 }
