@@ -333,13 +333,16 @@ pub fn provision_source(
             if dry_run {
                 return Ok(SourceDisposition::Planned);
             }
-            // `--depth 1` does a fetch-by-SHA, so it is a true depth-1 checkout
-            // of the pinned commit even when the pin lags the branch tip (a
-            // `.gitmodules` `shallow=true` alone would deepen back to full).
-            // `--recursive` only descends a source's own nested submodules.
-            let workspace = workspace.to_string_lossy();
+            // Fast path: `git submodule update --init [--recursive] [--depth 1]`.
+            // CAVEAT: `--depth 1` shallow-fetches the submodule's BRANCH TIP, not
+            // the pinned gitlink SHA — so a pin that lags its tip and isn't an
+            // advertised ref (e.g. PX4-Autopilot's 1.15.x sha vs `main`) fails the
+            // checkout here. We catch that and fall back to an explicit
+            // depth-1 fetch-by-SHA (GitHub serves reachable SHAs), which `git
+            // clone --branch` / `submodule update` can't express directly.
+            let workspace_s = workspace.to_string_lossy();
             let mut args: Vec<&str> =
-                vec!["git", "-C", &workspace, "submodule", "update", "--init"];
+                vec!["git", "-C", &workspace_s, "submodule", "update", "--init"];
             if src.recursive {
                 args.push("--recursive");
             }
@@ -349,8 +352,57 @@ pub fn provision_source(
             }
             args.push("--");
             args.push(path);
-            sh(&args, None)
-                .wrap_err_with(|| format!("git submodule update {path} (source {name})"))?;
+            let fast = sh(&args, None);
+            if let Err(e) = fast {
+                if !shallow {
+                    return Err(e)
+                        .wrap_err_with(|| format!("git submodule update {path} (source {name})"));
+                }
+                // By-SHA fallback. `submodule update` already initialised the
+                // gitdir + worktree (only its checkout of the lagging pin failed),
+                // so fetch the exact gitlink SHA at depth 1 and check it out, then
+                // descend if recursive.
+                let sha = sh_capture(
+                    &["git", "-C", &workspace_s, "ls-tree", "HEAD", path],
+                    None,
+                )
+                .wrap_err_with(|| format!("read gitlink sha for {path} (source {name})"))?
+                .split_whitespace()
+                .nth(2)
+                .map(str::to_owned)
+                .ok_or_else(|| eyre!("no gitlink sha for {path} (source {name})"))?;
+                let subdir = workspace.join(path);
+                let subdir_s = subdir.to_string_lossy();
+                sh(
+                    &[
+                        "git", "-C", &subdir_s, "fetch", "--depth", "1", "origin", &sha,
+                    ],
+                    None,
+                )
+                .wrap_err_with(|| format!("git fetch --depth 1 {sha} ({path}, source {name})"))?;
+                sh(&["git", "-C", &subdir_s, "checkout", "-q", &sha], None)
+                    .wrap_err_with(|| format!("git checkout {sha} ({path}, source {name})"))?;
+                if src.recursive {
+                    sh(
+                        &[
+                            "git",
+                            "-C",
+                            &subdir_s,
+                            "submodule",
+                            "update",
+                            "--init",
+                            "--recursive",
+                            "--depth",
+                            "1",
+                            "--recommend-shallow",
+                        ],
+                        None,
+                    )
+                    .wrap_err_with(|| {
+                        format!("git submodule update --recursive ({path}, source {name})")
+                    })?;
+                }
+            }
             Ok(SourceDisposition::Provisioned)
         }
         SourceProvision::Clone => {
@@ -442,6 +494,21 @@ fn sh(args: &[&str], cwd: Option<&Path>) -> Result<()> {
         bail!("`{}` failed ({status})", args.join(" "));
     }
     Ok(())
+}
+
+/// Run a command and capture trimmed stdout (for reading a gitlink SHA, etc.).
+fn sh_capture(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+    let (cmd, rest) = args.split_first().ok_or_else(|| eyre!("empty command"))?;
+    let mut c = Command::new(cmd);
+    c.args(rest);
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    let out = c.output().wrap_err_with(|| format!("spawn {cmd}"))?;
+    if !out.status.success() {
+        bail!("`{}` failed ({})", args.join(" "), out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 #[cfg(test)]
