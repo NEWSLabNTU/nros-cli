@@ -2318,12 +2318,30 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                 callback.source_callback.as_str(),
             ) {
                 Some((_node_id, PlanEntity::Timer { period_ms, .. })) => {
-                    out.push(format!(
-                        "    let handle_{callback_index} = executor.register_timer(nros::TimerDuration::from_millis({period_ms}), || {{}})?;\n"
-                    ));
-                    out.push(format!(
-                        "    handles.set({callback_index}, handle_{callback_index}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
-                    ));
+                    // W.5.3 — a rust component with an `ExecutableComponent` impl
+                    // dispatches a real body; the closure owns the component
+                    // `State` + a resolver owning the instance's publishers (no
+                    // statics, no_std-clean). Non-rust / non-executable timers
+                    // keep the noop tick.
+                    if let Some(comp_path) = rust_executable_component_path(plan, instance) {
+                        emit_executable_timer(
+                            &mut out,
+                            callback_index,
+                            &comp_path,
+                            // The component matches the *source* CallbackId it
+                            // declared (`cb_timer`), not the plan-prefixed id.
+                            callback.source_callback.as_str(),
+                            *period_ms,
+                            instance,
+                        );
+                    } else {
+                        out.push(format!(
+                            "    let handle_{callback_index} = executor.register_timer(nros::TimerDuration::from_millis({period_ms}), || {{}})?;\n"
+                        ));
+                        out.push(format!(
+                            "    handles.set({callback_index}, handle_{callback_index}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+                        ));
+                    }
                 }
                 Some((
                     node_id,
@@ -2410,6 +2428,124 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
         }
     }
     out
+}
+
+/// W.5.3 — the rust component type path for an instance whose component is a
+/// rust component (so it may impl `ExecutableComponent`); `None` for native
+/// (C/C++) components, which keep the noop path.
+fn rust_executable_component_path(plan: &NrosPlan, instance: &PlanInstance) -> Option<String> {
+    let comp = plan
+        .components
+        .iter()
+        .find(|c| c.id == instance.component)?;
+    if !matches!(comp.language.as_str(), "rust" | "Rust") {
+        return None;
+    }
+    rust_component_type_path(&comp.id)
+}
+
+/// W.5.3 — every publisher entity declared across an instance's nodes, as
+/// `(entity_id, topic, type_name, type_hash, owning_node_id)`. These are the
+/// publishers a callback's `CallbackCtx` can publish through.
+fn instance_publishers(instance: &PlanInstance) -> Vec<(String, String, String, String, String)> {
+    let mut pubs = Vec::new();
+    for node in &instance.nodes {
+        for entity in &node.entities {
+            if let PlanEntity::Publisher {
+                source_entity,
+                resolved_name,
+                interface,
+                ..
+            } = entity
+            {
+                // Key on the *source* entity id (`pub_chatter`), not the
+                // plan-prefixed id (`talker_1/pub_chatter`): the component body
+                // publishes via the `EntityId` it declared in `register`.
+                pubs.push((
+                    source_entity.clone(),
+                    resolved_name.clone(),
+                    interface_type_name(interface),
+                    interface_type_hash(interface),
+                    node.id.clone(),
+                ));
+            }
+        }
+    }
+    pubs
+}
+
+/// W.5.3 — emit a timer callback that runs a real `ExecutableComponent` body.
+/// The move-closure owns the component `State` + a generated `PublisherResolver`
+/// owning the instance's publishers, so the body publishes immediately with no
+/// statics (no_std-clean). Single-callback-per-state model; shared state across
+/// a component's callbacks is a follow-up.
+fn emit_executable_timer(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    period_ms: u64,
+    instance: &PlanInstance,
+) {
+    let pubs = instance_publishers(instance);
+    // Generated resolver struct + impl owning this callback's publishers.
+    let fields = pubs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("p{i}: nros::EmbeddedRawPublisher"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(format!("    struct Resolver{idx} {{ {fields} }}\n"));
+    out.push(format!(
+        "    impl nros::PublisherResolver for Resolver{idx} {{\n"
+    ));
+    out.push(
+        "        fn publish_raw(&self, entity_id: &str, data: &[u8]) -> nros::ComponentResult<()> {\n"
+            .to_string(),
+    );
+    out.push("            match entity_id {\n".to_string());
+    for (i, (entity_id, ..)) in pubs.iter().enumerate() {
+        out.push(format!(
+            "                {entity_id:?} => self.p{i}.publish_raw(data).map_err(|_| nros::ComponentError::Runtime),\n"
+        ));
+    }
+    out.push("                _ => Err(nros::ComponentError::Runtime),\n".to_string());
+    out.push("            }\n        }\n    }\n".to_string());
+    // Create each publisher on its owning node.
+    for (i, (_entity_id, topic, type_name, type_hash, node_id)) in pubs.iter().enumerate() {
+        out.push(format!(
+            "    let pubnode_{idx}_{i} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+        ));
+        out.push(format!(
+            "    let pubnh_{idx}_{i} = executor.node_id_by_name(pubnode_{idx}_{i}.node_name, pubnode_{idx}_{i}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+        ));
+        out.push(format!(
+            "    let p{i}_{idx} = executor.node_mut(pubnh_{idx}_{i}).publisher({topic:?}).generic({type_name:?}, {type_hash:?}).build()?;\n"
+        ));
+    }
+    let init = pubs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("p{i}: p{i}_{idx}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(format!("    let resolver{idx} = Resolver{idx} {{ {init} }};\n"));
+    out.push(format!(
+        "    let mut state{idx} = <{comp_path} as nros::ExecutableComponent>::init();\n"
+    ));
+    out.push(format!(
+        "    let handle_{idx} = executor.register_timer(nros::TimerDuration::from_millis({period_ms}), move || {{\n"
+    ));
+    out.push(format!(
+        "        let mut cb_ctx = nros::CallbackCtx::new(&[], &resolver{idx});\n"
+    ));
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut state{idx}, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("    })?;\n".to_string());
+    out.push(format!(
+        "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
 }
 
 fn find_callback_entity<'a>(

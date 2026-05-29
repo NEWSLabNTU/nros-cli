@@ -2,8 +2,9 @@
 
 pub mod talker {
     use nros::{
-        CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult, DeserError,
-        Deserialize, EntityId, NodeId, NodeOptions, RosMessage, SerError, Serialize, TimerDuration,
+        CallbackCtx, CallbackId, CdrReader, CdrWriter, ComponentContext, ComponentResult,
+        DeserError, Deserialize, EntityId, ExecutableComponent, NodeId, NodeOptions, RosMessage,
+        SerError, Serialize, TimerDuration,
     };
 
     pub struct Component;
@@ -22,6 +23,27 @@ pub mod talker {
                 TimerDuration::from_millis(100),
             )?;
             Ok(())
+        }
+    }
+
+    // W.5 — executable body: the timer callback publishes a counter each tick.
+    impl ExecutableComponent for Component {
+        /// Tick counter (this component's per-instance state).
+        type State = u32;
+
+        fn init() -> Self::State {
+            0
+        }
+
+        fn on_callback(
+            state: &mut Self::State,
+            callback: CallbackId<'_>,
+            ctx: &mut CallbackCtx<'_>,
+        ) {
+            if callback.as_str() == "cb_timer" {
+                *state = state.wrapping_add(1);
+                let _ = ctx.publish::<StringMsg, 64>(EntityId::new("pub_chatter"), &StringMsg);
+            }
         }
     }
 

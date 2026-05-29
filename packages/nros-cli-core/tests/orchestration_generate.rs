@@ -158,6 +158,39 @@ fn generated_package_writes_manifest_build_script_and_main() {
     assert!(output_dir.join("include/demo_system.h").is_file());
 }
 
+/// Phase 172 W.5.3 — a rust component's timer callback generates a real
+/// `ExecutableComponent::on_callback` dispatch (not the noop `|| {}`): a
+/// generated `PublisherResolver` keyed on the *source* entity id, the publisher
+/// created via the builder, and the dispatch using the *source* callback id.
+#[test]
+fn executable_timer_emits_on_callback_dispatch() {
+    let output_dir = generate_fixture("executable_timer_emits_on_callback_dispatch", "plan_pub_sub.json");
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+
+    // Real dispatch into the component body (replaces the noop tick).
+    assert!(
+        build_rs.contains("as nros::ExecutableComponent>::on_callback"),
+        "timer dispatches the component body:\n{build_rs}"
+    );
+    assert!(build_rs.contains("nros::CallbackCtx::new"));
+    assert!(build_rs.contains("as nros::ExecutableComponent>::init()"));
+    // Generated resolver keyed on the SOURCE entity id (`pub_chatter`), not the
+    // plan-prefixed `talker_1/pub_chatter`.
+    assert!(
+        build_rs.contains("impl nros::PublisherResolver for Resolver0")
+            && build_rs.contains("\\\"pub_chatter\\\" =>"),
+        "resolver keyed on source entity id:\n{build_rs}"
+    );
+    assert!(
+        !build_rs.contains("\\\"talker_1/pub_chatter\\\" =>"),
+        "must not key on the plan-prefixed entity id"
+    );
+    // Publisher created via the builder; dispatch uses the SOURCE callback id.
+    assert!(build_rs.contains(".publisher(\\\"/chatter\\\").generic("));
+    assert!(build_rs.contains("nros::CallbackId::new(\\\"cb_timer\\\")"));
+    assert!(!build_rs.contains("nros::CallbackId::new(\\\"talker_1/cb_timer\\\")"));
+}
+
 #[test]
 fn generated_package_features_follow_rtos_plan() {
     let root = temp_output("generated_package_features_follow_rtos_plan");
