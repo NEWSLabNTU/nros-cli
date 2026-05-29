@@ -573,6 +573,20 @@ impl PlanBuildOptions {
         self.transports.len() > 1
     }
 
+    /// Phase 204.7 — `true` when the declared transports carry **no IP link**
+    /// (every transport is serial/CAN, none ethernet/wifi). The generated
+    /// `.cargo/config.toml` then bakes `NROS_LINK_IP=0` so the zenoh-pico /
+    /// XRCE TCP+UDP link C is dropped (with `--gc-sections`, ~‑33 KB BSS on a
+    /// bare-metal serial build). Empty transports ⇒ `false` (zero-config build
+    /// keeps the board default IP link).
+    pub fn drops_ip_link(&self) -> bool {
+        !self.transports.is_empty()
+            && self
+                .transports
+                .iter()
+                .all(|t| matches!(t.kind, TransportKind::Serial | TransportKind::Can))
+    }
+
     /// Validate the `[[transport]]` array against per-kind field rules.
     /// Returns the list of human-readable problems (empty ⇒ valid) so
     /// the caller can surface them all at once rather than one per run.

@@ -1218,7 +1218,53 @@ fn render_cargo_config(options: &GenerateOptions, plan: &NrosPlan) -> Option<Str
     // `${workspace}` placeholders for any layout path); the CLI bakes in no
     // per-platform config. Boards needing no config omit the field.
     let workspace = workspace_from_nros_path(&options.nros_path)?;
-    profile(&plan.build)?.cargo_config_rendered(&workspace)
+    let body = profile(&plan.build)?.cargo_config_rendered(&workspace);
+
+    // Phase 204.7 — a serial/CAN-only build carries no IP link, so bake
+    // `NROS_LINK_IP=0` into the generated `[env]` (the board's `LinkFeatures`
+    // gate drops the zenoh-pico / XRCE TCP+UDP link C). Generator-side, not in
+    // the board descriptor: the same board (e.g. mps2-an385) builds either
+    // ethernet *or* serial, so only the per-build transport choice can decide.
+    if plan.build.drops_ip_link() {
+        Some(inject_env_var(
+            body.unwrap_or_default(),
+            "NROS_LINK_IP",
+            "0",
+        ))
+    } else {
+        body
+    }
+}
+
+/// Phase 204.7 — set `key = "value"` in a `.cargo/config.toml` `[env]` table,
+/// merging into an existing `[env]` (idempotent — skips if already present) or
+/// appending a new top-level `[env]` table. Keeps the rest of the board's
+/// verbatim config untouched.
+fn inject_env_var(body: String, key: &str, value: &str) -> String {
+    let prefix_space = format!("{key} ");
+    let prefix_eq = format!("{key}=");
+    if body.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with(&prefix_space) || t.starts_with(&prefix_eq)
+    }) {
+        return body; // already set (board config or a prior pass)
+    }
+    let assignment = format!("{key} = \"{value}\"");
+    if let Some(pos) = body.lines().position(|l| l.trim() == "[env]") {
+        let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+        lines.insert(pos + 1, assignment);
+        lines.join("\n") + "\n"
+    } else {
+        let mut out = body;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[env]\n{assignment}\n"));
+        out
+    }
 }
 
 fn path_for_template(path: &Path) -> String {
@@ -3818,6 +3864,54 @@ mod net_fragment_tests {
         // Unknown intent is inert (no profile), not an error.
         b.optimize = Some("bogus".to_string());
         assert_eq!(render_profile_section(&b), "");
+    }
+
+    #[test]
+    fn inject_env_var_merges_or_appends_link_ip() {
+        // No [env] → append a new table.
+        let body = "[build]\ntarget = \"thumbv7m-none-eabi\"\n".to_string();
+        let out = inject_env_var(body, "NROS_LINK_IP", "0");
+        assert!(out.contains("[env]\nNROS_LINK_IP = \"0\""), "{out}");
+
+        // Existing [env] → insert into it (key right after the header).
+        let body = "[env]\nFOO = \"1\"\n\n[build]\ntarget = \"x\"\n".to_string();
+        let out = inject_env_var(body, "NROS_LINK_IP", "0");
+        assert!(
+            out.contains("[env]\nNROS_LINK_IP = \"0\"\nFOO = \"1\""),
+            "{out}"
+        );
+        // FOO untouched, single [env] table.
+        assert_eq!(out.matches("[env]").count(), 1, "{out}");
+
+        // Already present → idempotent (no duplicate).
+        let body = "[env]\nNROS_LINK_IP = \"0\"\n".to_string();
+        let out = inject_env_var(body.clone(), "NROS_LINK_IP", "0");
+        assert_eq!(out.matches("NROS_LINK_IP").count(), 1, "{out}");
+
+        // Empty body → just the [env] table.
+        let out = inject_env_var(String::new(), "NROS_LINK_IP", "0");
+        assert_eq!(out, "[env]\nNROS_LINK_IP = \"0\"\n");
+    }
+
+    #[test]
+    fn drops_ip_link_only_for_serial_can_only_builds() {
+        use crate::orchestration::plan::{PlanTransport, TransportKind};
+        let mk = |k: &str| -> PlanTransport {
+            serde_json::from_value(serde_json::json!({ "kind": k })).unwrap()
+        };
+        let _ = TransportKind::Serial; // keep the import meaningful
+        let mut b = build_with(vec![]);
+        assert!(!b.drops_ip_link(), "empty transports keep board default");
+        b.transports = vec![mk("serial")];
+        assert!(b.drops_ip_link(), "serial-only drops IP");
+        b.transports = vec![mk("serial"), mk("can")];
+        assert!(b.drops_ip_link(), "serial+can drops IP");
+        b.transports = vec![mk("ethernet")];
+        assert!(!b.drops_ip_link(), "ethernet keeps IP");
+        b.transports = vec![mk("serial"), mk("ethernet")];
+        assert!(!b.drops_ip_link(), "any IP transport keeps IP");
+        b.transports = vec![mk("wifi")];
+        assert!(!b.drops_ip_link(), "wifi keeps IP");
     }
 
     #[test]
