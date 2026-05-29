@@ -801,6 +801,68 @@ fn fixture_workspace_builds_generated_bare_metal_service_action_package() {
     );
 }
 
+/// Phase 172 W.5.11 — no_std action *execution*. The dedicated `fib_server`
+/// component (single action + a real `tick` that drives feedback/result via
+/// `for_each_active_goal`) on a no_std target (bare-metal Cortex-M3) compiles
+/// through the module-level static action ctx + `tick_{idx}` + the infinite
+/// `run_tick_loop_nostd` (no `thread_local`/alloc/`is_halted`); the no_std self
+/// shim spins via it. Compile-only (no embedded action client to exchange with).
+#[test]
+fn fixture_workspace_builds_generated_bare_metal_fibonacci_action_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_bare_metal_fib");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-bare-metal-fib");
+    let plan_path = out_dir.join("nros-plan-bare-metal-fib.json");
+    fs::create_dir_all(&out_dir).expect("create bare-metal fib output dir");
+
+    // plan_fibonacci_action already targets the single-entity `demo_pkg::fib_server`.
+    let mut plan = fixture_plan("plan_fibonacci_action.json");
+    retarget_plan_to_bare_metal(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize bare-metal fib plan"),
+    )
+    .expect("write bare-metal fib plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated bare-metal fib plan");
+    build_generated_package(&BuildOptions {
+        package_name: "nros-e2e-generated-bare-metal-fib".to_string(),
+        output_dir: generated_dir.clone(),
+        plan_path,
+        workspace_root: nano_ros_workspace(),
+        component_workspace: Some(fixture),
+        release: true,
+        target: None,
+        cargo_args: Vec::new(),
+        force: false,
+    })
+    .expect("build command compiles generated bare-metal fib package");
+
+    let build_rs =
+        fs::read_to_string(generated_dir.join("build.rs")).expect("read generated build.rs");
+    assert!(build_rs.contains("static mut ACT_HANDLE_"));
+    assert!(build_rs.contains("fn tick_"));
+    assert!(build_rs.contains("pub fn run_tick_loop_nostd("));
+    assert!(!build_rs.contains("TICK_ENTRIES"));
+    let main_rs = fs::read_to_string(generated_dir.join("src/main.rs")).expect("read main.rs");
+    assert!(main_rs.contains("run_tick_loop_nostd(&mut executor)"));
+
+    let binary = out_dir
+        .join("target")
+        .join("thumbv7m-none-eabi")
+        .join("release")
+        .join("nros-e2e-generated-bare-metal-fib");
+    assert!(
+        binary.is_file(),
+        "generated bare-metal fib binary exists at {}",
+        binary.display()
+    );
+}
+
 /// Phase 126.M5.threadx — drives the orchestration generator against
 /// the ThreadX-Linux board (host-hosted ThreadX + NetX Duo over the
 /// NSOS BSD shim). Builds as a normal x86_64 Linux ELF — no custom

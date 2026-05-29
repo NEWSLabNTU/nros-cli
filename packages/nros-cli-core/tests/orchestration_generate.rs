@@ -568,18 +568,27 @@ fn generated_no_std_service_action_uses_static_context() {
     assert!(build_rs.contains("nros::CallbackCtx::with_reply"));
     assert!(build_rs.contains("nros::CallbackCtx::with_goal_decision"));
     assert!(build_rs.contains("as nros::ExecutableComponent>::on_callback"));
-    // The context lives in a function-local `static mut`, read via addr_of_mut!.
+    // The context lives in a `static mut`, read via addr_of_mut! (service is
+    // fn-local; the action's is module-level so the W.5.11 tick can reach it).
     assert!(build_rs.contains("static mut SVC_CTX_"));
     assert!(build_rs.contains("static mut ACT_CTX_"));
     assert!(build_rs.contains("core::ptr::addr_of_mut!(SVC_CTX_"));
     assert!(build_rs.contains("core::ptr::addr_of_mut!(ACT_CTX_"));
     assert!(build_rs.contains("register_service_raw_sized_on::<1024, 1024>"));
     assert!(build_rs.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>"));
-    // No std-only mechanisms: no Box::leak ctx, no Rc shared state, no tick loop.
+    // W.5.11 — no_std action execution: per-action `static mut` handle + `tick_`
+    // fn + `GenActionExec`, driven by `run_tick_loop_nostd` (infinite spin_once +
+    // tick, no halt); the no_std self shim spins via it.
+    assert!(build_rs.contains("static mut ACT_HANDLE_"));
+    assert!(build_rs.contains("fn tick_"));
+    assert!(build_rs.contains("impl nros::ActionExecutor for GenActionExec"));
+    assert!(build_rs.contains("pub fn run_tick_loop_nostd("));
+    // No std-only mechanisms: no Box::leak ctx, no Rc shared state, no
+    // thread_local tick registry, no std `run_tick_loop`.
     assert!(!build_rs.contains("::std::boxed::Box::into_raw"));
     assert!(!build_rs.contains("::std::rc::Rc::new"));
     assert!(!build_rs.contains("TICK_ENTRIES"));
-    assert!(!build_rs.contains("run_tick_loop"));
+    assert!(!build_rs.contains("thread_local!"));
     assert!(!build_rs.contains("unsupported generated callback"));
 }
 

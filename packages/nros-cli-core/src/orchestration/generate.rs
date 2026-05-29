@@ -421,6 +421,10 @@ fn render_entry_lib_rs(plan: &NrosPlan) -> String {
     if has_shared_instance(plan) {
         reexports.push_str(", run_tick_loop");
     }
+    // W.5.11 — the no_std action tick loop the board/self shim spins through.
+    if has_no_std_action(plan) {
+        reexports.push_str(", run_tick_loop_nostd");
+    }
     out.push_str(&format!("pub use nros_generated::{{{reexports}}};\n\n"));
 
     if !c_abi {
@@ -517,11 +521,22 @@ fn render_hosted_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String
     // W.5.6 — std builds with a rust executable instance spin via the manual
     // spin-once + tick loop (`run_tick_loop`) instead of plain `spin_blocking`.
     let shared = has_shared_instance(plan);
-    let tick_use = if shared { ", run_tick_loop" } else { "" };
+    // W.5.11 — no_std action plans spin via the no_std action tick loop.
+    let nostd_action = has_no_std_action(plan);
+    let tick_use = match (shared, nostd_action) {
+        (true, _) => ", run_tick_loop",
+        (false, true) => ", run_tick_loop_nostd",
+        (false, false) => "",
+    };
     let std_spin = if shared {
         "return run_tick_loop(&mut executor);"
     } else {
         "return executor.spin_blocking(SpinOptions::default());"
+    };
+    let nostd_spin = if nostd_action {
+        "run_tick_loop_nostd(&mut executor)"
+    } else {
+        "executor.spin_default()"
     };
     // Multi-session (bridge or multi-domain): the open_multi path opens
     // sessions from baked SESSION_SPECS — no `ExecutorConfig`. Same cfg-gated
@@ -539,7 +554,7 @@ fn render_hosted_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String
              \x20   #[cfg(feature = \"std\")]\n\
              \x20   {std_spin}\n\
              \x20   #[cfg(not(feature = \"std\"))]\n\
-             \x20   executor.spin_default()\n\
+             \x20   {nostd_spin}\n\
              }}\n"
         );
     }
@@ -562,7 +577,7 @@ fn render_hosted_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String
          \x20   #[cfg(feature = \"std\")]\n\
          \x20   {std_spin}\n\
          \x20   #[cfg(not(feature = \"std\"))]\n\
-         \x20   executor.spin_default()\n\
+         \x20   {nostd_spin}\n\
          }}\n"
     )
 }
@@ -620,6 +635,19 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
         .expect("render_board_shim_main: board_entry present (gated by emits_entry_lib)");
     let apply_config = emits_transport_config_override(plan);
     let bridge = is_multi_session(plan);
+    // W.5.11 — a no_std action plan spins via the action tick loop instead of
+    // plain `spin_default`, so the board's `tick` bodies drive feedback/result.
+    let nostd_action = has_no_std_action(plan);
+    let tick_use = if nostd_action {
+        ", run_tick_loop_nostd"
+    } else {
+        ""
+    };
+    let board_spin = if nostd_action {
+        "run_tick_loop_nostd(&mut executor)"
+    } else {
+        "executor.spin_default()"
+    };
     let cfg_expr = if apply_config {
         format!(
             "{{\n            let mut cfg = {b}::Config::default();\n\
@@ -640,9 +668,11 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
     );
     out.push_str("use nros::prelude::*;\n");
     let imports = if bridge {
-        format!("use {krate}::{{build_executor_bridge, register_all}};\n")
+        format!("use {krate}::{{build_executor_bridge, register_all{tick_use}}};\n")
     } else {
-        format!("use {krate}::{{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all}};\n")
+        format!(
+            "use {krate}::{{SYSTEM, TRANSPORT_LOCATOR, build_executor, register_all{tick_use}}};\n"
+        )
     };
     out.push_str(&imports);
     if !entry.crate_root_extra.is_empty() {
@@ -663,7 +693,7 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
             " {{\n    {b}::run(\n        {cfg_expr},\n        |_board_config| -> core::result::Result<(), nros::NodeError> {{\n\
              \x20           let mut executor = build_executor_bridge()?;\n\
              \x20           register_all(&mut executor)?;\n\
-             \x20           executor.spin_default()\n\
+             \x20           {board_spin}\n\
              \x20       }},\n    )\n}}\n",
             b = entry.crate_name,
         ));
@@ -675,7 +705,7 @@ fn render_board_shim_main(options: &GenerateOptions, plan: &NrosPlan) -> String 
              \x20               .node_name(SYSTEM.default_node_name()){extra};\n\
              \x20           let mut executor = build_executor(&config)?;\n\
              \x20           register_all(&mut executor)?;\n\
-             \x20           executor.spin_default()\n\
+             \x20           {board_spin}\n\
              \x20       }},\n    )\n}}\n",
             b = entry.crate_name,
             extra = entry.closure_extra,
@@ -1504,6 +1534,22 @@ fn has_shared_instance(plan: &NrosPlan) -> bool {
         })
 }
 
+/// W.5.11 — true if the plan has ≥1 **no_std** rust executable action server, so
+/// the no_std action execution path (`tick_{idx}` module fns + `GenActionExec` +
+/// `run_tick_loop_nostd`) is emitted and the no_std spin entrypoints route
+/// through it.
+fn has_no_std_action(plan: &NrosPlan) -> bool {
+    !uses_std(&plan.build)
+        && plan.instances.iter().any(|instance| {
+            rust_executable_component_path(plan, instance).is_some()
+                && instance.nodes.iter().any(|node| {
+                    node.entities
+                        .iter()
+                        .any(|e| matches!(e, PlanEntity::ActionServer { .. }))
+                })
+        })
+}
+
 // ============================================================================
 // Phase 195.C — board profile resolved from workspace descriptors
 // ----------------------------------------------------------------------------
@@ -1771,12 +1817,18 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     // each spin. `GenActionExec` is the runtime `ActionExecutor` the tick `ctx`
     // delegates complete-goal / publish-feedback to, resolving the action handle
     // by the source entity id and driving it through the live executor.
+    // `TICK_ENTRIES` (std boxed closures) is the std tick registry only.
     if has_shared_instance(plan) {
         out.push_str(
             "thread_local! {\n    \
              static TICK_ENTRIES: ::core::cell::RefCell<::std::vec::Vec<::std::boxed::Box<dyn FnMut(&mut nros::Executor)>>> = ::core::cell::RefCell::new(::std::vec::Vec::new());\n\
              }\n\n",
         );
+    }
+    // `GenActionExec` is the runtime `ActionExecutor` both the std tick closures
+    // and the no_std `tick_{idx}` delegate to (no std-only constructs, so it is
+    // shared by both paths).
+    if has_shared_instance(plan) || has_no_std_action(plan) {
         out.push_str(
             "struct GenActionExec<'e> {\n    \
              executor: &'e mut nros::Executor,\n    \
@@ -1838,13 +1890,20 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     out.push_str("    instantiate_callback_handles(executor, handles)?;\n");
     out.push_str("    Ok(())\n");
     out.push_str("}\n");
+    let regs = render_callback_registrations(plan);
+    // W.5.11 — module-level items the no_std action tick path needs (ctx struct +
+    // `static mut`s + decision trampolines + `tick_{idx}`), emitted at module
+    // scope so `run_tick_loop` can reach them.
+    for item in &regs.module_items {
+        out.push_str(item);
+    }
     out.push_str("\nfn instantiate_callback_handles(executor: &mut nros::Executor, handles: &mut CallbackHandleTable<CALLBACK_COUNT>) -> Result<(), nros::NodeError> {\n");
-    for line in render_callback_registrations(plan) {
-        out.push_str(&line);
+    for line in &regs.inline {
+        out.push_str(line);
     }
     out.push_str("    Ok(())\n");
     out.push_str("}\n");
-    render_entry_lib_fns(&mut out, plan);
+    render_entry_lib_fns(&mut out, plan, &regs.no_std_tick_idxs);
     out
 }
 
@@ -1859,7 +1918,7 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
 /// * `register_all(executor)` — the full post-open wiring on an already-opened
 ///   executor: sched contexts → instantiate components → bind callbacks →
 ///   lifecycle → parameter persistence.
-fn render_entry_lib_fns(out: &mut String, plan: &NrosPlan) {
+fn render_entry_lib_fns(out: &mut String, plan: &NrosPlan, no_std_tick_idxs: &[usize]) {
     out.push_str(
         "\npub fn build_executor(config: &nros::ExecutorConfig<'_>) -> Result<nros::Executor, nros::NodeError> {\n",
     );
@@ -1897,6 +1956,21 @@ fn render_entry_lib_fns(out: &mut String, plan: &NrosPlan) {
         out.push_str("        });\n");
         out.push_str("    }\n");
         out.push_str("    Ok(())\n");
+        out.push_str("}\n");
+    }
+    // W.5.11 — the no_std action execution loop. `is_halted`/`spin_blocking` are
+    // std-only and there's no `thread_local`/alloc, so this is an infinite
+    // `spin_once` + per-action `tick_{idx}` loop (mirrors `spin_default`'s
+    // never-returns shape); each `tick_{idx}` reads its module-level `static mut`
+    // ctx + handle and drives feedback/result via `GenActionExec`.
+    if !no_std_tick_idxs.is_empty() {
+        out.push_str("\npub fn run_tick_loop_nostd(executor: &mut nros::Executor) -> ! {\n");
+        out.push_str("    loop {\n");
+        out.push_str("        executor.spin_once(::core::time::Duration::from_millis(50));\n");
+        for idx in no_std_tick_idxs {
+            out.push_str(&format!("        tick_{idx}(executor);\n"));
+        }
+        out.push_str("    }\n");
         out.push_str("}\n");
     }
 }
@@ -2407,8 +2481,22 @@ fn render_parameters(out: &mut String, plan: &NrosPlan) {
     out.push_str("];\n\n");
 }
 
-fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
+/// Output of [`render_callback_registrations`]: the inline body of
+/// `instantiate_callback_handles`, plus (W.5.11) module-level items the no_std
+/// action tick path needs (struct/statics/trampolines/tick fns can't be
+/// fn-local, since the separate `run_tick_loop` must reach them) and the list of
+/// no_std action tick-fn indices `run_tick_loop` drives.
+#[derive(Default)]
+struct CallbackRegistrations {
+    inline: Vec<String>,
+    module_items: Vec<String>,
+    no_std_tick_idxs: Vec<usize>,
+}
+
+fn render_callback_registrations(plan: &NrosPlan) -> CallbackRegistrations {
     let mut out = Vec::new();
+    let mut module_items: Vec<String> = Vec::new();
+    let mut no_std_tick_idxs: Vec<usize> = Vec::new();
     let mut callback_index = 0usize;
     let std_build = uses_std(&plan.build);
     for (inst_idx, instance) in plan.instances.iter().enumerate() {
@@ -2599,15 +2687,19 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                     } else if let Some(comp_path) = &comp_path {
                         emit_static_action(
                             &mut out,
+                            &mut module_items,
                             callback_index,
                             comp_path,
                             cb_id,
                             node_id,
                             resolved_name,
+                            source_entity,
                             &interface_type_name(interface),
                             &interface_type_hash(interface),
                             instance,
                         );
+                        // W.5.11 — drive this action's `tick` from the no_std loop.
+                        no_std_tick_idxs.push(callback_index);
                     } else {
                         out.push(format!(
                             "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
@@ -2648,7 +2740,11 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
             );
         }
     }
-    out
+    CallbackRegistrations {
+        inline: out,
+        module_items,
+        no_std_tick_idxs,
+    }
 }
 
 /// W.5.6 — push the instance's tick closure into `TICK_ENTRIES`. The closure
@@ -3217,68 +3313,80 @@ fn emit_static_service(
     ));
 }
 
-/// W.5.8 — an action server's goal/cancel decision bodies on a **no_std** rust
-/// executable component. Like `emit_shared_action` but the `(state, resolver)`
-/// context lives in a function-local `static mut` (no alloc); both trampolines
-/// read it via `addr_of_mut!`. Execution (feedback/result) still rides the tick
-/// hook on std — no_std tick is the broader W.5.6 follow-up.
+/// W.5.8 + W.5.11 — an action server on a **no_std** rust executable component.
+/// The `(state, resolver)` context + the registered handle live in *module-level*
+/// `static mut`s (no alloc, no `thread_local`) so both the goal/cancel decision
+/// trampolines (W.5.8) and the per-spin `tick_{idx}` (W.5.11, called from the
+/// no_std `run_tick_loop`) can reach them — a function-local static can't be seen
+/// from the separate spin loop. The decision bodies run via the trampolines; the
+/// execution body (feedback/result) runs in `tick_{idx}` over a `GenActionExec`.
+/// `module` collects the module-level items; `out` the inline registration.
 #[allow(clippy::too_many_arguments)]
 fn emit_static_action(
     out: &mut Vec<String>,
+    module: &mut Vec<String>,
     idx: usize,
     comp_path: &str,
     callback_id: &str,
     node_id: &str,
     action: &str,
+    source_entity: &str,
     type_name: &str,
     type_hash: &str,
     instance: &PlanInstance,
 ) {
-    emit_executable_prelude(out, idx, comp_path, instance, false);
-    out.push(format!(
-        "    struct ActionCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+    let pubs = instance_publishers(instance);
+    let key = idx.to_string();
+    // --- module-level items ---
+    emit_resolver_struct(module, &key, &pubs);
+    module.push(format!(
+        "struct ActionCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
     ));
-    out.push(format!(
-        "    static mut ACT_CTX_{idx}: Option<ActionCtx{idx}> = None;\n"
+    module.push(format!(
+        "static mut ACT_CTX_{idx}: Option<ActionCtx{idx}> = None;\n"
+    ));
+    module.push(format!(
+        "static mut ACT_HANDLE_{idx}: Option<nros::ActionServerRawHandle> = None;\n"
     ));
     // goal-decision trampoline
-    out.push(format!(
-        "    unsafe extern \"C\" fn goal_tramp_{idx}(_goal_id: *const nros::GoalId, goal_data: *const u8, goal_len: usize, _ctx: *mut core::ffi::c_void) -> nros::GoalResponse {{\n"
+    module.push(format!(
+        "unsafe extern \"C\" fn goal_tramp_{idx}(_goal_id: *const nros::GoalId, goal_data: *const u8, goal_len: usize, _ctx: *mut core::ffi::c_void) -> nros::GoalResponse {{\n    \
+         let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return nros::GoalResponse::Reject }};\n    \
+         let goal_slice = unsafe {{ core::slice::from_raw_parts(goal_data, goal_len) }};\n    \
+         let mut resp = nros::GoalResponse::Reject;\n    \
+         let mut cb_ctx = nros::CallbackCtx::with_goal_decision(goal_slice, &actx.resolver, &mut resp);\n    \
+         <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n    \
+         resp\n}}\n"
     ));
-    out.push(format!(
-        "        let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return nros::GoalResponse::Reject }};\n"
-    ));
-    out.push(
-        "        let goal_slice = unsafe { core::slice::from_raw_parts(goal_data, goal_len) };\n"
-            .to_string(),
-    );
-    out.push("        let mut resp = nros::GoalResponse::Reject;\n".to_string());
-    out.push(
-        "        let mut cb_ctx = nros::CallbackCtx::with_goal_decision(goal_slice, &actx.resolver, &mut resp);\n"
-            .to_string(),
-    );
-    out.push(format!(
-        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
-    ));
-    out.push("        resp\n    }\n".to_string());
     // cancel-decision trampoline
-    out.push(format!(
-        "    unsafe extern \"C\" fn cancel_tramp_{idx}(_goal_id: *const nros::GoalId, _status: nros::GoalStatus, _ctx: *mut core::ffi::c_void) -> nros::CancelResponse {{\n"
+    module.push(format!(
+        "unsafe extern \"C\" fn cancel_tramp_{idx}(_goal_id: *const nros::GoalId, _status: nros::GoalStatus, _ctx: *mut core::ffi::c_void) -> nros::CancelResponse {{\n    \
+         let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return nros::CancelResponse::Rejected }};\n    \
+         let mut resp = nros::CancelResponse::Rejected;\n    \
+         let mut cb_ctx = nros::CallbackCtx::with_cancel_decision(&[], &actx.resolver, &mut resp);\n    \
+         <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n    \
+         resp\n}}\n"
     ));
-    out.push(format!(
-        "        let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return nros::CancelResponse::Rejected }};\n"
+    // per-spin execution tick (W.5.11)
+    module.push(format!(
+        "fn tick_{idx}(executor: &mut nros::Executor) {{\n    \
+         let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return }};\n    \
+         let handle = match unsafe {{ *core::ptr::addr_of!(ACT_HANDLE_{idx}) }} {{ Some(h) => h, None => return }};\n    \
+         let __handles: [(&'static str, nros::ActionServerRawHandle); 1] = [({source_entity:?}, handle)];\n    \
+         let mut __ae = GenActionExec {{ executor, handles: &__handles }};\n    \
+         let mut __tc = nros::TickCtx::new(&actx.resolver, &mut __ae);\n    \
+         <{comp_path} as nros::ExecutableComponent>::tick(&mut actx.state, &mut __tc);\n}}\n"
     ));
-    out.push("        let mut resp = nros::CancelResponse::Rejected;\n".to_string());
-    out.push(
-        "        let mut cb_ctx = nros::CallbackCtx::with_cancel_decision(&[], &actx.resolver, &mut resp);\n"
-            .to_string(),
-    );
+    // --- inline registration ---
+    emit_publisher_builders(out, &key, &pubs);
+    let init = pubs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("p{i}: p{i}_{idx}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     out.push(format!(
-        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
-    ));
-    out.push("        resp\n    }\n".to_string());
-    out.push(format!(
-        "    unsafe {{ ACT_CTX_{idx} = Some(ActionCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }}); }}\n"
+        "    unsafe {{ ACT_CTX_{idx} = Some(ActionCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::init(), resolver: Resolver{idx} {{ {init} }} }}); }}\n"
     ));
     out.push(format!(
         "    let actnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
@@ -3288,6 +3396,9 @@ fn emit_static_action(
     ));
     out.push(format!(
         "    let action_{idx} = executor.register_action_server_raw_sized::<1024, 1024, 1024, 4>(nros::RawActionServerSpec {{ node_id: Some(actnh_{idx}), action_name: {action:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, qos: nros::QosSettings::services_default(), goal_callback: goal_tramp_{idx}, cancel_callback: cancel_tramp_{idx}, accepted_callback: Some(noop_raw_accepted), context: core::ptr::null_mut() }})?;\n"
+    ));
+    out.push(format!(
+        "    unsafe {{ ACT_HANDLE_{idx} = Some(action_{idx}); }}\n"
     ));
     out.push(format!(
         "    handles.set({idx}, action_{idx}.handle_id()).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
