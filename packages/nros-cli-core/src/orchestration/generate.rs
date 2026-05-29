@@ -2521,9 +2521,10 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    // Service bodies need the `Box::leak`'d ctx (raw service
-                    // callbacks can't capture) — std only; no_std / non-executable
-                    // keeps the noop.
+                    // Service bodies need a captured ctx (raw service callbacks
+                    // can't close over one): std uses the shared `Box::leak`'d Rc
+                    // ctx; no_std (W.5.8) a function-local `static mut`; native
+                    // C/C++ keeps the noop.
                     if shared {
                         emit_shared_service(
                             &mut out,
@@ -2535,6 +2536,18 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                             resolved_name,
                             &interface_type_name(interface),
                             &interface_type_hash(interface),
+                        );
+                    } else if let Some(comp_path) = &comp_path {
+                        emit_static_service(
+                            &mut out,
+                            callback_index,
+                            comp_path,
+                            cb_id,
+                            node_id,
+                            resolved_name,
+                            &interface_type_name(interface),
+                            &interface_type_hash(interface),
+                            instance,
                         );
                     } else {
                         out.push(format!(
@@ -2563,8 +2576,10 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         ..
                     },
                 )) => {
-                    // W.5.5 — goal/cancel decision bodies (std only). Execution —
-                    // feedback/result — rides the W.5.6 tick hook.
+                    // Goal/cancel decision bodies: std shared `Box::leak`'d ctx;
+                    // no_std (W.5.8) a function-local `static mut`; native keeps the
+                    // noop. Execution (feedback/result) rides the W.5.6 tick hook
+                    // (std); no_std action execution is a follow-up.
                     if shared {
                         emit_shared_action(
                             &mut out,
@@ -2581,6 +2596,18 @@ fn render_callback_registrations(plan: &NrosPlan) -> Vec<String> {
                         // the component's `tick` can complete goals / publish
                         // feedback (keyed by the *source* entity id it declared).
                         inst_actions.push((source_entity.clone(), callback_index));
+                    } else if let Some(comp_path) = &comp_path {
+                        emit_static_action(
+                            &mut out,
+                            callback_index,
+                            comp_path,
+                            cb_id,
+                            node_id,
+                            resolved_name,
+                            &interface_type_name(interface),
+                            &interface_type_hash(interface),
+                            instance,
+                        );
                     } else {
                         out.push(format!(
                             "    let node_{callback_index} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
@@ -3118,6 +3145,149 @@ fn emit_shared_action(
     ));
     out.push(format!(
         "    let action_{idx} = executor.register_action_server_raw_sized::<1024, 1024, 1024, 4>(nros::RawActionServerSpec {{ node_id: Some(actnh_{idx}), action_name: {action:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, qos: nros::QosSettings::services_default(), goal_callback: goal_tramp_{idx}, cancel_callback: cancel_tramp_{idx}, accepted_callback: Some(noop_raw_accepted), context: actctx{idx} }})?;\n"
+    ));
+    out.push(format!(
+        "    handles.set({idx}, action_{idx}.handle_id()).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.8 — a service callback on a **no_std** rust executable component. Same
+/// real dispatch as `emit_shared_service`, but the `(state, resolver)` context
+/// lives in a function-local `static mut` (no `Box::leak`/alloc); the trampoline
+/// reads it via `addr_of_mut!`. Per-callback state (no_std doesn't share — that
+/// is the W.5.7 std path); the executor spins single-threaded so the `static mut`
+/// access is sound.
+#[allow(clippy::too_many_arguments)]
+fn emit_static_service(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    node_id: &str,
+    service: &str,
+    type_name: &str,
+    type_hash: &str,
+    instance: &PlanInstance,
+) {
+    emit_executable_prelude(out, idx, comp_path, instance, false);
+    out.push(format!(
+        "    struct SvcCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+    ));
+    out.push(format!(
+        "    static mut SVC_CTX_{idx}: Option<SvcCtx{idx}> = None;\n"
+    ));
+    out.push(format!(
+        "    unsafe extern \"C\" fn svc_tramp_{idx}(req: *const u8, req_len: usize, resp: *mut u8, resp_cap: usize, resp_len: *mut usize, _ctx: *mut core::ffi::c_void) -> bool {{\n"
+    ));
+    out.push(format!(
+        "        let sctx = match unsafe {{ (*core::ptr::addr_of_mut!(SVC_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => {{ unsafe {{ *resp_len = 0; }} return true; }} }};\n"
+    ));
+    out.push(
+        "        let req_slice = unsafe { core::slice::from_raw_parts(req, req_len) };\n"
+            .to_string(),
+    );
+    out.push(
+        "        let resp_slice = unsafe { core::slice::from_raw_parts_mut(resp, resp_cap) };\n"
+            .to_string(),
+    );
+    out.push("        let mut written = 0usize;\n".to_string());
+    out.push(
+        "        let mut cb_ctx = nros::CallbackCtx::with_reply(req_slice, &sctx.resolver, resp_slice, &mut written);\n"
+            .to_string(),
+    );
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut sctx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("        unsafe { *resp_len = written; }\n".to_string());
+    out.push("        true\n    }\n".to_string());
+    out.push(format!(
+        "    unsafe {{ SVC_CTX_{idx} = Some(SvcCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }}); }}\n"
+    ));
+    out.push(format!(
+        "    let svcnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let svcnh_{idx} = executor.node_id_by_name(svcnode_{idx}.node_name, svcnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let handle_{idx} = executor.register_service_raw_sized_on::<1024, 1024>(svcnh_{idx}, {service:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::services_default(), svc_tramp_{idx}, core::ptr::null_mut())?;\n"
+    ));
+    out.push(format!(
+        "    handles.set({idx}, handle_{idx}).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+}
+
+/// W.5.8 — an action server's goal/cancel decision bodies on a **no_std** rust
+/// executable component. Like `emit_shared_action` but the `(state, resolver)`
+/// context lives in a function-local `static mut` (no alloc); both trampolines
+/// read it via `addr_of_mut!`. Execution (feedback/result) still rides the tick
+/// hook on std — no_std tick is the broader W.5.6 follow-up.
+#[allow(clippy::too_many_arguments)]
+fn emit_static_action(
+    out: &mut Vec<String>,
+    idx: usize,
+    comp_path: &str,
+    callback_id: &str,
+    node_id: &str,
+    action: &str,
+    type_name: &str,
+    type_hash: &str,
+    instance: &PlanInstance,
+) {
+    emit_executable_prelude(out, idx, comp_path, instance, false);
+    out.push(format!(
+        "    struct ActionCtx{idx} {{ state: <{comp_path} as nros::ExecutableComponent>::State, resolver: Resolver{idx} }}\n"
+    ));
+    out.push(format!(
+        "    static mut ACT_CTX_{idx}: Option<ActionCtx{idx}> = None;\n"
+    ));
+    // goal-decision trampoline
+    out.push(format!(
+        "    unsafe extern \"C\" fn goal_tramp_{idx}(_goal_id: *const nros::GoalId, goal_data: *const u8, goal_len: usize, _ctx: *mut core::ffi::c_void) -> nros::GoalResponse {{\n"
+    ));
+    out.push(format!(
+        "        let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return nros::GoalResponse::Reject }};\n"
+    ));
+    out.push(
+        "        let goal_slice = unsafe { core::slice::from_raw_parts(goal_data, goal_len) };\n"
+            .to_string(),
+    );
+    out.push("        let mut resp = nros::GoalResponse::Reject;\n".to_string());
+    out.push(
+        "        let mut cb_ctx = nros::CallbackCtx::with_goal_decision(goal_slice, &actx.resolver, &mut resp);\n"
+            .to_string(),
+    );
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("        resp\n    }\n".to_string());
+    // cancel-decision trampoline
+    out.push(format!(
+        "    unsafe extern \"C\" fn cancel_tramp_{idx}(_goal_id: *const nros::GoalId, _status: nros::GoalStatus, _ctx: *mut core::ffi::c_void) -> nros::CancelResponse {{\n"
+    ));
+    out.push(format!(
+        "        let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return nros::CancelResponse::Rejected }};\n"
+    ));
+    out.push("        let mut resp = nros::CancelResponse::Rejected;\n".to_string());
+    out.push(
+        "        let mut cb_ctx = nros::CallbackCtx::with_cancel_decision(&[], &actx.resolver, &mut resp);\n"
+            .to_string(),
+    );
+    out.push(format!(
+        "        <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n"
+    ));
+    out.push("        resp\n    }\n".to_string());
+    out.push(format!(
+        "    unsafe {{ ACT_CTX_{idx} = Some(ActionCtx{idx} {{ state: state{idx}, resolver: resolver{idx} }}); }}\n"
+    ));
+    out.push(format!(
+        "    let actnode_{idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let actnh_{idx} = executor.node_id_by_name(actnode_{idx}.node_name, actnode_{idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+    ));
+    out.push(format!(
+        "    let action_{idx} = executor.register_action_server_raw_sized::<1024, 1024, 1024, 4>(nros::RawActionServerSpec {{ node_id: Some(actnh_{idx}), action_name: {action:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, qos: nros::QosSettings::services_default(), goal_callback: goal_tramp_{idx}, cancel_callback: cancel_tramp_{idx}, accepted_callback: Some(noop_raw_accepted), context: core::ptr::null_mut() }})?;\n"
     ));
     out.push(format!(
         "    handles.set({idx}, action_{idx}.handle_id()).map_err(|_| nros::NodeError::InvalidSchedContextBinding)?;\n"

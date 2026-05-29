@@ -549,6 +549,40 @@ fn generated_package_registers_service_and_action_callbacks() {
     assert!(!build_rs.contains("unsupported generated callback"));
 }
 
+/// Phase 172 W.5.8 — the same rust executable service + action component on a
+/// **no_std** target (freertos) dispatches real bodies via a function-local
+/// `static mut` context (no `Box::leak`/`Rc`/alloc), read through `addr_of_mut!`.
+/// The std-only tick machinery (`TICK_ENTRIES` / `run_tick_loop`) is absent.
+#[test]
+fn generated_no_std_service_action_uses_static_context() {
+    let output_dir = generate_fixture(
+        "generated_no_std_service_action_uses_static_context",
+        "plan_service_action_freertos.json",
+    );
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+
+    // Real dispatch — same trampolines + decision sinks as the std path.
+    assert!(build_rs.contains("svc_tramp_"));
+    assert!(build_rs.contains("goal_tramp_"));
+    assert!(build_rs.contains("cancel_tramp_"));
+    assert!(build_rs.contains("nros::CallbackCtx::with_reply"));
+    assert!(build_rs.contains("nros::CallbackCtx::with_goal_decision"));
+    assert!(build_rs.contains("as nros::ExecutableComponent>::on_callback"));
+    // The context lives in a function-local `static mut`, read via addr_of_mut!.
+    assert!(build_rs.contains("static mut SVC_CTX_"));
+    assert!(build_rs.contains("static mut ACT_CTX_"));
+    assert!(build_rs.contains("core::ptr::addr_of_mut!(SVC_CTX_"));
+    assert!(build_rs.contains("core::ptr::addr_of_mut!(ACT_CTX_"));
+    assert!(build_rs.contains("register_service_raw_sized_on::<1024, 1024>"));
+    assert!(build_rs.contains("register_action_server_raw_sized::<1024, 1024, 1024, 4>"));
+    // No std-only mechanisms: no Box::leak ctx, no Rc shared state, no tick loop.
+    assert!(!build_rs.contains("::std::boxed::Box::into_raw"));
+    assert!(!build_rs.contains("::std::rc::Rc::new"));
+    assert!(!build_rs.contains("TICK_ENTRIES"));
+    assert!(!build_rs.contains("run_tick_loop"));
+    assert!(!build_rs.contains("unsupported generated callback"));
+}
+
 #[test]
 fn generated_service_action_package_is_readable_by_cargo_metadata() {
     let output_dir = generate_workspace_backed_fixture(

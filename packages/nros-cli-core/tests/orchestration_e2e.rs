@@ -742,6 +742,65 @@ fn fixture_workspace_builds_generated_bare_metal_package() {
     );
 }
 
+/// Phase 172 W.5.8 — a service + action component on a no_std target (bare-metal
+/// Cortex-M3, no SDK) dispatches real bodies through a function-local `static mut`
+/// context (no `Box::leak`/alloc). Compile-verifies the static-ctx codegen: the
+/// generated package must build to a `thumbv7m-none-eabi` ELF and its build.rs
+/// must carry the static context (not the std Box::leak ctx / tick loop).
+#[test]
+fn fixture_workspace_builds_generated_bare_metal_service_action_package() {
+    let fixture = fixture_workspace();
+    let output = temp_output("orchestration_e2e_bare_metal_svc_act");
+    let out_dir = output.join("build/e2e_system/nros");
+    let generated_dir = out_dir.join("generated-bare-metal-svc-act");
+    let plan_path = out_dir.join("nros-plan-bare-metal-svc-act.json");
+    fs::create_dir_all(&out_dir).expect("create bare-metal svc/act output dir");
+
+    let mut plan = fixture_plan("plan_service_action.json");
+    retarget_plan_to_fixture_component(&mut plan);
+    retarget_plan_to_bare_metal(&mut plan);
+    fs::write(
+        &plan_path,
+        serde_json::to_string_pretty(&plan).expect("serialize bare-metal svc/act plan"),
+    )
+    .expect("write bare-metal svc/act plan");
+
+    check::run(check::Args {
+        plan: plan_path.clone(),
+    })
+    .expect("check command validates generated bare-metal svc/act plan");
+    build_generated_package(&BuildOptions {
+        package_name: "nros-e2e-generated-bare-metal-svc-act".to_string(),
+        output_dir: generated_dir.clone(),
+        plan_path,
+        workspace_root: nano_ros_workspace(),
+        component_workspace: Some(fixture),
+        release: true,
+        target: None,
+        cargo_args: Vec::new(),
+        force: false,
+    })
+    .expect("build command compiles generated bare-metal svc/act package");
+
+    let build_rs =
+        fs::read_to_string(generated_dir.join("build.rs")).expect("read generated build.rs");
+    assert!(build_rs.contains("static mut SVC_CTX_"));
+    assert!(build_rs.contains("static mut ACT_CTX_"));
+    assert!(!build_rs.contains("::std::boxed::Box::into_raw"));
+    assert!(!build_rs.contains("TICK_ENTRIES"));
+
+    let binary = out_dir
+        .join("target")
+        .join("thumbv7m-none-eabi")
+        .join("release")
+        .join("nros-e2e-generated-bare-metal-svc-act");
+    assert!(
+        binary.is_file(),
+        "generated bare-metal svc/act binary exists at {}",
+        binary.display()
+    );
+}
+
 /// Phase 126.M5.threadx — drives the orchestration generator against
 /// the ThreadX-Linux board (host-hosted ThreadX + NetX Duo over the
 /// NSOS BSD shim). Builds as a normal x86_64 Linux ELF — no custom
