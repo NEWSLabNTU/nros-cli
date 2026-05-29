@@ -50,7 +50,7 @@ jobs:
         run: >
           cargo +nightly-2026-04-19 fmt
           -p rosidl-parser -p rosidl-codegen -p rosidl-bindgen -p cargo-nano-ros
-          -p nros-cli-core -p nros-cli -p nros-codegen-c -p colcon-nano-ros
+          -p nros-cli-core -p nros-cli -p colcon-nano-ros
           -- --check
 
       # +stable explicitly: the nightly toolchain (installed for rustfmt) becomes
