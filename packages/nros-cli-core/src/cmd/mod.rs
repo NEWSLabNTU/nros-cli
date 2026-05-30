@@ -35,6 +35,7 @@ pub mod run_target;
 pub mod scaffold_deploy;
 pub mod setup;
 pub mod version;
+pub mod workspace;
 
 #[cfg(feature = "release")]
 pub mod release;
@@ -116,6 +117,9 @@ pub enum Cmd {
     /// Inspect supported boards
     #[command(subcommand)]
     Board(board::Args),
+
+    /// Workspace-level msg-pkg utilities (Phase 210.B.3 — `nros workspace env`).
+    Workspace(workspace::Args),
 
     /// Print toolchain + library versions
     Version,
