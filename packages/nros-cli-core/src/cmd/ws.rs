@@ -144,13 +144,29 @@ fn run_sync(args: SyncArgs) -> Result<()> {
             .wrap_err_with(|| format!("ws sync: {}", p.display()))?,
         None => std::env::current_dir()?,
     };
-    let src_root = ws_root.join("src");
-    if !src_root.is_dir() {
+    // Two layouts supported:
+    //  * `src/`-based: workspace root has src/, src/<pkg>/ subdirs (colcon
+    //    standard).
+    //  * Single-pkg: workspace root IS the pkg dir (package.xml at root).
+    //    Common for ported standalone examples (`examples/native/rust/talker`).
+    // Heuristic: colcon-style layout iff `src/` exists AND has at least one
+    // immediate subdir with `package.xml`. Falls through to single-pkg mode
+    // when the workspace root itself carries `package.xml` (the standalone
+    // example shape; `src/` may exist as the cargo source dir).
+    let colcon_layout = ws_root.join("src").is_dir()
+        && has_pkg_subdir(&ws_root.join("src"));
+    let single_pkg_mode = !colcon_layout && ws_root.join("package.xml").is_file();
+    let src_root = if colcon_layout {
+        ws_root.join("src")
+    } else if single_pkg_mode {
+        ws_root.clone()
+    } else {
         bail!(
-            "ws sync: no `src/` under workspace root {} — expected colcon-style layout",
+            "ws sync: no `src/<pkg>/package.xml` and no `package.xml` at root \
+             under {} — expected colcon-style workspace or single-pkg dir",
             ws_root.display()
         );
-    }
+    };
     let build_root = if args.build_dir.is_absolute() {
         args.build_dir.clone()
     } else {
@@ -158,7 +174,11 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     };
 
     let mut scan = Vec::new();
-    scan_workspace(&src_root, &mut scan)?;
+    if single_pkg_mode {
+        scan_one_pkg_dir(&src_root, &mut scan)?;
+    } else {
+        scan_workspace(&src_root, &mut scan)?;
+    }
     if scan.is_empty() {
         println!("ws sync: no pkgs under {}", src_root.display());
         return Ok(());
@@ -265,10 +285,14 @@ const NROS_RUNTIME_CRATES: &[(&str, &str)] = &[
     ("nros-core", "packages/core/nros-core"),
     ("nros-serdes", "packages/core/nros-serdes"),
     ("nros-platform", "packages/core/nros-platform"),
+    ("nros-platform-cffi", "packages/core/nros-platform-cffi"),
     ("nros-node", "packages/core/nros-node"),
     ("nros-rmw", "packages/core/nros-rmw"),
+    ("nros-rmw-cffi", "packages/core/nros-rmw-cffi"),
     ("nros-log", "packages/core/nros-log"),
     ("nros-macros", "packages/core/nros-macros"),
+    // RMW backend crates (zenoh-pico for now; cyclonedds + xrce later).
+    ("nros-rmw-zenoh", "packages/zpico/nros-rmw-zenoh"),
 ];
 
 fn parse_edition(s: &str) -> Result<RosEdition> {
@@ -366,6 +390,44 @@ fn codegen_ament_deps_for(
 
 
 // --- Scan ----------------------------------------------------------------------
+
+fn has_pkg_subdir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        if let Ok(t) = e.file_type() {
+            if t.is_dir() && e.path().join("package.xml").is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn scan_one_pkg_dir(pkg_dir: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
+    let manifest = pkg_dir.join("package.xml");
+    let body = std::fs::read_to_string(&manifest)?;
+    let Some(name) = extract_pkg_name(&body) else {
+        bail!("ws sync: single-pkg mode: package.xml at {} has no <name>",
+              manifest.display());
+    };
+    let is_msg_pkg = body.contains("rosidl_interface_packages")
+        || pkg_dir.join("msg").is_dir()
+        || pkg_dir.join("srv").is_dir()
+        || pkg_dir.join("action").is_dir();
+    let is_rust_pkg = pkg_dir.join("Cargo.toml").is_file();
+    let deps = extract_pkg_deps(&body);
+    out.push(WsPkg {
+        name,
+        dir: pkg_dir.to_path_buf(),
+        manifest,
+        is_msg_pkg,
+        is_rust_pkg,
+        deps,
+    });
+    Ok(())
+}
 
 fn scan_workspace(src_root: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
     for entry in std::fs::read_dir(src_root)? {
