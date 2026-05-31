@@ -86,7 +86,7 @@ pub fn plan_system(options: PlanOptions) -> Result<PlanningOutput> {
     }
     let overlays = load_toml_values(&unique_paths(nros_toml))?;
 
-    let (instances, mut diagnostics) =
+    let (instances, executables, mut diagnostics) =
         build_instances(&record, &metadata, &workspace, &overlays, &record_path);
     diagnostics.extend(check_manifest_endpoints(
         &instances,
@@ -133,6 +133,7 @@ pub fn plan_system(options: PlanOptions) -> Result<PlanningOutput> {
         &options,
         &record_path,
         &instances,
+        &executables,
         &metadata,
         &overlays,
         build_json,
@@ -555,6 +556,7 @@ fn schema_plan_json(
     options: &PlanOptions,
     record_path: &Path,
     instances: &[Value],
+    executables: &[Value],
     metadata: &[JsonArtifact],
     overlays: &[Value],
     build: Value,
@@ -620,6 +622,15 @@ fn schema_plan_json(
     // (NrosPlan field order); absent ⇒ omitted, plan stays byte-identical.
     if let Some(pp) = collect_param_persistence(overlays) {
         obj.insert("param_persistence".to_string(), pp);
+    }
+    // Phase 211.E — `<executable>` spawn entries. Skip-when-empty so plans
+    // without any `<executable>` stay byte-identical to pre-211.E.
+    if !executables.is_empty() {
+        let plan_executables = executables
+            .iter()
+            .map(schema_executable)
+            .collect::<Vec<_>>();
+        obj.insert("executables".to_string(), json!(plan_executables));
     }
     obj.insert("build".to_string(), build);
     plan
@@ -1025,6 +1036,44 @@ fn schema_remaps(value: Option<&Value>) -> Vec<Value> {
             _ => None,
         })
         .collect()
+}
+
+/// Phase 211.E — reshape an intermediate executable entry from
+/// [`build_executable_entry`] into the public `PlanExecutable` schema. The
+/// intermediate already carries `id` / `name` / `namespace` / `cmd` / `args`
+/// in their public shape; we only reshape `env` (pairs → `{name, value}`)
+/// and append the `trace` block.
+fn schema_executable(entry: &Value) -> Value {
+    let id = entry.get("id").and_then(Value::as_str).unwrap_or("executable");
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("executable");
+    let namespace = entry
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("/");
+    let cmd = entry
+        .get("cmd")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let args = entry
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "id": id,
+        "name": name,
+        "namespace": namespace,
+        "cmd": cmd,
+        "args": args,
+        "env": schema_env(entry.get("env")),
+        "trace": {
+            "launch_record_entity": format!("record://{id}"),
+        },
+    })
 }
 
 /// Phase 211.E — reshape an `env` field from its intermediate `[[name, value],
@@ -1496,23 +1545,24 @@ fn build_instances(
     workspace: &Workspace,
     overlays: &[Value],
     record_path: &Path,
-) -> (Vec<Value>, Vec<Value>) {
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
     let mut counts = HashMap::<(String, String), usize>::new();
+    let mut exec_counts = HashMap::<String, usize>::new();
     let mut diagnostics = Vec::new();
     let mut instances = Vec::new();
+    let mut executables = Vec::new();
 
     for node in record_array(record, "node") {
         let package = string_field(node, &["package"]).unwrap_or_default();
         if package.is_empty() {
-            diagnostics.push(diagnostic(
-                "error",
-                "missing-package",
-                "launch node has no package",
-                None,
-                None,
-                None,
-                record_path,
-            ));
+            // Phase 211.E — a `<executable>` from the launch lands here.
+            // `play_launch_parser` writes every `<executable cmd="…">` as a
+            // `record.node` with `package=None`; the planner used to emit a
+            // `missing-package` error, which made any launch carrying a
+            // `<executable>` unplanable. Now they're surfaced as non-rmw
+            // spawn entries the deploy stage runs alongside the rmw
+            // `instances`.
+            executables.push(build_executable_entry(node, &mut exec_counts));
             continue;
         }
         let executable = string_field(node, &["executable"]).unwrap_or_default();
@@ -1573,7 +1623,38 @@ fn build_instances(
         ));
     }
 
-    (instances, diagnostics)
+    (instances, executables, diagnostics)
+}
+
+/// Phase 211.E — build an intermediate executable entry from a `record.node`
+/// whose `package` is missing (the parser's marker for `<executable>`).
+/// Output shape is parallel to [`build_node_instance`]'s instance: a serde
+/// JSON object the downstream [`schema_executable`] reshapes into the public
+/// schema. `exec_counts` per-name bumps the synthesized id so multiple
+/// `<executable name="…">` entries with the same name stay distinct.
+fn build_executable_entry(node: &Value, exec_counts: &mut HashMap<String, usize>) -> Value {
+    let raw_name = string_field(node, &["name", "exec_name"]).unwrap_or("executable");
+    let name = raw_name.to_string();
+    let sanitized = sanitize_id(raw_name);
+    let index = {
+        let entry = exec_counts.entry(sanitized.clone()).or_insert(0);
+        let i = *entry;
+        *entry += 1;
+        i
+    };
+    let id = format!("executable.{sanitized}.{index}");
+    let namespace = names::normalize_namespace(string_field(node, &["namespace"]));
+    let cmd = string_list_field(node, "cmd");
+    let args = string_list_field(node, "args");
+    let env = pairs_field(node, "env");
+    json!({
+        "id": id,
+        "name": name,
+        "namespace": namespace,
+        "cmd": cmd,
+        "args": args,
+        "env": env,
+    })
 }
 
 /// Per-node inputs for [`build_node_instance`].
@@ -3196,6 +3277,151 @@ topics:
         assert_eq!(env[0]["value"], "verbose");
         assert_eq!(env[1]["name"], "NODE_VAR");
         assert_eq!(env[1]["value"], "node_specific");
+    }
+
+    /// Phase 211.E — `<executable>` declarations surface on `plan.executables`
+    /// as non-rmw spawn entries. Previously the parser-recorded
+    /// `package=None` tripped a `missing-package` diagnostic, making any
+    /// launch carrying an `<executable>` unplanable.
+    #[test]
+    fn plan_system_emits_executables_for_package_less_record_nodes() {
+        let root = temp_workspace("nros-plan-executables");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.xml"),
+            r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+        )
+        .unwrap();
+        let launch = root.join("system.launch.xml");
+        fs::write(&launch, "<launch />").unwrap();
+        let record = root.join("record.json");
+        // Mirrors the parser output for:
+        //   <set_env name="FOO" value="bar" />
+        //   <executable cmd="/bin/echo" name="greeter">
+        //     <arg value="hello" />
+        //     <arg value="world" />
+        //   </executable>
+        fs::write(
+            &record,
+            r#"{
+  "node": [
+    {
+      "package": null,
+      "name": "greeter",
+      "exec_name": "greeter",
+      "executable": "/bin/echo",
+      "cmd": ["/bin/echo", "hello", "world"],
+      "args": ["hello", "world"],
+      "env": [["FOO", "bar"]],
+      "namespace": null
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let output = plan_system(PlanOptions {
+            system_pkg: "system_pkg".to_string(),
+            workspace_root: root.clone(),
+            launch_file: launch,
+            record_file: Some(record),
+            out_root: root.join("build/system_pkg/nros"),
+            metadata_files: vec![],
+            manifest_files: vec![],
+            nros_toml_files: vec![],
+            launch_args: vec![],
+        })
+        .unwrap();
+        let plan: Value =
+            serde_json::from_str(&fs::read_to_string(output.plan_path).unwrap()).unwrap();
+        serde_json::from_value::<NrosPlan>(plan.clone()).unwrap();
+
+        // No rmw instances at all (the only record.node was the executable).
+        assert_eq!(plan["instances"].as_array().unwrap().len(), 0);
+
+        let execs = plan["executables"]
+            .as_array()
+            .expect("executables field must surface when the record carries any <executable>");
+        assert_eq!(execs.len(), 1);
+        let exec = &execs[0];
+        assert_eq!(exec["id"], "executable.greeter.0");
+        assert_eq!(exec["name"], "greeter");
+        assert_eq!(exec["namespace"], "/");
+        assert_eq!(exec["cmd"], json!(["/bin/echo", "hello", "world"]));
+        assert_eq!(exec["args"], json!(["hello", "world"]));
+        assert_eq!(exec["env"], json!([{"name": "FOO", "value": "bar"}]));
+        assert_eq!(
+            exec["trace"]["launch_record_entity"],
+            "record://executable.greeter.0"
+        );
+    }
+
+    /// A plan with no `<executable>` entries must NOT carry the `executables`
+    /// key at all (additive field, `skip_serializing_if = "Vec::is_empty"`),
+    /// so plans written before 211.E stay byte-identical.
+    #[test]
+    fn plan_system_omits_executables_field_when_none_declared() {
+        let root = temp_workspace("nros-plan-executables-empty");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.xml"),
+            r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+        )
+        .unwrap();
+        let launch = root.join("system.launch.xml");
+        fs::write(
+            &launch,
+            r#"<launch>
+  <node pkg="demo_pkg" exec="talker" name="talker" />
+</launch>"#,
+        )
+        .unwrap();
+        let record = root.join("record.json");
+        fs::write(
+            &record,
+            r#"{
+  "node": [{
+    "package": "demo_pkg",
+    "executable": "talker",
+    "name": "talker",
+    "namespace": "/"
+  }]
+}"#,
+        )
+        .unwrap();
+        let metadata = root.join("talker.metadata.json");
+        fs::write(
+            &metadata,
+            r#"{
+  "version": 1, "package": "demo_pkg", "component": "talker", "language": "rust",
+  "executable": "talker", "exported_symbol": "nros_component_talker",
+  "nodes": [{ "id": "n", "unresolved_name": {"value":"talker","kind":"relative"}, "namespace": null,
+    "publishers": [], "subscribers": [], "timers": [], "services": [], "actions": [] }],
+  "callbacks": [], "parameters": [],
+  "trace": {"generator":"test","package_manifest":"package.xml","source_artifacts":[]}
+}"#,
+        )
+        .unwrap();
+
+        let output = plan_system(PlanOptions {
+            system_pkg: "system_pkg".to_string(),
+            workspace_root: root.clone(),
+            launch_file: launch,
+            record_file: Some(record),
+            out_root: root.join("build/system_pkg/nros"),
+            metadata_files: vec![metadata],
+            manifest_files: vec![],
+            nros_toml_files: vec![],
+            launch_args: vec![],
+        })
+        .unwrap();
+        let raw = fs::read_to_string(output.plan_path).unwrap();
+        let plan: Value = serde_json::from_str(&raw).unwrap();
+        serde_json::from_value::<NrosPlan>(plan.clone()).unwrap();
+        assert!(
+            plan.get("executables").is_none(),
+            "expected `executables` to be omitted when none declared, got: {raw}"
+        );
     }
 
     /// A record node without an `env` block must still emit an `env` field

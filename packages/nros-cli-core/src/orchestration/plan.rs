@@ -50,6 +50,17 @@ pub struct NrosPlan {
     /// from output when empty so non-bridge plans stay byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bridges: Vec<PlanBridge>,
+    /// Phase 211.E — `<executable>` declarations from the launch surface here
+    /// as non-rmw "spawn" entries the deploy stage runs alongside the rmw
+    /// `instances`. The parser records each `<executable>` as a `record.node`
+    /// with `package=None`; the planner used to reject those as
+    /// `missing-package`, but they're legal in ROS 2 launches (rviz, rosbag,
+    /// robot_state_publisher's CLI wrapper, etc.) so the planner now surfaces
+    /// them here. Additive: pre-211.E plans don't carry the field;
+    /// `serde(default)` keeps them round-tripping unchanged. Omitted from
+    /// output when empty so non-executable plans stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executables: Vec<PlanExecutable>,
     pub build: PlanBuildOptions,
 }
 
@@ -142,6 +153,40 @@ pub struct PlanInstance {
 pub struct InstanceTrace {
     pub launch_record_entity: String,
     pub source_metadata: String,
+}
+
+/// Phase 211.E — a non-rmw command the deploy stage spawns alongside the
+/// rmw `instances`. Sourced from `<executable cmd="…">` in the launch
+/// (parser writes it as a `record.node` with `package=None`, `cmd` carries
+/// the fully-resolved command).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanExecutable {
+    /// Synthesized, stable id (`executable.<sanitized-name>.<index>`).
+    pub id: String,
+    /// Display / record name (the launch's `name=` attribute, or
+    /// `"executable"` when unnamed).
+    pub name: String,
+    /// Resolved namespace (defaults to `/`).
+    pub namespace: String,
+    /// Full argv as the parser resolved it. `cmd[0]` is the executable
+    /// path; `cmd[1..]` are its arguments (post-substitution).
+    pub cmd: Vec<String>,
+    /// Just the `<arg>` children, separately, in declaration order.
+    /// Empty when the launch declared none.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// `<set_env>` / `<env>` declarations attached to this entry (Phase
+    /// 211.E env-propagation). Empty when nothing is declared.
+    #[serde(default)]
+    pub env: Vec<EnvDecl>,
+    pub trace: ExecutableTrace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableTrace {
+    pub launch_record_entity: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
