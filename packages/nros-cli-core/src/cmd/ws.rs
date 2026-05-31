@@ -4,9 +4,22 @@
 //!
 //! * `env` — print shell export for `NROS_INTERFACE_SEARCH_PATH`.
 //! * `sync` — scan workspace, codegen msg pkgs into
-//!   `build/<pkg>/nros_generator_rs/<pkg>/rust/`, write `[patch.crates-io]`
+//!   `build/nros_generator_rs/<pkg>/`, write `[patch.crates-io]`
 //!   block into the patch authority Cargo.toml so plain `cargo build`
 //!   resolves `local_msgs = "*"` to the generated crate.
+//!
+//! **Dual-mode (`cargo`-style):** every subcommand works on BOTH layouts —
+//! a multi-pkg colcon workspace (`<root>/src/<pkg>/package.xml`) AND a
+//! single standalone pkg (`<root>/package.xml`). Detection runs at command
+//! time:
+//!
+//!   * **colcon-mode** iff `<root>/src/` exists AND at least one
+//!     immediate subdir contains `package.xml`.
+//!   * **single-pkg mode** iff `<root>/package.xml` exists and the colcon
+//!     check fails.
+//!
+//! Mirrors `cargo build` which works at either a workspace root or a
+//! standalone pkg dir without special arg.
 //!
 //! See `docs/roadmap/phase-210-ros-convention-codegen.md` for the
 //! full design (patch authority detection, colcon-shape build dir,
@@ -104,9 +117,7 @@ pub fn run(args: Args) -> Result<()> {
 // =============================================================================
 
 fn run_env(args: EnvArgs) -> Result<()> {
-    let ws = args.workspace.unwrap_or_else(|| PathBuf::from("./src"));
-    let abs = std::fs::canonicalize(&ws)
-        .map_err(|e| eyre!("workspace env: {}: {e}", ws.display()))?;
+    let abs = resolve_env_root(args.workspace.as_deref())?;
     let abs_s = abs.display().to_string();
     match args.shell {
         Shell::Posix => {
@@ -117,6 +128,44 @@ fn run_env(args: EnvArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the dir the cmake-side smart Find-stub will scan as a
+/// `NROS_INTERFACE_SEARCH_PATH` entry. Mirrors `sync`'s dual-mode
+/// detection so a `cd <my_pkg> && eval "$(nros ws env)"` from inside a
+/// standalone pkg works the same as one run at a colcon workspace root.
+///
+/// Resolution order:
+///   1. Explicit path arg → use it.
+///   2. `<cwd>/src/<sub>/package.xml` exists → use `<cwd>/src`.
+///   3. `<cwd>/package.xml` exists → use `<cwd>/..` (so smart Find-stub
+///      finds `<parent>/<my_pkg>/package.xml` from there).
+///   4. Fallback → `<cwd>/src` (legacy default; may not exist).
+fn resolve_env_root(arg: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = arg {
+        return std::fs::canonicalize(p)
+            .map_err(|e| eyre!("ws env: {}: {e}", p.display()));
+    }
+    let cwd = std::env::current_dir()?;
+    let src = cwd.join("src");
+    if src.is_dir() && has_pkg_subdir(&src) {
+        return std::fs::canonicalize(&src)
+            .map_err(|e| eyre!("ws env: {}: {e}", src.display()));
+    }
+    if cwd.join("package.xml").is_file() {
+        let parent = cwd.parent().ok_or_else(|| {
+            eyre!("ws env: cwd {} is a standalone pkg but has no parent", cwd.display())
+        })?;
+        return std::fs::canonicalize(parent)
+            .map_err(|e| eyre!("ws env: {}: {e}", parent.display()));
+    }
+    // Fallback — caller might not be in a pkg/workspace dir. Use ./src
+    // and surface the error from canonicalize if it doesn't exist.
+    std::fs::canonicalize(&src)
+        .map_err(|e| eyre!("ws env: {}: {e}\n\
+                            (no `src/<pkg>/package.xml` colcon layout and no `package.xml` \
+                            at cwd — pass an explicit path arg)",
+                           src.display()))
 }
 
 // =============================================================================
