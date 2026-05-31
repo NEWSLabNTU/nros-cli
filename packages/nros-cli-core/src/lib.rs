@@ -36,7 +36,7 @@ pub fn run(cmd: cmd::Cmd) -> Result<()> {
         cmd::Cmd::Monitor(args) => cmd::monitor::run(args),
         cmd::Cmd::Doctor(args) => cmd::doctor::run(args),
         cmd::Cmd::Board(args) => cmd::board::run(args),
-        cmd::Cmd::Workspace(args) => cmd::workspace::run(args),
+        cmd::Cmd::Ws(args) => cmd::ws::run(args),
         cmd::Cmd::Version => cmd::version::run(),
         cmd::Cmd::Completions(args) => cmd::completions::run(args),
         #[cfg(feature = "release")]

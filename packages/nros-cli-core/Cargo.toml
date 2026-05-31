@@ -48,6 +48,16 @@ cargo-nano-ros = { workspace = true }
 # over IDL synthesised from `.msg` sources via this lib.
 nros-msg-to-idl = { workspace = true }
 
+# Phase 210.D.1 — `nros ws sync` writes the auto-managed
+# [patch.crates-io] block into each Rust consumer's patch authority
+# Cargo.toml. `pathdiff` makes the crate path relative to the authority
+# dir (portable across moved workspace roots); rosidl-bindgen +
+# rosidl-codegen drive per-pkg Rust codegen directly (workspace-pkg
+# path; bypasses the AMENT-only `generate_from_package_xml` resolver).
+pathdiff = "0.2"
+rosidl-bindgen = { path = "../rosidl-bindgen" }
+rosidl-codegen = { path = "../rosidl-codegen" }
+
 # Phase 212.J `nros launch` — raw POSIX `kill(2)` for SIGTERM propagation.
 # Unix-only: the launcher is a desktop / native_sim host runner; Windows is not
 # in scope for nano-ros host bringup (every supported workflow targets Linux /

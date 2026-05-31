@@ -35,7 +35,7 @@ pub mod run_target;
 pub mod scaffold_deploy;
 pub mod setup;
 pub mod version;
-pub mod workspace;
+pub mod ws;
 
 #[cfg(feature = "release")]
 pub mod release;
@@ -118,8 +118,8 @@ pub enum Cmd {
     #[command(subcommand)]
     Board(board::Args),
 
-    /// Workspace-level msg-pkg utilities (Phase 210.B.3 — `nros workspace env`).
-    Workspace(workspace::Args),
+    /// Workspace-level msg-pkg utilities (Phase 210.B.3 + 210.D.1 — env, sync, …).
+    Ws(ws::Args),
 
     /// Print toolchain + library versions
     Version,
