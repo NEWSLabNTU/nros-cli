@@ -447,6 +447,25 @@ fn parse_launch_file_record(
     let bin = std::env::var("NROS_PLAY_LAUNCH_PARSER")
         .unwrap_or_else(|_| "play_launch_parser".to_string());
     let mut cmd = Command::new(&bin);
+    // `<include>` recursion-safety knobs (Phase 211.J):
+    //
+    // * `--strict-includes` — orchestration cannot tolerate a silently-dropped
+    //   include branch (the dropped sub-tree's nodes would simply vanish from
+    //   the plan), so the planner always runs the parser in strict mode. This
+    //   flips the parser default of warn-and-skip into a hard
+    //   `ParseError::CircularInclude` that surfaces as a non-zero exit + the
+    //   include chain in stderr — what every `nros plan` caller actually wants.
+    //
+    // * `--max-include-depth` — opt-in cap. The parser default is 100
+    //   (generous enough to never false-positive on Autoware); set
+    //   `NROS_PLAY_LAUNCH_MAX_INCLUDE_DEPTH=<N>` to tighten or loosen.
+    //   16 is the 211.J-proposed default for orchestration but we keep the
+    //   parser's 100 unless the env var is explicitly set, so we don't break
+    //   any existing user's plan.
+    cmd.arg("--strict-includes");
+    if let Ok(depth) = std::env::var("NROS_PLAY_LAUNCH_MAX_INCLUDE_DEPTH") {
+        cmd.arg("--max-include-depth").arg(depth);
+    }
     cmd.arg("file").arg(launch_file);
     for (k, v) in &launch_args {
         cmd.arg(format!("{k}:={v}"));
