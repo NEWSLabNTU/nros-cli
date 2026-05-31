@@ -748,6 +748,10 @@ fn schema_instance(instance: &Value, declared: &BTreeMap<String, Value>) -> Valu
         "launch_name": launch_name,
         "namespace": namespace,
         "remaps": schema_remaps(instance.get("remaps")),
+        // Phase 211.E — `<set_env>` / `<env>` declarations from the launch
+        // surface here as `[{name, value}, …]`. Always emitted (empty when
+        // nothing is declared) so deploy iterates uniformly.
+        "env": schema_env(instance.get("env")),
         "nodes": nodes,
         "callbacks": callbacks,
         "parameters": schema_parameters(id, default_source_node, instance.get("parameters")),
@@ -1018,6 +1022,32 @@ fn schema_remaps(value: Option<&Value>) -> Vec<Value> {
                 "from": pair[0].as_str().unwrap_or_default(),
                 "to": pair[1].as_str().unwrap_or_default(),
             })),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Phase 211.E — reshape an `env` field from its intermediate `[[name, value],
+/// …]` representation into the public schema's `[{"name": …, "value": …}, …]`.
+/// Parallel to [`schema_remaps`]; always returns an array (empty when nothing
+/// is declared) so deploy-stage consumers can iterate without a presence
+/// check.
+fn schema_env(value: Option<&Value>) -> Vec<Value> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Array(pair) if pair.len() == 2 => Some(json!({
+                "name": pair[0].as_str().unwrap_or_default(),
+                "value": pair[1].as_str().unwrap_or_default(),
+            })),
+            Value::Object(map) => {
+                let name = map.get("name").or_else(|| map.get("key"))?.as_str()?;
+                let value = map.get("value")?.as_str().unwrap_or_default();
+                Some(json!({ "name": name, "value": value }))
+            }
             _ => None,
         })
         .collect()
@@ -1488,6 +1518,7 @@ fn build_instances(
         let executable = string_field(node, &["executable"]).unwrap_or_default();
         let params = pairs_field(node, "params");
         let remaps = pairs_field(node, "remaps");
+        let env = pairs_field(node, "env");
         let param_files = string_list_field(node, "params_files");
         instances.push(build_node_instance(
             NodeInstanceSpec {
@@ -1498,6 +1529,7 @@ fn build_instances(
                 params: &params,
                 param_files: &param_files,
                 remaps: &remaps,
+                env: &env,
                 launch_kind: "node",
             },
             &mut PlanCtx {
@@ -1517,6 +1549,7 @@ fn build_instances(
         let executable = plugin.split("::").last().unwrap_or(plugin);
         let params = pairs_field(load_node, "params");
         let remaps = pairs_field(load_node, "remaps");
+        let env = pairs_field(load_node, "env");
         instances.push(build_node_instance(
             NodeInstanceSpec {
                 package,
@@ -1526,6 +1559,7 @@ fn build_instances(
                 params: &params,
                 param_files: &[],
                 remaps: &remaps,
+                env: &env,
                 launch_kind: "load_node",
             },
             &mut PlanCtx {
@@ -1551,6 +1585,12 @@ struct NodeInstanceSpec<'a> {
     params: &'a [(String, String)],
     param_files: &'a [String],
     remaps: &'a [(String, String)],
+    /// Environment variables flowing onto the spawned process. Sourced from
+    /// the launch file's `<set_env>` / `<env>` elements via the parser
+    /// (`record.node[*].env`); the planner threads them through verbatim so
+    /// the deploy stage can hand them to the spawn / systemd / runtime
+    /// equivalent. Phase 211.E.
+    env: &'a [(String, String)],
     launch_kind: &'a str,
 }
 
@@ -1575,6 +1615,7 @@ fn build_node_instance(spec: NodeInstanceSpec<'_>, ctx: &mut PlanCtx<'_>) -> Val
         params,
         param_files,
         remaps,
+        env,
         launch_kind,
     } = spec;
     let metadata = ctx.metadata;
@@ -1663,6 +1704,9 @@ fn build_node_instance(spec: NodeInstanceSpec<'_>, ctx: &mut PlanCtx<'_>) -> Val
         "namespace": namespace,
         "remaps": remaps,
         "parameters": parameters,
+        // Forward raw pairs (matches `remaps` shape); `schema_env` reshapes
+        // them into the public `{name, value}` schema. Phase 211.E.
+        "env": env,
         "source_metadata": source_metadata.map(|artifact| artifact.path.to_string_lossy().to_string()),
         "nodes": nodes,
         "entities": entities,
@@ -3058,6 +3102,174 @@ topics:
             .find(|parameter| parameter["name"] == name)
             .unwrap_or_else(|| panic!("missing parameter {name}"));
         assert_eq!(parameter["value"], expected);
+    }
+
+    /// Phase 211.E — `<set_env>` / `<env>` declarations in the launch file
+    /// land on each instance's `env` array as `{name, value}` objects.
+    /// Without the propagation the deploy stage has no way to ship the
+    /// declared env onto the spawned process.
+    #[test]
+    fn plan_system_threads_node_env_onto_instances() {
+        let root = temp_workspace("nros-plan-set-env");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.xml"),
+            r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+        )
+        .unwrap();
+        let launch = root.join("system.launch.xml");
+        fs::write(&launch, "<launch />").unwrap();
+        // Record shape mirrors the parser output for
+        //     <set_env name="DEMO_LEVEL" value="verbose" />
+        //     <node pkg="demo_pkg" exec="talker" name="worker">
+        //       <env name="NODE_VAR" value="node_specific" />
+        //     </node>
+        // i.e. one merged `env = [[k, v], …]` per record.node entry.
+        let record = root.join("record.json");
+        fs::write(
+            &record,
+            r#"{
+  "node": [
+    {
+      "package": "demo_pkg",
+      "executable": "talker",
+      "name": "worker",
+      "namespace": "/",
+      "env": [
+        ["DEMO_LEVEL", "verbose"],
+        ["NODE_VAR", "node_specific"]
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let metadata = root.join("talker.metadata.json");
+        fs::write(
+            &metadata,
+            r#"{
+  "version": 1,
+  "package": "demo_pkg",
+  "component": "talker",
+  "language": "rust",
+  "executable": "talker",
+  "exported_symbol": "nros_component_talker",
+  "nodes": [{
+    "id": "node_talker",
+    "unresolved_name": {"value": "talker", "kind": "relative"},
+    "namespace": null,
+    "publishers": [],
+    "subscribers": [],
+    "timers": [],
+    "services": [],
+    "actions": []
+  }],
+  "callbacks": [],
+  "parameters": [],
+  "trace": {"generator": "test", "package_manifest": "package.xml", "source_artifacts": []}
+}"#,
+        )
+        .unwrap();
+
+        let output = plan_system(PlanOptions {
+            system_pkg: "system_pkg".to_string(),
+            workspace_root: root.clone(),
+            launch_file: launch,
+            record_file: Some(record),
+            out_root: root.join("build/system_pkg/nros"),
+            metadata_files: vec![metadata],
+            manifest_files: vec![],
+            nros_toml_files: vec![],
+            launch_args: vec![],
+        })
+        .unwrap();
+        let plan: Value =
+            serde_json::from_str(&fs::read_to_string(output.plan_path).unwrap()).unwrap();
+        let instances = plan["instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 1);
+        let env = instances[0]["env"]
+            .as_array()
+            .expect("env field must be an array on the instance");
+        // Both pairs must propagate, in order, as {name, value} objects.
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0]["name"], "DEMO_LEVEL");
+        assert_eq!(env[0]["value"], "verbose");
+        assert_eq!(env[1]["name"], "NODE_VAR");
+        assert_eq!(env[1]["value"], "node_specific");
+    }
+
+    /// A record node without an `env` block must still emit an `env` field
+    /// on the instance — empty, not null — so the deploy stage can iterate
+    /// uniformly without a presence check.
+    #[test]
+    fn plan_system_emits_empty_env_when_record_has_none() {
+        let root = temp_workspace("nros-plan-set-env-empty");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.xml"),
+            r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+        )
+        .unwrap();
+        let launch = root.join("system.launch.xml");
+        fs::write(&launch, "<launch />").unwrap();
+        let record = root.join("record.json");
+        fs::write(
+            &record,
+            r#"{
+  "node": [
+    {
+      "package": "demo_pkg",
+      "executable": "talker",
+      "name": "worker",
+      "namespace": "/"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let metadata = root.join("talker.metadata.json");
+        fs::write(
+            &metadata,
+            r#"{
+  "version": 1,
+  "package": "demo_pkg",
+  "component": "talker",
+  "language": "rust",
+  "executable": "talker",
+  "exported_symbol": "nros_component_talker",
+  "nodes": [{
+    "id": "node_talker",
+    "unresolved_name": {"value": "talker", "kind": "relative"},
+    "namespace": null,
+    "publishers": [],
+    "subscribers": [],
+    "timers": [],
+    "services": [],
+    "actions": []
+  }],
+  "callbacks": [],
+  "parameters": [],
+  "trace": {"generator": "test", "package_manifest": "package.xml", "source_artifacts": []}
+}"#,
+        )
+        .unwrap();
+
+        let output = plan_system(PlanOptions {
+            system_pkg: "system_pkg".to_string(),
+            workspace_root: root.clone(),
+            launch_file: launch,
+            record_file: Some(record),
+            out_root: root.join("build/system_pkg/nros"),
+            metadata_files: vec![metadata],
+            manifest_files: vec![],
+            nros_toml_files: vec![],
+            launch_args: vec![],
+        })
+        .unwrap();
+        let plan: Value =
+            serde_json::from_str(&fs::read_to_string(output.plan_path).unwrap()).unwrap();
+        let env = plan["instances"][0]["env"].as_array().expect("env array");
+        assert!(env.is_empty());
     }
 
     #[test]

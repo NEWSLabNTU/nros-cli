@@ -102,6 +102,17 @@ pub struct RemapRule {
     pub to: String,
 }
 
+/// Phase 211.E — `<set_env>` / `<env>` declaration carried onto each instance.
+/// Parallel to [`RemapRule`]: a `{name, value}` pair sourced from the parser's
+/// `record.node[*].env` field and surfaced on `PlanInstance.env` so the deploy
+/// stage can pass them to the spawned process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvDecl {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceName {

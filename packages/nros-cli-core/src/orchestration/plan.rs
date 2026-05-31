@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::schema::{
-    DeadlinePolicy, InterfaceRef, ParameterTable, QosProfile, RemapRule, SchedClass, SourceLocation,
+    DeadlinePolicy, EnvDecl, InterfaceRef, ParameterTable, QosProfile, RemapRule, SchedClass,
+    SourceLocation,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,6 +124,12 @@ pub struct PlanInstance {
     pub launch_name: String,
     pub namespace: String,
     pub remaps: Vec<RemapRule>,
+    /// Phase 211.E — `<set_env>` / `<env>` declarations the launch attached
+    /// to this instance. Empty when nothing is declared. Additive on the
+    /// schema: `#[serde(default)]` so existing nros-plan.json files written
+    /// before the field was emitted round-trip unchanged.
+    #[serde(default)]
+    pub env: Vec<EnvDecl>,
     pub nodes: Vec<PlanNode>,
     pub callbacks: Vec<PlanCallback>,
     pub parameters: Vec<PlanParameter>,
