@@ -839,6 +839,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "eyre",
+ "libc",
  "ros-launch-manifest-types",
  "serde",
  "serde_json",

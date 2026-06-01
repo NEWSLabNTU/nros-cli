@@ -14,6 +14,7 @@ pub mod bringup;
 pub mod build;
 pub mod check;
 pub mod codegen;
+pub mod codegen_system;
 pub mod completions;
 pub mod config;
 pub mod deploy;
@@ -21,7 +22,9 @@ pub mod doctor;
 pub mod emit_package_xml;
 pub mod explain;
 pub mod generate;
+pub mod launch;
 pub mod metadata;
+pub mod migrate;
 pub mod monitor;
 pub mod new;
 pub mod new_system;
@@ -51,8 +54,19 @@ pub enum Cmd {
     /// in the former standalone `nros-codegen` binary).
     Codegen(codegen::Args),
 
+    /// Host-time system bake (Phase 212.E) — read `<bringup>/system.toml` +
+    /// `<bringup>/launch/system.launch.xml` and emit the baked compile-time
+    /// C config + component registration glue consumed by every embedded
+    /// RTOS adapter.
+    #[command(name = "codegen-system")]
+    CodegenSystem(codegen_system::Args),
+
     /// Collect component source metadata for orchestration planning
     Metadata(metadata::Args),
+
+    /// Migrate a pre-212 workspace to the new shape (Phase 212.I)
+    #[command(subcommand)]
+    Migrate(MigrateSub),
 
     /// Resolve launch files, manifests, and metadata into nros-plan.json
     Plan(plan::Args),
@@ -76,6 +90,11 @@ pub enum Cmd {
 
     /// Run a [deploy.<name>] target from the root nros.toml (Phase 172 WP-A)
     Deploy(deploy::Args),
+
+    /// Spawn a bringup pkg's components on the host (Phase 212.J — no ament
+    /// install required; the desktop / native_sim alternative to
+    /// `ros2 launch`).
+    Launch(launch::Args),
 
     /// Resolve + fetch a board's toolchain/SDK packages (Phase 187)
     Setup(setup::Args),
@@ -105,4 +124,11 @@ pub enum Cmd {
     #[cfg(feature = "release")]
     #[command(subcommand)]
     Release(release::Args),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MigrateSub {
+    /// Migrate a pre-212 workspace (`nros.toml` + `component_nros.toml` +
+    /// committed `metadata/*.json`) to the post-212 layout.
+    Workspace(migrate::Args),
 }
