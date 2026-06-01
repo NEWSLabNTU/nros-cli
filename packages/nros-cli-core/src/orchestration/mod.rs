@@ -6,6 +6,7 @@
 
 pub mod board_descriptor;
 pub mod build;
+pub mod cargo_metadata_schema;
 pub mod config;
 pub mod generate;
 pub mod manifest;
