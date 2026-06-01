@@ -1816,7 +1816,12 @@ fn build_node_instance(spec: NodeInstanceSpec<'_>, ctx: &mut PlanCtx<'_>) -> Val
     let node_name = names::node_fqn(namespace, name, executable);
     let namespace = names::normalize_namespace(namespace);
     let source_metadata = find_source_metadata(metadata, package, executable);
-    if source_metadata.is_none() {
+    // Phase 211.B — `<node_container>` typically spawns a stock binary
+    // (e.g. rclcpp_components::component_container) that isn't a nros
+    // component and so has no source_metadata. The composable children
+    // each carry their own metadata; the container itself doesn't need
+    // any. Suppress the missing-source-metadata diagnostic for containers.
+    if source_metadata.is_none() && launch_kind != "container" {
         ctx.diagnostics.push(diagnostic(
             "error",
             "missing-source-metadata",
