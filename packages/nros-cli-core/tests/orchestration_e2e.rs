@@ -54,6 +54,8 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
     let plan_path = out_dir.join("nros-plan.json");
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated plan");
 
@@ -173,6 +175,8 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
     .expect("write multi-instance plan");
     check::run(check::Args {
         plan: multi_plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated multi-instance plan");
     let multi_generated_dir = out_dir.join("generated-multi");
@@ -213,6 +217,8 @@ fn fixture_workspace_plans_checks_and_builds_generated_package() {
     .expect("write persistence plan");
     check::run(check::Args {
         plan: persist_plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates persistence plan");
     let persist_generated_dir = out_dir.join("generated-persist");
@@ -259,6 +265,8 @@ fn fixture_workspace_builds_and_boots_generated_freertos_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated FreeRTOS plan");
     build_generated_package(&BuildOptions {
@@ -328,6 +336,8 @@ fn fixture_workspace_builds_generated_nuttx_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated NuttX plan");
     build_generated_package(&BuildOptions {
@@ -388,6 +398,8 @@ fn fixture_workspace_builds_generated_esp32_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated ESP32 plan");
     build_generated_package(&BuildOptions {
@@ -517,6 +529,8 @@ fn fixture_workspace_generates_zephyr_package_shape() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated Zephyr plan");
 
@@ -611,6 +625,8 @@ fn fixture_workspace_builds_generated_threadx_riscv64_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated ThreadX-RISCV64 plan");
     build_generated_package(&BuildOptions {
@@ -663,6 +679,8 @@ fn fixture_workspace_builds_generated_stm32f4_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated STM32F4 plan");
     build_generated_package(&BuildOptions {
@@ -715,6 +733,8 @@ fn fixture_workspace_builds_generated_bare_metal_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated bare-metal plan");
     build_generated_package(&BuildOptions {
@@ -767,6 +787,8 @@ fn fixture_workspace_builds_generated_bare_metal_service_action_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated bare-metal svc/act plan");
     build_generated_package(&BuildOptions {
@@ -827,6 +849,8 @@ fn fixture_workspace_builds_generated_bare_metal_fibonacci_action_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated bare-metal fib plan");
     build_generated_package(&BuildOptions {
@@ -888,6 +912,8 @@ fn fixture_workspace_builds_generated_threadx_linux_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated ThreadX-Linux plan");
     build_generated_package(&BuildOptions {
@@ -1000,6 +1026,8 @@ fn fixture_workspace_links_mixed_c_component_archive() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated mixed C plan");
     build_generated_package(&BuildOptions {
@@ -1053,6 +1081,8 @@ fn fixture_workspace_builds_generated_service_action_package() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated service/action plan");
     build_generated_package(&BuildOptions {
@@ -1116,6 +1146,8 @@ fn fibonacci_action_tick_drives_example_client_exchange() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated fibonacci plan");
     build_generated_package(&BuildOptions {
@@ -1314,6 +1346,8 @@ fn bridge_forwards_chatter_across_two_zenoh_routers() {
 
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated bridge plan");
     build_generated_package(&BuildOptions {

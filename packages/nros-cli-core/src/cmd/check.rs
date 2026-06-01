@@ -1,18 +1,62 @@
-//! `nros check` - validate a generated nros-plan.json or a root nros.toml.
+//! `nros check` - validate a generated nros-plan.json, a root nros.toml, or
+//! (Phase 212.F) a `<bringup>` pkg directory for pure-declarative shape.
 
+use crate::cmd::bringup::lint_bringup;
+use crate::cmd::emit_package_xml::{DriftStatus, check_drift};
 use crate::orchestration::{planner::check_plan_file, root_config::WorkspaceConfig};
 use clap::Args as ClapArgs;
 use eyre::Result;
 use std::path::PathBuf;
 
-#[derive(Debug, ClapArgs)]
+#[derive(Debug, Default, ClapArgs)]
 pub struct Args {
-    /// Path to nros-plan.json, or a root nros.toml (Phase 172 WP-A)
+    /// Path to nros-plan.json, a root nros.toml (Phase 172 WP-A), or a
+    /// `<bringup>` pkg directory when `--bringup` is set (Phase 212.F).
     #[arg(default_value = "build/nros/nros-plan.json")]
     pub plan: PathBuf,
+
+    /// Phase 212.G.2 — also check a package directory for generated
+    /// `package.xml` drift (a generator-marked file edited by hand).
+    /// May be passed multiple times.
+    #[arg(long = "package-xml-drift")]
+    pub package_xml_drift: Vec<PathBuf>,
+
+    /// Phase 212.F — lint the `plan` argument as a `<bringup>` package
+    /// directory: reject `Cargo.toml`, `CMakeLists.txt`, `src/`, or any
+    /// nested `add_executable(`. The bringup package must be pure
+    /// declarative (see docs/design/multi-node-workspace-layout.md §4).
+    #[arg(long)]
+    pub bringup: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
+    // Phase 212.F — `--bringup` switches the `plan` argument into a directory
+    // path and runs the pure-declarative lint.
+    if args.bringup {
+        lint_bringup(&args.plan)?;
+        eprintln!(
+            "nros check: ok (bringup pkg {} is pure declarative)",
+            args.plan.display()
+        );
+        return Ok(());
+    }
+
+    // Phase 212.G.2 — drift sweep over any explicitly named pkg dirs runs
+    // first so warnings surface even when the plan check exits early.
+    for pkg_dir in &args.package_xml_drift {
+        match check_drift(pkg_dir)? {
+            DriftStatus::Drift { on_disk_path } => {
+                eprintln!(
+                    "nros check: warning: {} carries the generated marker but \
+                     differs from a fresh `nros emit package-xml` — \
+                     re-run the emit to discard local edits",
+                    on_disk_path.display()
+                );
+            }
+            DriftStatus::Absent | DriftStatus::Clean | DriftStatus::HandWritten => {}
+        }
+    }
+
     // A `.toml` argument is the workspace-root deployment config; anything
     // else is a generated plan. `WorkspaceConfig::load` validates as it parses.
     if args.plan.extension().is_some_and(|e| e == "toml") {

@@ -23,6 +23,7 @@ pub fn run(cmd: cmd::Cmd) -> Result<()> {
         cmd::Cmd::Plan(args) => cmd::plan::run(args),
         cmd::Cmd::Check(args) => cmd::check::run(args),
         cmd::Cmd::Explain(args) => cmd::explain::run(args),
+        cmd::Cmd::Emit(what) => cmd::emit_package_xml::run(cmd::emit_package_xml::Args { what }),
         cmd::Cmd::Config(args) => cmd::config::run(args),
         cmd::Cmd::Build(args) => cmd::build::run(args),
         cmd::Cmd::Deploy(args) => cmd::deploy::run(args),

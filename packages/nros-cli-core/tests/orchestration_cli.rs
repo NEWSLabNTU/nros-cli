@@ -44,6 +44,8 @@ fn orchestration_metadata_plan_check_commands_share_artifacts() {
     let plan_path = out_dir.join("nros-plan.json");
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check command validates generated plan");
 
@@ -190,6 +192,8 @@ deadline_policy = "warn"
     let plan_path = out_dir.join("nros-plan.json");
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check validates the multi-tier plan");
 
@@ -256,6 +260,8 @@ fn orchestration_plan_models_managed_lifecycle_from_nros_toml() {
     let plan_path = out_dir.join("nros-plan.json");
     check::run(check::Args {
         plan: plan_path.clone(),
+        package_xml_drift: Vec::new(),
+        bringup: false,
     })
     .expect("check validates the lifecycle plan");
 

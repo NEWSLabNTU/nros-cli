@@ -16,14 +16,33 @@ use eyre::{Result, bail};
 use std::path::PathBuf;
 
 use crate::{
-    cmd::scaffold_deploy::{DeployScaffold, scaffold_deploy},
+    cmd::{
+        new_system::{BringupScaffold, scaffold_bringup},
+        scaffold_deploy::{DeployScaffold, scaffold_deploy},
+    },
     orchestration::root_config::DeployKind,
 };
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Project directory to create (project mode)
+    /// Project directory to create (project mode), or the literal keyword
+    /// `system` to enter Phase 212.F bringup-scaffold mode: `nros new system
+    /// <name>_bringup --components <pkg1,pkg2,...>`.
     pub name: Option<PathBuf>,
+
+    /// Phase 212.F bringup-scaffold mode — the bringup package directory.
+    /// Only consumed when the first positional is the literal `system`.
+    pub system_name: Option<PathBuf>,
+
+    /// Phase 212.F — comma-separated component package names for
+    /// `nros new system <bringup> --components <list>`.
+    #[arg(long, value_delimiter = ',')]
+    pub components: Vec<String>,
+
+    /// Phase 212.F — workspace root holding the cargo `Cargo.toml` to
+    /// update. Defaults to the parent of the bringup dir.
+    #[arg(long)]
+    pub workspace_root: Option<PathBuf>,
 
     /// Target platform (required in project mode)
     #[arg(long, value_parser = ["native", "freertos", "nuttx", "threadx", "zephyr", "esp32", "posix", "baremetal"])]
@@ -79,6 +98,61 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    // Phase 212.F — system / bringup mode: `nros new system <name>_bringup
+    // --components <list>`. The literal `system` keyword as the first
+    // positional dispatches here.
+    if args
+        .name
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .map(|s| s == "system")
+        .unwrap_or(false)
+    {
+        let bringup_path = args
+            .system_name
+            .clone()
+            .ok_or_else(|| eyre::eyre!("`nros new system <name>_bringup` requires a bringup pkg name"))?;
+        if args.components.is_empty() {
+            bail!(
+                "`nros new system <bringup>` requires --components <pkg1,pkg2,...> \
+                 (at least one component)"
+            );
+        }
+        let cwd = std::env::current_dir()?;
+        let bringup_dir = if bringup_path.is_absolute() {
+            bringup_path
+        } else {
+            cwd.join(&bringup_path)
+        };
+        let pkg_name = bringup_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| eyre::eyre!("invalid bringup package name"))?
+            .to_string();
+        let workspace_root = args
+            .workspace_root
+            .clone()
+            .or_else(|| bringup_dir.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| cwd.clone());
+        let out = scaffold_bringup(&BringupScaffold {
+            bringup_dir: bringup_dir.clone(),
+            pkg_name: pkg_name.clone(),
+            components: args.components.clone(),
+            workspace_root,
+            force: args.force,
+        })?;
+        eprintln!(
+            "nros new system: scaffolded bringup pkg {pkg_name} at {} ({} component(s))",
+            out.bringup_dir.display(),
+            args.components.len()
+        );
+        if let Some(ws) = out.workspace_cargo_toml.as_ref() {
+            eprintln!("nros new system: updated [workspace] exclude in {}", ws.display());
+        }
+        let _ = out; // silence unused warning under future changes
+        return Ok(());
+    }
+
     // Deploy mode (Phase 172 WP-A): `nros new --deploy <name> --kind <k> ...`.
     if let Some(deploy_name) = args.deploy {
         let kind = match args.kind.as_str() {

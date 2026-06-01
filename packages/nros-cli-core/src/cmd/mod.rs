@@ -10,6 +10,7 @@
 use clap::Subcommand;
 
 pub mod board;
+pub mod bringup;
 pub mod build;
 pub mod check;
 pub mod codegen;
@@ -17,11 +18,13 @@ pub mod completions;
 pub mod config;
 pub mod deploy;
 pub mod doctor;
+pub mod emit_package_xml;
 pub mod explain;
 pub mod generate;
 pub mod metadata;
 pub mod monitor;
 pub mod new;
+pub mod new_system;
 pub mod plan;
 pub mod run_target;
 pub mod scaffold_deploy;
@@ -59,6 +62,10 @@ pub enum Cmd {
 
     /// Render a generated nros-plan.json in human-readable form
     Explain(explain::Args),
+
+    /// Emit a generated artifact for a package (Phase 212.G — `package-xml`).
+    #[command(subcommand)]
+    Emit(emit_package_xml::What),
 
     /// Inspect or validate the current project's resolved configuration
     #[command(subcommand)]
