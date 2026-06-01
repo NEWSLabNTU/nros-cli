@@ -89,7 +89,87 @@ pub fn lint_bringup(bringup_dir: &Path) -> Result<()> {
             found.join(", ")
         );
     }
+
+    // 3. Cross-validate `package.xml` `<exec_depend>` rows against
+    //    `[[component]].pkg` rows in `system.toml`. The bringup's
+    //    `<exec_depend>` block IS a derived view of the system's component
+    //    list; any drift means a stale package.xml after a component
+    //    rename or add/remove. This replaces the retired
+    //    `nros emit package-xml` auto-regeneration path (Phase 212.G).
+    check_exec_depend_drift(bringup_dir, pkg_name)?;
+
     Ok(())
+}
+
+/// Compare `<exec_depend>…</exec_depend>` rows in `<bringup>/package.xml`
+/// against `[[component]].pkg` rows in `<bringup>/system.toml`. Surfaces
+/// extras + missing as a single lint error. Empty `<exec_depend>` blocks
+/// fine when `[[component]]` list is also empty.
+fn check_exec_depend_drift(bringup_dir: &Path, pkg_name: &str) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    use crate::orchestration::cargo_metadata_schema::SystemToml;
+
+    let system_toml_raw = fs::read_to_string(bringup_dir.join("system.toml"))?;
+    let system: SystemToml = toml::from_str(&system_toml_raw)?;
+    let want: BTreeSet<String> = system.components.iter().map(|c| c.pkg.clone()).collect();
+
+    let package_xml = fs::read_to_string(bringup_dir.join("package.xml"))?;
+    let got = parse_exec_depend(&package_xml);
+
+    let missing: Vec<&String> = want.difference(&got).collect();
+    let extra: Vec<&String> = got.difference(&want).collect();
+    if missing.is_empty() && extra.is_empty() {
+        return Ok(());
+    }
+    let mut details: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+        details.push(format!(
+            "missing <exec_depend>: {} (declared in system.toml [[component]])",
+            names.join(", ")
+        ));
+    }
+    if !extra.is_empty() {
+        let names: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        details.push(format!(
+            "stray <exec_depend>: {} (not in system.toml [[component]])",
+            names.join(", ")
+        ));
+    }
+    bail!(
+        "bringup pkg {pkg_name}: package.xml drift vs system.toml — {}. \
+         Hand-edit package.xml to add/remove the listed entries; the \
+         `nros emit package-xml` auto-regen verb was retired in Phase 212.G.",
+        details.join("; ")
+    );
+}
+
+/// Pull every `<exec_depend>NAME</exec_depend>` body from a `package.xml`
+/// blob. Minimal substring parser — `package.xml` is regular enough that
+/// a full XML pass would be overkill. Whitespace is trimmed; duplicates
+/// collapse into the BTreeSet.
+fn parse_exec_depend(xml: &str) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+
+    let mut out = BTreeSet::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<exec_depend") {
+        rest = &rest[start..];
+        let Some(open_end) = rest.find('>') else {
+            break;
+        };
+        rest = &rest[open_end + 1..];
+        let Some(close) = rest.find("</exec_depend>") else {
+            break;
+        };
+        let body = rest[..close].trim();
+        if !body.is_empty() {
+            out.insert(body.to_string());
+        }
+        rest = &rest[close + "</exec_depend>".len()..];
+    }
+    out
 }
 
 fn walk_cmakelists(root: &Path) -> Vec<PathBuf> {
@@ -163,7 +243,10 @@ pub fn discover_bringups(workspace_root: &Path) -> Result<Vec<DiscoveredBringup>
             continue;
         }
         if p.join("package.xml").is_file() && p.join("system.toml").is_file() {
-            found.push(DiscoveredBringup { pkg_name: name, dir: p });
+            found.push(DiscoveredBringup {
+                pkg_name: name,
+                dir: p,
+            });
         }
     }
     found.sort_by(|a, b| a.pkg_name.cmp(&b.pkg_name));
@@ -179,8 +262,8 @@ fn read_workspace_members(workspace_root: &Path) -> Result<Option<Vec<String>>> 
     }
     let raw = fs::read_to_string(&cargo_toml)
         .wrap_err_with(|| format!("read {}", cargo_toml.display()))?;
-    let doc: toml::Value = toml::from_str(&raw)
-        .wrap_err_with(|| format!("parse {}", cargo_toml.display()))?;
+    let doc: toml::Value =
+        toml::from_str(&raw).wrap_err_with(|| format!("parse {}", cargo_toml.display()))?;
     let members = doc
         .get("workspace")
         .and_then(|w| w.get("members"))
@@ -208,10 +291,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "nros-bringup-{tag}-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nros-bringup-{tag}-{}-{stamp}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -246,7 +327,11 @@ mod tests {
         let root = temp_root("reject_cargo");
         let bringup = root.join("demo_bringup");
         write_pure_bringup(&bringup);
-        fs::write(bringup.join("Cargo.toml"), "[package]\nname=\"demo_bringup\"\n").unwrap();
+        fs::write(
+            bringup.join("Cargo.toml"),
+            "[package]\nname=\"demo_bringup\"\n",
+        )
+        .unwrap();
         let err = lint_bringup(&bringup).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Cargo.toml"), "diagnostic: {msg}");
@@ -271,7 +356,11 @@ mod tests {
         let root = temp_root("reject_cmake");
         let bringup = root.join("demo_bringup");
         write_pure_bringup(&bringup);
-        fs::write(bringup.join("CMakeLists.txt"), "add_executable(demo src/main.cpp)\n").unwrap();
+        fs::write(
+            bringup.join("CMakeLists.txt"),
+            "add_executable(demo src/main.cpp)\n",
+        )
+        .unwrap();
         let err = lint_bringup(&bringup).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("CMakeLists.txt"), "diagnostic: {msg}");
@@ -317,9 +406,17 @@ mod tests {
         .unwrap();
         // Pretend component pkgs.
         fs::create_dir_all(root.join("talker_pkg/src")).unwrap();
-        fs::write(root.join("talker_pkg/Cargo.toml"), "[package]\nname=\"talker_pkg\"\nversion=\"0.1.0\"\n").unwrap();
+        fs::write(
+            root.join("talker_pkg/Cargo.toml"),
+            "[package]\nname=\"talker_pkg\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("listener_pkg/src")).unwrap();
-        fs::write(root.join("listener_pkg/Cargo.toml"), "[package]\nname=\"listener_pkg\"\nversion=\"0.1.0\"\n").unwrap();
+        fs::write(
+            root.join("listener_pkg/Cargo.toml"),
+            "[package]\nname=\"listener_pkg\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
         // Bringup sibling.
         let bringup = root.join("demo_bringup");
         write_pure_bringup(&bringup);
@@ -344,13 +441,14 @@ mod tests {
         .unwrap();
         let odd = root.join("odd_pkg");
         write_pure_bringup(&odd);
-        fs::write(odd.join("Cargo.toml"), "[package]\nname=\"odd_pkg\"\nversion=\"0.1.0\"\n").unwrap();
+        fs::write(
+            odd.join("Cargo.toml"),
+            "[package]\nname=\"odd_pkg\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
 
         let found = discover_bringups(&root).expect("discovery walk");
-        assert!(
-            found.is_empty(),
-            "members must be skipped, got: {found:?}"
-        );
+        assert!(found.is_empty(), "members must be skipped, got: {found:?}");
     }
 
     #[test]

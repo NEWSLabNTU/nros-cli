@@ -64,8 +64,14 @@ pub enum Cmd {
     /// Collect component source metadata for orchestration planning
     Metadata(metadata::Args),
 
-    /// Migrate a pre-212 workspace to the new shape (Phase 212.I)
-    #[command(subcommand)]
+    /// Migrate a pre-212 workspace to the new shape (Phase 212.I).
+    ///
+    /// Hidden from `nros --help`: this is an internal maintainer tool
+    /// that runs once per pre-212 workspace and retires. End users start
+    /// from the post-212 shape (`nros new system <bringup>`) and never
+    /// touch this verb. Kept callable via `cargo run -p nros-cli` for
+    /// the in-tree fixture sweep.
+    #[command(subcommand, hide = true)]
     Migrate(MigrateSub),
 
     /// Resolve launch files, manifests, and metadata into nros-plan.json
@@ -76,10 +82,6 @@ pub enum Cmd {
 
     /// Render a generated nros-plan.json in human-readable form
     Explain(explain::Args),
-
-    /// Emit a generated artifact for a package (Phase 212.G — `package-xml`).
-    #[command(subcommand)]
-    Emit(emit_package_xml::What),
 
     /// Inspect or validate the current project's resolved configuration
     #[command(subcommand)]

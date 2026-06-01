@@ -1,9 +1,19 @@
-//! `nros emit package-xml` — Phase 212.G.
+//! Internal `package.xml` helpers — Phase 212.G (CLI verb removed).
 //!
-//! Auto-generate `package.xml` from a component package's `Cargo.toml`
+//! Renders a `package.xml` from a component package's `Cargo.toml`
 //! `[package.metadata.ament]` table, or from a bringup package's
-//! `system.toml.[system].components` block. Eliminates hand-maintenance while
-//! keeping `package.xml` in tree for ament/colcon interop.
+//! `system.toml.[[component]]` block. The `nros emit package-xml`
+//! user-facing verb was retired (users hand-write `package.xml` when
+//! they need ament/colcon interop, or skip it entirely when they use
+//! `nros launch`). The render path stays as an internal helper:
+//!
+//!   * `migrate::run` regenerates `package.xml` for every component
+//!     during the pre-212 → post-212 sweep.
+//!   * `check::run` uses [`check_drift`] to detect a hand-edited
+//!     `package.xml` whose generator marker disagrees with the current
+//!     `Cargo.toml` / `system.toml` (Phase 212.G.2).
+//!
+//! Nothing in this module is reachable from the CLI dispatcher.
 //!
 //! Two pkg shapes, dispatched by the artifacts present in `<pkg-dir>`:
 //!
@@ -27,7 +37,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use clap::{Args as ClapArgs, Subcommand};
 use eyre::{Context, Result, bail};
 use serde::Deserialize;
 
@@ -51,54 +60,6 @@ const DEFAULT_MAINTAINER_NAME: &str = "Developer";
 const DEFAULT_BUILD_TYPE_COMPONENT: &str = "ament_cargo";
 const DEFAULT_BUILD_TYPE_BRINGUP: &str = "ament_cmake";
 const DEFAULT_DESCRIPTION_BRINGUP_FMT: &str = "Generated bringup package for ";
-
-// ---------------------------------------------------------------------------
-// Clap surface
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, ClapArgs)]
-pub struct Args {
-    #[command(subcommand)]
-    pub what: What,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum What {
-    /// Emit `package.xml` for a component pkg (Cargo.toml) or bringup pkg
-    /// (system.toml). The pkg shape is autodetected.
-    #[command(name = "package-xml")]
-    PackageXml(PackageXmlArgs),
-}
-
-#[derive(Debug, ClapArgs)]
-pub struct PackageXmlArgs {
-    /// Package directory containing `Cargo.toml` (component pkg) or
-    /// `system.toml` (bringup pkg).
-    pub pkg_dir: PathBuf,
-
-    /// Write to `<pkg-dir>/package.xml` (default: print to stdout).
-    #[arg(long)]
-    pub write: bool,
-}
-
-pub fn run(args: Args) -> Result<()> {
-    match args.what {
-        What::PackageXml(a) => run_package_xml(a),
-    }
-}
-
-fn run_package_xml(args: PackageXmlArgs) -> Result<()> {
-    let xml = render_for_pkg(&args.pkg_dir)?;
-    if args.write {
-        let out = args.pkg_dir.join("package.xml");
-        std::fs::write(&out, &xml)
-            .with_context(|| format!("write {}", out.display()))?;
-        eprintln!("nros emit package-xml: wrote {}", out.display());
-    } else {
-        print!("{xml}");
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -163,8 +124,8 @@ struct CargoPackageMetadata {
 fn render_component(cargo_toml: &Path) -> Result<String> {
     let raw = std::fs::read_to_string(cargo_toml)
         .with_context(|| format!("read {}", cargo_toml.display()))?;
-    let manifest: CargoManifest = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", cargo_toml.display()))?;
+    let manifest: CargoManifest =
+        toml::from_str(&raw).with_context(|| format!("parse {}", cargo_toml.display()))?;
 
     // Validate the nros table early — surfaces the
     // "both component and components" diagnostic from the schema layer.
@@ -184,12 +145,18 @@ fn render_component(cargo_toml: &Path) -> Result<String> {
         .unwrap_or_default();
 
     let pkg_name = manifest.package.name;
-    let version = manifest.package.version.unwrap_or_else(|| DEFAULT_VERSION.into());
+    let version = manifest
+        .package
+        .version
+        .unwrap_or_else(|| DEFAULT_VERSION.into());
     let description = manifest
         .package
         .description
         .unwrap_or_else(|| format!("nano-ros component package {pkg_name}"));
-    let license = manifest.package.license.unwrap_or_else(|| DEFAULT_LICENSE.into());
+    let license = manifest
+        .package
+        .license
+        .unwrap_or_else(|| DEFAULT_LICENSE.into());
     let build_type = ament
         .build_type
         .clone()
@@ -214,8 +181,8 @@ fn render_component(cargo_toml: &Path) -> Result<String> {
 fn render_bringup(system_toml: &Path) -> Result<String> {
     let raw = std::fs::read_to_string(system_toml)
         .with_context(|| format!("read {}", system_toml.display()))?;
-    let system: SystemToml = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", system_toml.display()))?;
+    let system: SystemToml =
+        toml::from_str(&raw).with_context(|| format!("parse {}", system_toml.display()))?;
 
     // Bringup pkg name convention is `<system>_bringup`. Per the design doc
     // we name the emitted `<package><name>` by suffixing if missing — but the
@@ -378,9 +345,7 @@ pub fn check_drift(pkg_dir: &Path) -> Result<DriftStatus> {
     if on_disk == fresh {
         Ok(DriftStatus::Clean)
     } else {
-        Ok(DriftStatus::Drift {
-            on_disk_path,
-        })
+        Ok(DriftStatus::Drift { on_disk_path })
     }
 }
 
@@ -393,9 +358,7 @@ pub enum DriftStatus {
     /// Present, generator-owned, and matches a fresh emit.
     Clean,
     /// Present, generator-owned, but differs from a fresh emit.
-    Drift {
-        on_disk_path: PathBuf,
-    },
+    Drift { on_disk_path: PathBuf },
 }
 
 // ---------------------------------------------------------------------------
@@ -688,8 +651,7 @@ name = "p"
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                let path = std::env::temp_dir()
-                    .join(format!("nros-emit-pkgxml-{pid}-{now}-{n}"));
+                let path = std::env::temp_dir().join(format!("nros-emit-pkgxml-{pid}-{now}-{n}"));
                 std::fs::create_dir_all(&path)?;
                 Ok(Self { path })
             }
