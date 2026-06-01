@@ -840,6 +840,7 @@ dependencies = [
  "clap",
  "eyre",
  "libc",
+ "nros-msg-to-idl",
  "ros-launch-manifest-types",
  "serde",
  "serde_json",
@@ -847,6 +848,10 @@ dependencies = [
  "toml",
  "toml_edit",
 ]
+
+[[package]]
+name = "nros-msg-to-idl"
+version = "0.1.0"
 
 [[package]]
 name = "num-traits"

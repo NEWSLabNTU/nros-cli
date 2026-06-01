@@ -49,6 +49,15 @@ pub enum Sub {
         #[arg(long)]
         verbose: bool,
     },
+
+    /// Phase 212.K.4 — emit per-example Cyclone-DDS topic descriptors.
+    ///
+    /// Synthesises Cyclone-shaped IDL from one or more `.msg` sources,
+    /// drives the host `idlc` to produce `<pkg>_<Msg>.{c,h}` pairs, and
+    /// writes a `register.{c,h}` + JSON manifest the consumer build
+    /// script feeds into `cc::Build`.
+    #[command(name = "cyclonedds-descriptors")]
+    CycloneddsDescriptors(super::codegen_cyclonedds_descriptors::Args),
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -63,6 +72,9 @@ pub fn run(args: Args) -> Result<()> {
             verbose,
         })
         .map_err(|e| eyre!("{e:#}")),
+        Some(Sub::CycloneddsDescriptors(sub_args)) => {
+            super::codegen_cyclonedds_descriptors::run(sub_args)
+        }
         None => {
             let Some(args_file) = args.args_file else {
                 bail!("nros codegen: --args-file is required (or use a subcommand)");

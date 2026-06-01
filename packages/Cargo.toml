@@ -8,6 +8,7 @@ members = [
     "cargo-nros",
     "nros-cli-core",
     "nros-cli",
+    "nros-msg-to-idl",
     "colcon-cargo-ros2",  # Package dir name (contains colcon-nano-ros crate)
 ]
 
@@ -40,6 +41,7 @@ nros-cli-core = { path = "nros-cli-core" }
 rosidl-bindgen = { path = "rosidl-bindgen" }
 rosidl-parser = { path = "rosidl-parser" }
 rosidl-codegen = { path = "rosidl-codegen" }
+nros-msg-to-idl = { path = "nros-msg-to-idl" }
 
 [profile.dev-release]
 inherits = "release"

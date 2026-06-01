@@ -14,6 +14,7 @@ pub mod bringup;
 pub mod build;
 pub mod check;
 pub mod codegen;
+pub mod codegen_cyclonedds_descriptors;
 pub mod codegen_system;
 pub mod completions;
 pub mod config;
