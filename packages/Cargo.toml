@@ -5,6 +5,7 @@ members = [
     "rosidl-codegen",
     "rosidl-bindgen",
     "cargo-nano-ros",
+    "cargo-nros",
     "nros-cli-core",
     "nros-cli",
     "colcon-cargo-ros2",  # Package dir name (contains colcon-nano-ros crate)
