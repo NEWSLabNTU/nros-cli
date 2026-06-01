@@ -134,6 +134,22 @@ pub struct PlanInstance {
     pub executable: String,
     pub launch_name: String,
     pub namespace: String,
+    /// Phase 211.B — entity kind: `"node"` for a plain `<node>`,
+    /// `"container"` for a `<node_container>` (the spawned binary
+    /// hosting composable children in-process), or `"composable_node"`
+    /// for a `<composable_node>` / `<load_composable_node>` child.
+    /// Additive on the schema: defaults to `"node"` so pre-211.B plans
+    /// round-trip unchanged.
+    #[serde(default = "PlanInstance::default_kind")]
+    pub kind: String,
+    /// Phase 211.B — when `kind == "composable_node"`, the id of the
+    /// parent container instance (the `<node_container>` that hosts
+    /// this composable in-process). `None` for `kind = "node"` and for
+    /// `kind = "container"` (the container itself has no parent).
+    /// Additive: `#[serde(default)]` so pre-211.B plans round-trip
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
     pub remaps: Vec<RemapRule>,
     /// Phase 211.E — `<set_env>` / `<env>` declarations the launch attached
     /// to this instance. Empty when nothing is declared. Additive on the
@@ -146,6 +162,12 @@ pub struct PlanInstance {
     pub parameters: Vec<PlanParameter>,
     pub sched_bindings: Vec<PlanSchedBinding>,
     pub trace: InstanceTrace,
+}
+
+impl PlanInstance {
+    fn default_kind() -> String {
+        "node".to_string()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

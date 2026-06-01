@@ -751,11 +751,26 @@ fn schema_instance(instance: &Value, declared: &BTreeMap<String, Value>) -> Valu
         .and_then(|node| node.get("id"))
         .and_then(Value::as_str)
         .unwrap_or("node");
-    json!({
+    // Phase 211.B — map the intermediate `launch_kind` onto the public
+    // schema's `kind`: "node" / "container" / "composable_node".
+    let kind = match instance.get("launch_kind").and_then(Value::as_str) {
+        Some("container") => "container",
+        Some("load_node") => "composable_node",
+        _ => "node",
+    };
+    let container_id = instance
+        .get("container_id")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    let mut out = json!({
         "id": id,
         "component": format!("{package}::{executable}"),
         "package": package,
         "executable": executable,
+        // Phase 211.B — defaults to "node" (matches PlanInstance::default_kind);
+        // emitted explicitly so the wire shape always carries the kind.
+        "kind": kind,
         "launch_name": launch_name,
         "namespace": namespace,
         "remaps": schema_remaps(instance.get("remaps")),
@@ -771,7 +786,16 @@ fn schema_instance(instance: &Value, declared: &BTreeMap<String, Value>) -> Valu
             "launch_record_entity": format!("record://{id}"),
             "source_metadata": instance.get("source_metadata").and_then(Value::as_str).unwrap_or(""),
         },
-    })
+    });
+    // Phase 211.B — `container_id` is `skip_serializing_if = "Option::is_none"`
+    // on the schema struct, so we only emit it when actually set (composable
+    // children); plain nodes + containers themselves stay byte-compat.
+    if let Some(parent_id) = container_id {
+        out.as_object_mut()
+            .expect("schema_instance produces object")
+            .insert("container_id".to_string(), json!(parent_id));
+    }
+    out
 }
 
 fn schema_nodes(instance_id: &str, source_nodes: &[Value], entities: &[Value]) -> Vec<Value> {
@@ -1552,6 +1576,61 @@ fn build_instances(
     let mut instances = Vec::new();
     let mut executables = Vec::new();
 
+    // Phase 211.B — index containers by canonical name → instance id so the
+    // composable loop below can link each child to its parent. The canonical
+    // key matches the parser's `target_container_name` shape: an absolute
+    // path like `/my_container` (the parent's launch_name) for resolved
+    // entries. We populate the map AS we mint each container instance.
+    let mut container_id_by_launch_name: HashMap<String, String> = HashMap::new();
+
+    for container in record_array(record, "container") {
+        let package = string_field(container, &["package"]).unwrap_or_default();
+        if package.is_empty() {
+            continue;
+        }
+        let executable = string_field(container, &["executable"]).unwrap_or_default();
+        let params = pairs_field(container, "params");
+        let remaps = pairs_field(container, "remaps");
+        let env = pairs_field(container, "env");
+        let param_files = string_list_field(container, "params_files");
+        let name = string_field(container, &["name"]);
+        let namespace = string_field(container, &["namespace"]);
+        let launch_name = names::node_fqn(namespace, name, executable);
+        let inst = build_node_instance(
+            NodeInstanceSpec {
+                package,
+                executable,
+                name,
+                namespace,
+                params: &params,
+                param_files: &param_files,
+                remaps: &remaps,
+                env: &env,
+                launch_kind: "container",
+                container_id: None,
+            },
+            &mut PlanCtx {
+                metadata,
+                workspace,
+                overlays,
+                record_path,
+                counts: &mut counts,
+                diagnostics: &mut diagnostics,
+            },
+        );
+        if let Some(id) = inst.get("id").and_then(Value::as_str) {
+            container_id_by_launch_name.insert(launch_name.clone(), id.to_string());
+            // Composable launches reference the container by FQN (e.g.
+            // `/my_container`) on `target_container_name`; some launches use
+            // the bare `name` instead. Store both forms so the lookup is
+            // robust to either spelling.
+            if let Some(name) = name {
+                container_id_by_launch_name.insert(name.to_string(), id.to_string());
+            }
+        }
+        instances.push(inst);
+    }
+
     for node in record_array(record, "node") {
         let package = string_field(node, &["package"]).unwrap_or_default();
         if package.is_empty() {
@@ -1581,6 +1660,7 @@ fn build_instances(
                 remaps: &remaps,
                 env: &env,
                 launch_kind: "node",
+                container_id: None,
             },
             &mut PlanCtx {
                 metadata,
@@ -1600,6 +1680,21 @@ fn build_instances(
         let params = pairs_field(load_node, "params");
         let remaps = pairs_field(load_node, "remaps");
         let env = pairs_field(load_node, "env");
+        // Phase 211.B — resolve the parent container's instance id from the
+        // parser's `target_container_name`. Try the FQN as-is, the leading
+        // slash stripped, and the trailing path segment — covers every form
+        // we've seen on Autoware launches (parser writes the FQN).
+        let target = string_field(load_node, &["target_container_name"]).unwrap_or("");
+        let container_id = container_id_by_launch_name
+            .get(target)
+            .or_else(|| container_id_by_launch_name.get(target.trim_start_matches('/')))
+            .or_else(|| {
+                target
+                    .rsplit('/')
+                    .next()
+                    .and_then(|tail| container_id_by_launch_name.get(tail))
+            })
+            .cloned();
         instances.push(build_node_instance(
             NodeInstanceSpec {
                 package,
@@ -1611,6 +1706,7 @@ fn build_instances(
                 remaps: &remaps,
                 env: &env,
                 launch_kind: "load_node",
+                container_id: container_id.as_deref(),
             },
             &mut PlanCtx {
                 metadata,
@@ -1673,6 +1769,11 @@ struct NodeInstanceSpec<'a> {
     /// equivalent. Phase 211.E.
     env: &'a [(String, String)],
     launch_kind: &'a str,
+    /// Phase 211.B — when this instance is a `<composable_node>` child, the
+    /// instance id of the parent `<node_container>` (resolved from the
+    /// parser's `target_container_name`). `None` for plain `<node>` and
+    /// for `<node_container>` itself.
+    container_id: Option<&'a str>,
 }
 
 /// Ambient state threaded through plan construction: read-only inputs
@@ -1698,6 +1799,7 @@ fn build_node_instance(spec: NodeInstanceSpec<'_>, ctx: &mut PlanCtx<'_>) -> Val
         remaps,
         env,
         launch_kind,
+        container_id,
     } = spec;
     let metadata = ctx.metadata;
     let workspace = ctx.workspace;
@@ -1781,6 +1883,11 @@ fn build_node_instance(spec: NodeInstanceSpec<'_>, ctx: &mut PlanCtx<'_>) -> Val
         "package": package,
         "executable": executable,
         "launch_kind": launch_kind,
+        // Phase 211.B — `container_id` is None for plain `<node>` and for
+        // `<node_container>` itself; Some for `<composable_node>` children.
+        // schema_instance reshapes this onto the public `container_id`
+        // field (skip_serializing_if = "Option::is_none").
+        "container_id": container_id,
         "node_name": node_name,
         "namespace": namespace,
         "remaps": remaps,
@@ -3277,6 +3384,212 @@ topics:
         assert_eq!(env[0]["value"], "verbose");
         assert_eq!(env[1]["name"], "NODE_VAR");
         assert_eq!(env[1]["value"], "node_specific");
+    }
+
+    /// Phase 211.B — `<node_container>` mints a container instance; its
+    /// `<composable_node>` children land as flat instances but each
+    /// carries `container_id` pointing back at the parent and
+    /// `kind = "composable_node"`. The container itself has
+    /// `kind = "container"` and NO `container_id`.
+    #[test]
+    fn plan_system_groups_composables_under_container() {
+        let root = temp_workspace("nros-plan-composable-grouping");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.xml"),
+            r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+        )
+        .unwrap();
+        let launch = root.join("system.launch.xml");
+        fs::write(&launch, "<launch />").unwrap();
+        // Mirrors the parser output for:
+        //   <node_container pkg="rclcpp_components" exec="component_container"
+        //                    name="my_container" namespace="">
+        //     <composable_node pkg="demo_pkg" plugin="demo_pkg::Talker" name="talker"/>
+        //     <composable_node pkg="demo_pkg" plugin="demo_pkg::Listener" name="listener"/>
+        //   </node_container>
+        let record = root.join("record.json");
+        fs::write(
+            &record,
+            r#"{
+  "container": [
+    {
+      "package": "rclcpp_components",
+      "executable": "component_container",
+      "name": "my_container",
+      "namespace": "/"
+    }
+  ],
+  "load_node": [
+    {
+      "package": "demo_pkg",
+      "plugin": "demo_pkg::Talker",
+      "node_name": "talker",
+      "namespace": "/",
+      "target_container_name": "/my_container"
+    },
+    {
+      "package": "demo_pkg",
+      "plugin": "demo_pkg::Listener",
+      "node_name": "listener",
+      "namespace": "/",
+      "target_container_name": "/my_container"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let make_metadata = |path: &Path, component: &str| {
+            fs::write(
+                path,
+                format!(
+                    r#"{{
+  "version": 1, "package": "demo_pkg", "component": "{component}", "language": "cpp",
+  "executable": "{component}", "exported_symbol": "nros_component_demo_pkg_{component}",
+  "nodes": [{{ "id": "n", "unresolved_name": {{"value":"{component}","kind":"relative"}}, "namespace": null,
+    "publishers": [], "subscribers": [], "timers": [], "services": [], "actions": [] }}],
+  "callbacks": [], "parameters": [],
+  "trace": {{"generator":"test","package_manifest":"package.xml","source_artifacts":[]}}
+}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let container_md = root.join("container.metadata.json");
+        fs::write(
+            &container_md,
+            r#"{
+  "version": 1, "package": "rclcpp_components", "component": "component_container", "language": "cpp",
+  "executable": "component_container", "exported_symbol": "nros_component_container",
+  "nodes": [{ "id": "n", "unresolved_name": {"value":"component_container","kind":"relative"}, "namespace": null,
+    "publishers": [], "subscribers": [], "timers": [], "services": [], "actions": [] }],
+  "callbacks": [], "parameters": [],
+  "trace": {"generator":"test","package_manifest":"package.xml","source_artifacts":[]}
+}"#,
+        )
+        .unwrap();
+        let talker_md = root.join("talker.metadata.json");
+        make_metadata(&talker_md, "Talker");
+        let listener_md = root.join("listener.metadata.json");
+        make_metadata(&listener_md, "Listener");
+
+        let output = plan_system(PlanOptions {
+            system_pkg: "system_pkg".to_string(),
+            workspace_root: root.clone(),
+            launch_file: launch,
+            record_file: Some(record),
+            out_root: root.join("build/system_pkg/nros"),
+            metadata_files: vec![container_md, talker_md, listener_md],
+            manifest_files: vec![],
+            nros_toml_files: vec![],
+            launch_args: vec![],
+        })
+        .unwrap();
+        let plan: Value =
+            serde_json::from_str(&fs::read_to_string(output.plan_path).unwrap()).unwrap();
+        // Schema round-trip catches drift (deny_unknown_fields).
+        serde_json::from_value::<NrosPlan>(plan.clone()).unwrap();
+
+        let instances = plan["instances"].as_array().unwrap();
+        assert_eq!(
+            instances.len(),
+            3,
+            "expected container + 2 composables, got: {instances:#?}"
+        );
+
+        let container = instances
+            .iter()
+            .find(|i| i["kind"] == "container")
+            .expect("container instance");
+        assert_eq!(container["component"], "rclcpp_components::component_container");
+        assert!(
+            container.get("container_id").is_none()
+                || container["container_id"].is_null(),
+            "container must NOT carry its own container_id: {container:#?}"
+        );
+        let container_id = container["id"].as_str().expect("container id");
+
+        for needle in ["Talker", "Listener"] {
+            let child = instances
+                .iter()
+                .find(|i| {
+                    i["component"]
+                        .as_str()
+                        .is_some_and(|s| s == format!("demo_pkg::{needle}"))
+                })
+                .unwrap_or_else(|| panic!("no demo_pkg::{needle} instance"));
+            assert_eq!(
+                child["kind"], "composable_node",
+                "{needle} should be kind=composable_node"
+            );
+            assert_eq!(
+                child["container_id"], container_id,
+                "{needle} container_id must point at the parent container"
+            );
+        }
+    }
+
+    /// A plain `<node>` (no parent container) must surface as
+    /// `kind = "node"` with no `container_id` key on the JSON (the field
+    /// is `skip_serializing_if = "Option::is_none"` so byte-compat with
+    /// pre-211.B plans is preserved).
+    #[test]
+    fn plan_system_plain_node_has_kind_node_and_no_container_id() {
+        let root = temp_workspace("nros-plan-plain-node-kind");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.xml"),
+            r#"<package format="3"><name>system_pkg</name><version>0.1.0</version></package>"#,
+        )
+        .unwrap();
+        let launch = root.join("system.launch.xml");
+        fs::write(&launch, "<launch />").unwrap();
+        let record = root.join("record.json");
+        fs::write(
+            &record,
+            r#"{
+  "node": [{
+    "package": "demo_pkg",
+    "executable": "talker",
+    "name": "talker",
+    "namespace": "/"
+  }]
+}"#,
+        )
+        .unwrap();
+        let metadata = root.join("talker.metadata.json");
+        fs::write(
+            &metadata,
+            r#"{
+  "version": 1, "package": "demo_pkg", "component": "talker", "language": "rust",
+  "executable": "talker", "exported_symbol": "nros_component_talker",
+  "nodes": [{ "id": "n", "unresolved_name": {"value":"talker","kind":"relative"}, "namespace": null,
+    "publishers": [], "subscribers": [], "timers": [], "services": [], "actions": [] }],
+  "callbacks": [], "parameters": [],
+  "trace": {"generator":"test","package_manifest":"package.xml","source_artifacts":[]}
+}"#,
+        )
+        .unwrap();
+        let output = plan_system(PlanOptions {
+            system_pkg: "system_pkg".to_string(),
+            workspace_root: root.clone(),
+            launch_file: launch,
+            record_file: Some(record),
+            out_root: root.join("build/system_pkg/nros"),
+            metadata_files: vec![metadata],
+            manifest_files: vec![],
+            nros_toml_files: vec![],
+            launch_args: vec![],
+        })
+        .unwrap();
+        let raw = fs::read_to_string(output.plan_path).unwrap();
+        let plan: Value = serde_json::from_str(&raw).unwrap();
+        serde_json::from_value::<NrosPlan>(plan.clone()).unwrap();
+        assert_eq!(plan["instances"][0]["kind"], "node");
+        assert!(
+            plan["instances"][0].get("container_id").is_none(),
+            "container_id key must be omitted for plain <node>; got raw: {raw}"
+        );
     }
 
     /// Phase 211.E — `<executable>` declarations surface on `plan.executables`
