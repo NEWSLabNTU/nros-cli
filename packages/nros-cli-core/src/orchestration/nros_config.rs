@@ -268,6 +268,63 @@ impl NrosConfig {
             }
         }
 
+        // Phase 212.F.3 — Path A bringup discovery via dirwalk.
+        //
+        // Bringup pkgs ship `package.xml` + `system.toml` but no
+        // `Cargo.toml`; cargo's workspace `exclude` list keeps them out of
+        // `metadata.packages`, so the member-loop above never sees them.
+        // Walk the workspace root for sibling dirs that match the bringup
+        // shape and load each as a `BringupPackageEntry` keyed on the dir
+        // name.
+        if let Ok(entries) = std::fs::read_dir(workspace_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if bringup_packages.contains_key(name) {
+                    continue;
+                }
+                let system_toml_path = path.join("system.toml");
+                let cargo_toml_path = path.join("Cargo.toml");
+                let package_xml_path = path.join("package.xml");
+                if cargo_toml_path.exists() {
+                    continue; // Has Cargo.toml → not Path A.
+                }
+                if !system_toml_path.exists() || !package_xml_path.exists() {
+                    continue;
+                }
+                let raw =
+                    std::fs::read_to_string(&system_toml_path).map_err(|source| {
+                        NrosConfigError::BringupSystemTomlIo {
+                            package: name.to_string(),
+                            path: system_toml_path.clone(),
+                            source,
+                        }
+                    })?;
+                let system: SystemToml = toml::from_str(&raw).map_err(|source| {
+                    NrosConfigError::BringupSystemTomlParse {
+                        package: name.to_string(),
+                        path: system_toml_path.clone(),
+                        source,
+                    }
+                })?;
+                bringup_packages.insert(
+                    name.to_string(),
+                    BringupPackageEntry {
+                        name: name.to_string(),
+                        manifest_path: package_xml_path.clone(),
+                        system_toml_path,
+                        system,
+                        ament: Default::default(),
+                    },
+                );
+            }
+        }
+
         Ok(NrosConfig {
             workspace_root: workspace_root.to_path_buf(),
             workspace_metadata,
