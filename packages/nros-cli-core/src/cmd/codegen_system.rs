@@ -20,10 +20,11 @@
 //! Optional `--ahead-of-vendor <kind>` mode emits hookless-vendor artifacts:
 //!
 //! * `--ahead-of-vendor pio`  — `library.json` snippet next to the bake dir.
-//! * `--ahead-of-vendor px4`  — one `<component>_module/` skeleton dir per
-//!                              component matching PX4's `px4_add_module`
-//!                              template (skeleton only; integration logic
-//!                              deferred to Phase 212.H.7).
+//! * `--ahead-of-vendor px4`  — one `nros_<component>/` PX4-native module dir
+//!                              per component: `px4_add_module()` CMakeLists,
+//!                              `Kconfig` w/ `menuconfig MODULES_NROS_<NAME>`,
+//!                              and a `nros_<name>.cpp` stub entry point.
+//!                              See Phase 212.H.7 for the shape.
 
 use std::{
     collections::BTreeSet,
@@ -45,7 +46,8 @@ use crate::orchestration::{
 pub enum AheadOfVendor {
     /// Emit a PlatformIO `library.json` augment next to the bake dir.
     Pio,
-    /// Emit one `<component>_module/` skeleton per component (PX4 shape).
+    /// Emit one PX4-native `nros_<component>/` module dir per component
+    /// (CMakeLists.txt + Kconfig + cpp/h stub) — see Phase 212.H.7.
     Px4,
 }
 
@@ -117,10 +119,7 @@ enum ComponentLang {
 
 /// Resolve `--bringup` (name or path) → a `BringupPackageEntry`. Falls back
 /// to the workspace's `default_system` pointer when no explicit hint given.
-fn resolve_bringup<'a>(
-    cfg: &'a NrosConfig,
-    hint: Option<&str>,
-) -> Result<&'a BringupPackageEntry> {
+fn resolve_bringup<'a>(cfg: &'a NrosConfig, hint: Option<&str>) -> Result<&'a BringupPackageEntry> {
     let name = match hint {
         Some(h) => {
             // Treat as path first: if it points at an existing dir whose
@@ -243,8 +242,7 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create parent {}", parent.display()))?;
     }
-    let mut f = fs::File::create(path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let mut f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     f.write_all(contents.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
@@ -433,8 +431,7 @@ fn render_plan_json(
         launch_file: launch_file.as_deref(),
         components,
     };
-    let mut s =
-        serde_json::to_string_pretty(&doc).context("serialize plan json")?;
+    let mut s = serde_json::to_string_pretty(&doc).context("serialize plan json")?;
     s.push('\n');
     Ok(s)
 }
@@ -455,8 +452,7 @@ fn emit_ahead_of_vendor(
 }
 
 fn emit_pio(out_dir: &Path, bringup: &BringupPackageEntry) -> Result<()> {
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("create {}", out_dir.display()))?;
+    fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
     // Minimal `library.json` snippet pointing at the staticlib build tree.
     // Full PIO integration (extra_script.py, transport selection) is
     // deferred to Phase 212.H.6; this emits the manifest skeleton only.
@@ -472,30 +468,159 @@ fn emit_pio(out_dir: &Path, bringup: &BringupPackageEntry) -> Result<()> {
 }
 
 fn emit_px4(out_dir: &Path, bringup: &BringupPackageEntry) -> Result<()> {
-    // PX4 expects one module dir per `px4_add_module` call. Phase 212.E
-    // emits a skeleton (CMakeLists.txt + module.h with TODO markers); the
-    // full `px4_add_module` integration is deferred to Phase 212.H.7.
+    // PX4 expects one module dir per `px4_add_module` call (see Phase 212.H.7
+    // + `third-party/px4/PX4-Autopilot/src/modules/time_persistor/` for the
+    // reference shape). For each component we emit:
+    //
+    //   <out>/nros_<name>/CMakeLists.txt   -- px4_add_module(...) invocation
+    //   <out>/nros_<name>/Kconfig          -- menuconfig MODULES_NROS_<NAME>
+    //   <out>/nros_<name>/nros_<name>.cpp  -- stub entry point
+    //   <out>/nros_<name>/nros_<name>.h    -- stub header
+    //
+    // Modules emit disabled-by-default (Kconfig `default n`). Operators
+    // opt-in via a board overlay (`CONFIG_MODULES_NROS_<NAME>=y` in the
+    // `.px4board` file) — same gate as every other PX4 module.
+    fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+
     for c in &bringup.system.components {
-        let mod_dir = out_dir.join(format!("{}_module", c_ident(&c.name)));
-        fs::create_dir_all(&mod_dir)
-            .with_context(|| format!("create {}", mod_dir.display()))?;
-        let cmakelists = format!(
-            "# Auto-generated skeleton for PX4 component `{}`.\n\
-             # TODO(212.H.7): fill in `px4_add_module(...)` invocation.\n\
-             # Component class: {}\n\
-             # Source pkg:      {}\n",
-            c.name, c.class, c.pkg
-        );
-        write_if_changed(&mod_dir.join("CMakeLists.txt"), &cmakelists)?;
-        let module_h = format!(
-            "/* Auto-generated skeleton for PX4 component `{}`.\n\
-             * TODO(212.H.7): bridge to uORB + register with nano-ros runtime.\n\
-             */\n",
-            c.name
-        );
-        write_if_changed(&mod_dir.join("module.h"), &module_h)?;
+        let name = c_ident(&c.name);
+        let mod_name = format!("nros_{name}");
+        let mod_dir = out_dir.join(&mod_name);
+        fs::create_dir_all(&mod_dir).with_context(|| format!("create {}", mod_dir.display()))?;
+
+        write_if_changed(
+            &mod_dir.join("CMakeLists.txt"),
+            &render_px4_cmakelists(&mod_name, &name, &c.class, &c.pkg),
+        )?;
+        write_if_changed(
+            &mod_dir.join("Kconfig"),
+            &render_px4_kconfig(&mod_name, &name, &bringup.name),
+        )?;
+        write_if_changed(
+            &mod_dir.join(format!("{mod_name}.cpp")),
+            &render_px4_module_cpp(&mod_name, &name, &c.class, &c.pkg),
+        )?;
+        write_if_changed(
+            &mod_dir.join(format!("{mod_name}.h")),
+            &render_px4_module_h(&mod_name, &name),
+        )?;
     }
+
+    // Mirror the other emit paths: drop a flat plan json next to the module
+    // dirs so downstream tooling (PX4 board overlay generators, the H.7
+    // gate) can read the resolved plan w/o re-parsing system.toml.
+    let kinds = classify_components(
+        // re-classify w/o a full NrosConfig — we only need the rust-ness for
+        // the plan, and the px4 emit only fires after emit_bake_tree() which
+        // already ran the real classify. For the side-car plan json we mark
+        // everything as `other` since PX4 components are C++-only.
+        &NrosConfig::default(),
+        &bringup.system.components,
+    );
+    write_if_changed(
+        &out_dir.join("nros-plan.json"),
+        &render_plan_json(bringup, &kinds, Some("px4"))?,
+    )?;
+
     Ok(())
+}
+
+fn render_px4_cmakelists(mod_name: &str, name: &str, class: &str, pkg: &str) -> String {
+    // Mirrors `src/modules/time_persistor/CMakeLists.txt`. `MODULE` must
+    // match PX4's `modules__<dir>` convention; `MAIN` is the entry symbol
+    // PX4 wires up via `px4_add_module`. The DEPENDS px4_work_queue is the
+    // minimum any module needs to coexist on the nuttx/sitl work queue.
+    format!(
+        "############################################################################\n\
+         # Auto-generated by `nros codegen-system --ahead-of-vendor px4`.\n\
+         #\n\
+         # Component: {name}\n\
+         # Class:     {class}\n\
+         # Source:    {pkg}\n\
+         ############################################################################\n\
+         \n\
+         px4_add_module(\n\
+         \tMODULE modules__{mod_name}\n\
+         \tMAIN {mod_name}\n\
+         \tCOMPILE_FLAGS\n\
+         \tSRCS\n\
+         \t\t{mod_name}.cpp\n\
+         \t\t{mod_name}.h\n\
+         \tDEPENDS\n\
+         \t\tpx4_work_queue\n\
+         \t)\n"
+    )
+}
+
+fn render_px4_kconfig(mod_name: &str, name: &str, bringup: &str) -> String {
+    // PX4 module Kconfigs follow `menuconfig MODULES_<UPPER_NAME>` (see
+    // `src/modules/time_persistor/Kconfig`). `default n` keeps the module
+    // off in stock SITL configs until an operator opts in via a board
+    // overlay (`CONFIG_MODULES_NROS_<NAME>=y`).
+    let upper = mod_name.to_ascii_uppercase();
+    format!(
+        "menuconfig MODULES_{upper}\n\
+         \tbool \"{name} (nano-ros component)\"\n\
+         \tdefault n\n\
+         \t---help---\n\
+         \t\tnano-ros component `{name}`, generated from bringup `{bringup}`.\n\
+         \t\tEnable to link this nano-ros component into the PX4 firmware.\n"
+    )
+}
+
+fn render_px4_module_cpp(mod_name: &str, name: &str, class: &str, pkg: &str) -> String {
+    // Minimal PX4 entry point. `<mod_name>_main(argc, argv)` matches what
+    // `px4_add_module(MAIN ...)` expects; PX4_INFO is the px4-native log
+    // sink. Wiring this to the nano-ros runtime is a follow-up — the H.7
+    // acceptance only requires that PX4 can discover + parse the module.
+    format!(
+        "/*\n\
+         * Auto-generated by `nros codegen-system --ahead-of-vendor px4`.\n\
+         *\n\
+         * Component: {name}\n\
+         * Class:     {class}\n\
+         * Source:    {pkg}\n\
+         */\n\
+         \n\
+         #include \"{mod_name}.h\"\n\
+         #include <px4_platform_common/log.h>\n\
+         #include <px4_platform_common/module.h>\n\
+         \n\
+         extern \"C\" __EXPORT int {mod_name}_main(int argc, char *argv[]);\n\
+         \n\
+         int {mod_name}_main(int argc, char *argv[])\n\
+         {{\n\
+         \t(void)argc;\n\
+         \t(void)argv;\n\
+         \tPX4_INFO(\"nros component {name} started\");\n\
+         \treturn 0;\n\
+         }}\n"
+    )
+}
+
+fn render_px4_module_h(mod_name: &str, name: &str) -> String {
+    let guard = mod_name.to_ascii_uppercase();
+    format!(
+        "/*\n\
+         * Auto-generated by `nros codegen-system --ahead-of-vendor px4`.\n\
+         *\n\
+         * Component: {name}\n\
+         */\n\
+         #ifndef {guard}_H\n\
+         #define {guard}_H\n\
+         \n\
+         #ifdef __cplusplus\n\
+         extern \"C\" {{\n\
+         #endif\n\
+         \n\
+         int {mod_name}_main(int argc, char *argv[]);\n\
+         \n\
+         #ifdef __cplusplus\n\
+         }}\n\
+         #endif\n\
+         \n\
+         #endif /* {guard}_H */\n"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -730,9 +855,18 @@ name = "talker"
 
         let bake = out.join("nros-system");
         let header = fs::read_to_string(bake.join("system_config.h")).unwrap();
-        assert!(header.contains("#define NROS_SYSTEM_DOMAIN_ID 7u"), "header: {header}");
-        assert!(header.contains("#define NROS_SYSTEM_RMW \"zenoh\""), "header: {header}");
-        assert!(header.contains("#define NROS_SYSTEM_RMW_ZENOH"), "header: {header}");
+        assert!(
+            header.contains("#define NROS_SYSTEM_DOMAIN_ID 7u"),
+            "header: {header}"
+        );
+        assert!(
+            header.contains("#define NROS_SYSTEM_RMW \"zenoh\""),
+            "header: {header}"
+        );
+        assert!(
+            header.contains("#define NROS_SYSTEM_RMW_ZENOH"),
+            "header: {header}"
+        );
         assert!(header.contains("#define NROS_SYSTEM_LOCATOR \"tcp/127.0.0.1:7447\""));
         assert!(header.contains("#define NROS_SYSTEM_COMPONENT_COUNT 2"));
         assert!(header.contains("#define NROS_SYSTEM_COMPONENT_0_NAME \"talker\""));
@@ -776,10 +910,15 @@ name = "talker"
         run(args()).expect("first run");
 
         let bake = out.join("nros-system");
-        let snap: Vec<(String, Vec<u8>)> = ["system_config.h", "system_main.c", "Cargo.toml", "nros-plan.json"]
-            .iter()
-            .map(|f| (f.to_string(), fs::read(bake.join(f)).expect("read")))
-            .collect();
+        let snap: Vec<(String, Vec<u8>)> = [
+            "system_config.h",
+            "system_main.c",
+            "Cargo.toml",
+            "nros-plan.json",
+        ]
+        .iter()
+        .map(|f| (f.to_string(), fs::read(bake.join(f)).expect("read")))
+        .collect();
 
         run(args()).expect("second run");
 
@@ -809,11 +948,97 @@ name = "talker"
         let bake = out.join("nros-system");
         assert!(bake.join("system_config.h").exists());
         assert!(bake.join("system_main.c").exists());
-        assert!(!bake.join("Cargo.toml").exists(), "no Rust components → no Cargo stub");
+        assert!(
+            !bake.join("Cargo.toml").exists(),
+            "no Rust components → no Cargo stub"
+        );
         assert!(bake.join("nros-plan.json").exists());
 
         let plan = fs::read_to_string(bake.join("nros-plan.json")).unwrap();
-        assert!(plan.contains("\"lang\": \"other\""), "non-Rust comp tagged: {plan}");
+        assert!(
+            plan.contains("\"lang\": \"other\""),
+            "non-Rust comp tagged: {plan}"
+        );
+    }
+
+    /// 212.H.7 — `--ahead-of-vendor px4` emits PX4-native `nros_<name>/`
+    /// module dirs (CMakeLists.txt + Kconfig + cpp + h) per component, plus
+    /// a flat `nros-plan.json` next to them.
+    #[test]
+    fn codegen_system_ahead_of_vendor_emits_px4_module_dirs() {
+        let dir = scratch_dir("ahead_of_vendor_px4_module_dirs");
+        write_rust_two_component_workspace(&dir);
+
+        let out = dir.join("build/demo_bringup");
+        run(Args {
+            workspace: Some(dir.clone()),
+            bringup: None,
+            target: Some("px4".into()),
+            out: Some(out.clone()),
+            ahead_of_vendor: Some(AheadOfVendor::Px4),
+        })
+        .expect("codegen runs");
+
+        for name in ["talker", "listener"] {
+            let mod_dir = out.join(format!("nros_{name}"));
+            assert!(mod_dir.is_dir(), "missing {}", mod_dir.display());
+
+            let cmake = fs::read_to_string(mod_dir.join("CMakeLists.txt")).unwrap();
+            assert!(
+                cmake.contains("px4_add_module("),
+                "no px4_add_module: {cmake}"
+            );
+            assert!(
+                cmake.contains(&format!("MODULE modules__nros_{name}")),
+                "missing MODULE marker: {cmake}"
+            );
+            assert!(
+                cmake.contains(&format!("MAIN nros_{name}")),
+                "missing MAIN marker: {cmake}"
+            );
+            assert!(
+                cmake.contains(name),
+                "missing component name reference: {cmake}"
+            );
+
+            let kconfig = fs::read_to_string(mod_dir.join("Kconfig")).unwrap();
+            assert!(
+                kconfig.contains(&format!(
+                    "menuconfig MODULES_NROS_{}",
+                    name.to_ascii_uppercase()
+                )),
+                "missing menuconfig: {kconfig}"
+            );
+            assert!(
+                kconfig.contains("default n"),
+                "expected default-off: {kconfig}"
+            );
+
+            let cpp = fs::read_to_string(mod_dir.join(format!("nros_{name}.cpp"))).unwrap();
+            assert!(
+                cpp.contains(&format!("int nros_{name}_main(int argc, char *argv[])")),
+                "missing main entry: {cpp}"
+            );
+            assert!(cpp.contains("PX4_INFO("), "missing PX4_INFO: {cpp}");
+            assert!(
+                cpp.contains("px4_platform_common/module.h"),
+                "missing module.h include: {cpp}"
+            );
+
+            let h = fs::read_to_string(mod_dir.join(format!("nros_{name}.h"))).unwrap();
+            assert!(
+                h.contains(&format!("int nros_{name}_main(int argc, char *argv[]);")),
+                "missing main decl: {h}"
+            );
+        }
+
+        let plan = fs::read_to_string(out.join("nros-plan.json")).unwrap();
+        assert!(plan.contains("\"target\": \"px4\""), "plan: {plan}");
+        assert!(plan.contains("\"name\": \"talker\""), "plan: {plan}");
+        assert!(plan.contains("\"name\": \"listener\""), "plan: {plan}");
+
+        // Standard bake still produced.
+        assert!(out.join("nros-system/system_config.h").exists());
     }
 
     /// 212.E.T4 — `--ahead-of-vendor pio` mode emits `library.json` alongside
