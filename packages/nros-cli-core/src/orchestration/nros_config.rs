@@ -25,7 +25,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::cargo_metadata_schema::{
-    PackageMetadataAment, PackageMetadataNros, SystemToml, WorkspaceMetadataNros,
+    DeployTarget, DeployTargetMetadata, PackageMetadataAment, PackageMetadataNros,
+    SystemComponentEntry, SystemHeader, SystemToml, WorkspaceMetadataNros,
 };
 
 /// Errors surfaced by the Phase 212.B loader. Distinct from the catch-all
@@ -124,18 +125,37 @@ pub struct ComponentPackageEntry {
     pub ament: PackageMetadataAment,
 }
 
+/// Phase 212.L.7 — provenance of a [`BringupPackageEntry`]. Helps `nros
+/// plan` / `nros codegen-system` distinguish a real `system.toml`-backed
+/// bringup from a synthesised one (self-bringup component / application
+/// pkg) — the latter has no on-disk `system.toml` and the resolver tracks
+/// it via the host package's manifest instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BringupSource {
+    /// Real bringup pkg with an on-disk `system.toml` (Path A or Path B).
+    SystemToml,
+    /// Synthesised from a self-bringup component / application pkg's
+    /// `[package.metadata.nros]` + `[package.metadata.nros.deploy.*]`
+    /// (Phase 212.L.7).
+    SelfBringup,
+}
+
 /// A workspace member declared as the bringup pkg for a system. Carries a
-/// loaded `system.toml`.
+/// loaded `system.toml` (or a synthesised one for self-bringup pkgs).
 #[derive(Clone, Debug)]
 pub struct BringupPackageEntry {
     pub name: String,
     pub manifest_path: PathBuf,
-    /// `<bringup>/system.toml`.
+    /// `<bringup>/system.toml`. For self-bringup pkgs this points at the
+    /// host pkg's `Cargo.toml` (no on-disk system.toml exists); callers
+    /// keying on file presence should consult `source` instead.
     pub system_toml_path: PathBuf,
     pub system: SystemToml,
     /// Bringup pkgs may still declare `[package.metadata.ament]` for
     /// `package.xml` regeneration (Phase 212.G).
     pub ament: PackageMetadataAment,
+    /// Phase 212.L.7 — provenance (`SystemToml` vs `SelfBringup`).
+    pub source: BringupSource,
 }
 
 impl NrosConfig {
@@ -176,10 +196,12 @@ impl NrosConfig {
             })?;
 
         // 3 — workspace-level metadata.
-        let workspace_metadata = parse_workspace_metadata(&metadata.workspace_metadata)
-            .map_err(|message| NrosConfigError::InvalidWorkspaceMetadata {
-                manifest: manifest_path.clone(),
-                message,
+        let workspace_metadata =
+            parse_workspace_metadata(&metadata.workspace_metadata).map_err(|message| {
+                NrosConfigError::InvalidWorkspaceMetadata {
+                    manifest: manifest_path.clone(),
+                    message,
+                }
             })?;
 
         // 4 — per-member metadata + 5 bringup discovery.
@@ -215,13 +237,12 @@ impl NrosConfig {
             match nros_opt {
                 Some(nros) => {
                     // Validate single-vs-multi shape exclusion.
-                    nros.validate().map_err(|message| {
-                        NrosConfigError::InvalidPackageMetadata {
+                    nros.validate()
+                        .map_err(|message| NrosConfigError::InvalidPackageMetadata {
                             package: package.name.clone(),
                             manifest: pkg_manifest.clone(),
                             message,
-                        }
-                    })?;
+                        })?;
                     component_packages.insert(
                         package.name.clone(),
                         ComponentPackageEntry {
@@ -259,6 +280,7 @@ impl NrosConfig {
                                 system_toml_path,
                                 system,
                                 ament,
+                                source: BringupSource::SystemToml,
                             },
                         );
                     }
@@ -297,14 +319,13 @@ impl NrosConfig {
                 if !system_toml_path.exists() || !package_xml_path.exists() {
                     continue;
                 }
-                let raw =
-                    std::fs::read_to_string(&system_toml_path).map_err(|source| {
-                        NrosConfigError::BringupSystemTomlIo {
-                            package: name.to_string(),
-                            path: system_toml_path.clone(),
-                            source,
-                        }
-                    })?;
+                let raw = std::fs::read_to_string(&system_toml_path).map_err(|source| {
+                    NrosConfigError::BringupSystemTomlIo {
+                        package: name.to_string(),
+                        path: system_toml_path.clone(),
+                        source,
+                    }
+                })?;
                 let system: SystemToml = toml::from_str(&raw).map_err(|source| {
                     NrosConfigError::BringupSystemTomlParse {
                         package: name.to_string(),
@@ -320,9 +341,40 @@ impl NrosConfig {
                         system_toml_path,
                         system,
                         ament: Default::default(),
+                        source: BringupSource::SystemToml,
                     },
                 );
             }
+        }
+
+        // Phase 212.L.7 — self-bringup synthesis.
+        //
+        // A component / application pkg whose `[package.metadata.nros]`
+        // carries `[deploy.<target>]` AND that is not already named as
+        // `pkg = "<name>"` by any sibling bringup pkg becomes its own
+        // degenerate 1-component bringup. We synthesise a SystemToml
+        // from the component metadata + the first deploy block so the
+        // planner / codegen path can consume it uniformly.
+        let referenced_by_bringup: std::collections::HashSet<String> = bringup_packages
+            .values()
+            .flat_map(|b| b.system.components.iter().map(|c| c.pkg.clone()))
+            .collect();
+        let mut synthesised: Vec<(String, BringupPackageEntry)> = Vec::new();
+        for comp in component_packages.values() {
+            if !comp.nros.is_self_bringup_eligible() {
+                continue;
+            }
+            if referenced_by_bringup.contains(&comp.name) {
+                continue; // A real bringup already wires this pkg in.
+            }
+            if bringup_packages.contains_key(&comp.name) {
+                continue; // A bringup pkg already exists under this name.
+            }
+            let synth = synthesise_self_bringup(comp);
+            synthesised.push((comp.name.clone(), synth));
+        }
+        for (k, v) in synthesised {
+            bringup_packages.insert(k, v);
         }
 
         Ok(NrosConfig {
@@ -369,6 +421,112 @@ fn parse_ament_metadata(value: &serde_json::Value) -> Result<PackageMetadataAmen
 }
 
 // ---------------------------------------------------------------------------
+// Phase 212.L.7 — self-bringup synthesis
+// ---------------------------------------------------------------------------
+
+/// Synthesise a [`BringupPackageEntry`] for a self-bringup component /
+/// application pkg. The first declared `[deploy.<target>]` block supplies
+/// the `[system]` header (rmw / domain_id / locator); every declared deploy
+/// block flows into `system.deploy.<target>`; the component(s) flow into
+/// `system.components` (single `[component]` → one entry using `class` +
+/// `name` fallback; multi `[components.<N>]` → one per entry; application
+/// pkgs synthesise an empty component list — the orchestration root is the
+/// pkg itself).
+fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry {
+    let nros = &comp.nros;
+
+    // Pick the first deploy target deterministically (BTreeMap iteration
+    // order is key-sorted). The `[system]` header's rmw / domain_id /
+    // locator come from this block, defaulting when the deploy table
+    // omits them.
+    let (first_target_name, first_deploy) = nros
+        .deploy
+        .iter()
+        .next()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .unwrap_or_else(|| ("native".to_string(), DeployTargetMetadata::default()));
+    let _ = first_target_name; // recorded via the deploy map below.
+
+    let system_header = SystemHeader {
+        name: comp.name.clone(),
+        rmw: first_deploy
+            .rmw
+            .clone()
+            .unwrap_or_else(|| "zenoh".to_string()),
+        domain_id: first_deploy.domain_id.unwrap_or(0),
+        locator: first_deploy.locator.clone(),
+    };
+
+    // Component rows.
+    let mut components: Vec<SystemComponentEntry> = Vec::new();
+    if let Some(single) = nros.component.as_ref() {
+        let class = single
+            .class
+            .clone()
+            .unwrap_or_else(|| format!("{}::Node", comp.name));
+        let inst_name = single.name.clone().unwrap_or_else(|| comp.name.clone());
+        components.push(SystemComponentEntry {
+            pkg: comp.name.clone(),
+            class,
+            name: inst_name,
+        });
+    } else {
+        for (key, meta) in &nros.components {
+            let class = meta
+                .class
+                .clone()
+                .unwrap_or_else(|| format!("{}::{}", comp.name, key));
+            let inst_name = meta.name.clone().unwrap_or_else(|| key.clone());
+            components.push(SystemComponentEntry {
+                pkg: comp.name.clone(),
+                class,
+                name: inst_name,
+            });
+        }
+    }
+    // Application pkgs: no components on this pkg directly; bringup body
+    // stays empty. (Future: discover sibling component pkgs the
+    // application allow-lists.)
+
+    // Deploy block — every `[package.metadata.nros.deploy.<target>]`
+    // becomes a `[deploy.<target>]` row. The bringup `DeployTarget`
+    // schema is shaped around `kind` / `target` / optional `launch` /
+    // `board`. Map: `target` ⇒ the target-name key; `kind` ⇒ `"self"`
+    // (this is a self-bringup, definitionally); `board` ⇒ verbatim.
+    let mut deploy: BTreeMap<String, DeployTarget> = BTreeMap::new();
+    for (target_name, dt) in &nros.deploy {
+        deploy.insert(
+            target_name.clone(),
+            DeployTarget {
+                kind: "self".to_string(),
+                target: target_name.clone(),
+                launch: None,
+                board: dt.board.clone(),
+            },
+        );
+    }
+
+    let system = SystemToml {
+        system: system_header,
+        components,
+        deploy,
+        domains: Vec::new(),
+        bridges: Vec::new(),
+    };
+
+    BringupPackageEntry {
+        name: comp.name.clone(),
+        manifest_path: comp.manifest_path.clone(),
+        // No on-disk system.toml; point at the Cargo manifest as a
+        // stand-in so callers needing a real path don't crash.
+        system_toml_path: comp.manifest_path.clone(),
+        system,
+        ament: comp.ament.clone(),
+        source: BringupSource::SelfBringup,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -382,9 +540,7 @@ mod tests {
     fn scratch_dir(test: &str) -> PathBuf {
         let base = std::env::var_os("CARGO_TARGET_TMPDIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join("nros-cli-core-tests")
-            });
+            .unwrap_or_else(|| std::env::temp_dir().join("nros-cli-core-tests"));
         let dir = base.join(format!("nros_config_{test}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
@@ -542,8 +698,7 @@ target = "x86_64-unknown-linux-gnu"
         // Drop a pre-212 `nros.toml` next to the workspace root.
         fs::write(dir.join("nros.toml"), "[workspace]\n").unwrap();
 
-        let err = NrosConfig::from_cargo_metadata(&dir)
-            .expect_err("must reject root nros.toml");
+        let err = NrosConfig::from_cargo_metadata(&dir).expect_err("must reject root nros.toml");
         match &err {
             NrosConfigError::NrosTomlNotSupported { path } => {
                 assert_eq!(path, &dir.join("nros.toml"));
@@ -580,7 +735,10 @@ target = "x86_64-unknown-linux-gnu"
             .as_ref()
             .expect("single-shape component table present");
         assert_eq!(component.default_namespace.as_deref(), Some("/demo"));
-        assert_eq!(component.parameters.get("rate_hz").map(|v| v.as_integer()), Some(Some(10)));
+        assert_eq!(
+            component.parameters.get("rate_hz").map(|v| v.as_integer()),
+            Some(Some(10))
+        );
         assert_eq!(component.remaps.len(), 1);
         assert_eq!(component.remaps[0].from, "chatter");
         assert!(talker.nros.components.is_empty());
@@ -605,8 +763,225 @@ target = "x86_64-unknown-linux-gnu"
             .expect("listener present");
         assert!(listener.nros.component.is_none());
         // BTreeMap-sorted keys.
-        let names: Vec<&str> = listener.nros.components.keys().map(String::as_str).collect();
+        let names: Vec<&str> = listener
+            .nros
+            .components
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(names, ["Echo", "Listener"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 212.L.7 — self-bringup synthesis
+    // -----------------------------------------------------------------
+
+    /// Stage a workspace with a single component pkg that carries
+    /// `[deploy.<target>]` AND NO sibling bringup naming it. The loader
+    /// must synthesise a `BringupPackageEntry` for the pkg.
+    fn write_self_bringup_component_workspace(dir: &Path) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["alpha_pkg"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("alpha_pkg/src")).unwrap();
+        fs::write(
+            dir.join("alpha_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "alpha_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.component]
+class = "alpha_pkg::Node"
+name = "alpha"
+default_namespace = "/demo"
+
+[package.metadata.nros.deploy.native]
+board = "native_sim/native/64"
+rmw = "zenoh"
+domain_id = 7
+locator = "tcp/127.0.0.1:7447"
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("alpha_pkg/src/lib.rs"), "").unwrap();
+    }
+
+    #[test]
+    fn discovers_self_bringup_component_pkg() {
+        let dir = scratch_dir("discovers_self_bringup_component_pkg");
+        write_self_bringup_component_workspace(&dir);
+
+        let cfg = NrosConfig::from_cargo_metadata(&dir).expect("loads");
+        let entry = cfg
+            .bringup_packages
+            .get("alpha_pkg")
+            .expect("self-bringup entry synthesised");
+        assert_eq!(entry.source, BringupSource::SelfBringup);
+        assert_eq!(entry.system.system.name, "alpha_pkg");
+        assert_eq!(entry.system.system.rmw, "zenoh");
+        assert_eq!(entry.system.system.domain_id, 7);
+        assert_eq!(
+            entry.system.system.locator.as_deref(),
+            Some("tcp/127.0.0.1:7447")
+        );
+        assert_eq!(entry.system.components.len(), 1);
+        let c = &entry.system.components[0];
+        assert_eq!(c.pkg, "alpha_pkg");
+        assert_eq!(c.class, "alpha_pkg::Node");
+        assert_eq!(c.name, "alpha");
+        let native = entry
+            .system
+            .deploy
+            .get("native")
+            .expect("native deploy block synthesised");
+        assert_eq!(native.kind, "self");
+        assert_eq!(native.board.as_deref(), Some("native_sim/native/64"));
+    }
+
+    #[test]
+    fn discovers_self_bringup_application_pkg() {
+        let dir = scratch_dir("discovers_self_bringup_application_pkg");
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["demo_app"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("demo_app/src")).unwrap();
+        fs::write(
+            dir.join("demo_app/Cargo.toml"),
+            r#"
+[package]
+name = "demo_app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.application]
+name = "demo_app"
+deploy = ["native"]
+
+[package.metadata.nros.deploy.native]
+board = "native_sim/native/64"
+rmw = "zenoh"
+domain_id = 0
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("demo_app/src/lib.rs"), "").unwrap();
+
+        let cfg = NrosConfig::from_cargo_metadata(&dir).expect("loads");
+        let entry = cfg
+            .bringup_packages
+            .get("demo_app")
+            .expect("self-bringup application entry");
+        assert_eq!(entry.source, BringupSource::SelfBringup);
+        assert_eq!(entry.system.system.name, "demo_app");
+        // Application self-bringup has no in-pkg components.
+        assert!(entry.system.components.is_empty());
+        assert!(entry.system.deploy.contains_key("native"));
+    }
+
+    /// When a real bringup pkg already names a component pkg via
+    /// `pkg = "<name>"`, the component's deploy table does NOT cause a
+    /// synthesised bringup (no double-counting).
+    #[test]
+    fn self_bringup_skipped_when_named_by_real_bringup() {
+        let dir = scratch_dir("self_bringup_skipped_when_named_by_real_bringup");
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["alpha_pkg", "demo_bringup"]
+
+[workspace.metadata.nros]
+default_system = "demo_bringup"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("alpha_pkg/src")).unwrap();
+        fs::write(
+            dir.join("alpha_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "alpha_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.component]
+class = "alpha_pkg::Node"
+name = "alpha"
+
+[package.metadata.nros.deploy.native]
+rmw = "zenoh"
+domain_id = 0
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("alpha_pkg/src/lib.rs"), "").unwrap();
+
+        fs::create_dir_all(dir.join("demo_bringup/src")).unwrap();
+        fs::write(
+            dir.join("demo_bringup/Cargo.toml"),
+            r#"
+[package]
+name = "demo_bringup"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("demo_bringup/src/lib.rs"), "").unwrap();
+        fs::write(
+            dir.join("demo_bringup/system.toml"),
+            r#"
+[system]
+name = "demo"
+rmw = "zenoh"
+domain_id = 0
+
+[[component]]
+pkg = "alpha_pkg"
+class = "alpha_pkg::Node"
+name = "alpha"
+"#,
+        )
+        .unwrap();
+
+        let cfg = NrosConfig::from_cargo_metadata(&dir).expect("loads");
+        // Only `demo_bringup` is a bringup; alpha_pkg is NOT auto-synthesised.
+        assert!(cfg.bringup_packages.contains_key("demo_bringup"));
+        assert!(
+            !cfg.bringup_packages.contains_key("alpha_pkg"),
+            "alpha_pkg should not be self-bringup'd when demo_bringup names it"
+        );
+        assert_eq!(
+            cfg.bringup_packages.get("demo_bringup").unwrap().source,
+            BringupSource::SystemToml
+        );
     }
 
     /// 212.B.2 — bringup pkg's `system.toml` is loaded into the entry.
@@ -639,7 +1014,10 @@ target = "x86_64-unknown-linux-gnu"
         assert_eq!(native.kind, "self");
 
         // The bringup pkg's ament block is preserved.
-        assert_eq!(bringup.ament.exec_depend, vec!["talker_pkg", "listener_pkg"]);
+        assert_eq!(
+            bringup.ament.exec_depend,
+            vec!["talker_pkg", "listener_pkg"]
+        );
         // And the system.toml path is recorded (callers regenerating
         // package.xml from system.toml need it).
         assert_eq!(

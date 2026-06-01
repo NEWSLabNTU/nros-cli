@@ -47,19 +47,27 @@ pub struct WorkspaceMetadataNros {
 // Per-package metadata: `[package.metadata.nros]`
 // ---------------------------------------------------------------------------
 
-/// `[package.metadata.nros]` in a component package's `Cargo.toml`.
+/// `[package.metadata.nros]` in a component / application package's
+/// `Cargo.toml`.
 ///
-/// Two shapes (mutually exclusive):
+/// Three top-level shapes (mutually exclusive):
 ///
 /// * Single-component crate — `[package.metadata.nros.component]` describes
 ///   the one component the crate exposes.
 /// * Multi-component crate — `[package.metadata.nros.components.<Name>]`
 ///   table-of-tables enumerates each.
+/// * Application crate — `[package.metadata.nros.application]` describes a
+///   native-only application pkg (per Phase 212.L.2).
 ///
-/// At most one of `component` / `components` may be present; the loader
-/// validates this after deserialization (a serde untagged enum would lose
-/// the precise `deny_unknown_fields` error, so we keep both fields and
-/// reject the conflict in [`PackageMetadataNros::validate`]).
+/// Phase 212.L.7 also adds an optional per-target deploy table at
+/// `[package.metadata.nros.deploy.<target>]`, used both by application pkgs
+/// and by self-bringup component pkgs (component pkg w/ `[deploy.*]` and no
+/// sibling bringup acts as its own bringup).
+///
+/// At most one of `component` / `components` / `application` may be present;
+/// the loader validates this after deserialization (a serde untagged enum
+/// would lose the precise `deny_unknown_fields` error, so we keep the fields
+/// flat and reject conflicts in [`PackageMetadataNros::validate`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageMetadataNros {
@@ -67,20 +75,53 @@ pub struct PackageMetadataNros {
     pub component: Option<ComponentMetadata>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, ComponentMetadata>,
+    /// Phase 212.L.2 — `[package.metadata.nros.application]`. Application
+    /// pkgs are native-only orchestration roots; they MUST NOT name an RTOS
+    /// in their `deploy = […]` allow-list. (The `nros check` lint enforces
+    /// the no-RTOS rule; the schema only accepts the field.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<ApplicationMetadata>,
+    /// Phase 212.L.7 / L.8 — per-target deploy tables, keyed by target name
+    /// (`native`, `qemu-mps2-an385`, …). Populates both application pkgs and
+    /// self-bringup component pkgs (component pkg w/ `[deploy.*]` and no
+    /// sibling bringup eats its own bringup role).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deploy: BTreeMap<String, DeployTargetMetadata>,
 }
 
 impl PackageMetadataNros {
-    /// Reject manifests that set both `component` and `components` — the two
-    /// shapes are mutually exclusive per the Phase 212 design doc.
+    /// Reject manifests that combine more than one of `component` /
+    /// `components` / `application` — the three shapes are mutually
+    /// exclusive per the Phase 212.L design doc. A pkg is either a
+    /// component (single or multi) OR an application; bringup pkgs at the
+    /// Path A shape have neither (no Cargo.toml at all).
     pub fn validate(&self) -> Result<(), String> {
-        if self.component.is_some() && !self.components.is_empty() {
-            return Err(
-                "`[package.metadata.nros]` carries both `component` and \
-                 `components` — use one or the other, not both"
-                    .to_string(),
-            );
+        let has_component = self.component.is_some();
+        let has_components = !self.components.is_empty();
+        let has_application = self.application.is_some();
+        let count = [has_component, has_components, has_application]
+            .into_iter()
+            .filter(|b| *b)
+            .count();
+        if count > 1 {
+            return Err("`[package.metadata.nros]` carries more than one of \
+                 `component` / `components` / `application` — pick exactly \
+                 one shape (Phase 212.L.2 / L.7)"
+                .to_string());
         }
         Ok(())
+    }
+
+    /// True when this manifest is a *self-bringup-eligible* component or
+    /// application pkg (Phase 212.L.7): it declares its component/application
+    /// surface AND at least one `[package.metadata.nros.deploy.<target>]`
+    /// table. The planner / codegen path treats such a pkg as its own
+    /// degenerate 1-component bringup when no sibling bringup pkg points at
+    /// it.
+    pub fn is_self_bringup_eligible(&self) -> bool {
+        let has_role =
+            self.component.is_some() || !self.components.is_empty() || self.application.is_some();
+        has_role && !self.deploy.is_empty()
     }
 }
 
@@ -88,9 +129,19 @@ impl PackageMetadataNros {
 /// `[package.metadata.nros.components.<Name>]` (multi shape).
 ///
 /// Pure deployment intent — no build-system knobs (Cargo + CMake own those).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentMetadata {
+    /// Phase 212.L.4 — fully-qualified class name (`<pkg-dir>::<UserClass>`).
+    /// Lint-enforced by `nros check` to match the host pkg name; codegen
+    /// uses it to land at the right Rust type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// Short component instance name (used as the planner / codegen
+    /// instance identifier when the pkg is its own self-bringup, per
+    /// Phase 212.L.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Default namespace the component is mounted at. Absent → `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_namespace: Option<String>,
@@ -106,14 +157,50 @@ pub struct ComponentMetadata {
     pub remaps: Vec<RemapRule>,
 }
 
-impl Default for ComponentMetadata {
-    fn default() -> Self {
-        Self {
-            default_namespace: None,
-            parameters: BTreeMap::new(),
-            remaps: Vec::new(),
-        }
-    }
+/// `[package.metadata.nros.application]` — Phase 212.L.2.
+///
+/// Application pkgs are native-only orchestration roots: they wire several
+/// component pkgs together but MUST NOT name an RTOS target in their
+/// `deploy = […]` allow-list. The allow-list semantics are enforced by
+/// `nros check`; the schema only accepts the field.
+///
+/// The application's per-target deploy block lives on the outer
+/// `[package.metadata.nros.deploy.<target>]` (shared with self-bringup
+/// component pkgs), not nested under `[application]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationMetadata {
+    /// Allow-list of deploy targets — keys into the outer
+    /// `[package.metadata.nros.deploy.<target>]` map. Must not include an
+    /// RTOS target name (lint-enforced by `nros check`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deploy: Vec<String>,
+    /// Optional short app name; falls back to the Cargo `[package].name`
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// `[package.metadata.nros.deploy.<target>]` — Phase 212.L.8.
+///
+/// Per-target deploy parameters baked into the bringup tree by `nros
+/// codegen-system` (and recorded into `nros-plan.json` by `nros plan`).
+/// Used by application pkgs and by self-bringup component pkgs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployTargetMetadata {
+    /// Board identifier (e.g. `native_sim/native/64`, `mps2-an385`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+    /// RMW backend (`zenoh` / `xrce` / `cyclonedds`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rmw: Option<String>,
+    /// Baked ROS_DOMAIN_ID — embedded targets bake at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<u32>,
+    /// Optional RMW locator URI (e.g. `tcp/127.0.0.1:7447`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
 }
 
 /// Convenience alias: spec calls these `RemapEntry`. The existing
@@ -341,7 +428,10 @@ default_namespace = "/b"
 "#;
         let v: PackageMetadataNros = toml::from_str(raw).expect("parse");
         let err = v.validate().expect_err("conflicting shapes must error");
-        assert!(err.contains("component"), "diagnostic mentions field: {err}");
+        assert!(
+            err.contains("component"),
+            "diagnostic mentions field: {err}"
+        );
     }
 
     /// `deny_unknown_fields` rejects typos on the component table.
@@ -352,8 +442,8 @@ default_namespace = "/b"
 default_namespace = "/demo"
 unknown_typo = true
 "#;
-        let err = toml::from_str::<PackageMetadataNros>(raw)
-            .expect_err("unknown field must be rejected");
+        let err =
+            toml::from_str::<PackageMetadataNros>(raw).expect_err("unknown field must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown_typo") || msg.contains("unknown field"),
@@ -460,7 +550,10 @@ to = "zenoh:default"
         let native = v1.deploy.get("native").expect("native deploy present");
         assert_eq!(native.kind, "self");
         assert_eq!(native.launch.as_deref(), Some("launch/system.launch.xml"));
-        let qemu = v1.deploy.get("qemu-mps2-an385").expect("qemu deploy present");
+        let qemu = v1
+            .deploy
+            .get("qemu-mps2-an385")
+            .expect("qemu deploy present");
         assert_eq!(qemu.board.as_deref(), Some("mps2_an385"));
         assert_eq!(v1.domains.len(), 1);
         assert_eq!(v1.bridges.len(), 1);
@@ -492,6 +585,165 @@ name = "talker"
         assert!(v.deploy.is_empty());
         assert!(v.domains.is_empty());
         assert!(v.bridges.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 212.L — class / name / application / deploy schema additions
+    // -----------------------------------------------------------------
+
+    /// `[package.metadata.nros.component]` round-trip carries the new
+    /// `class` + `name` fields.
+    #[test]
+    fn loads_component_with_class_and_name() {
+        let raw = r#"
+[component]
+class = "alpha_pkg::Node"
+name = "alpha"
+default_namespace = "/demo"
+
+[component.parameters]
+rate_hz = 5
+"#;
+        let v: PackageMetadataNros = toml::from_str(raw).expect("parse");
+        v.validate().expect("single-shape ok");
+        let c = v.component.as_ref().expect("component present");
+        assert_eq!(c.class.as_deref(), Some("alpha_pkg::Node"));
+        assert_eq!(c.name.as_deref(), Some("alpha"));
+        assert_eq!(c.default_namespace.as_deref(), Some("/demo"));
+        assert_eq!(c.parameters.len(), 1);
+
+        // Round-trip.
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: PackageMetadataNros = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
+    }
+
+    /// `[package.metadata.nros.application]` accepts a `deploy = […]`
+    /// allow-list and an optional `name`.
+    #[test]
+    fn loads_application_with_deploy_targets() {
+        let raw = r#"
+[application]
+name = "demo_app"
+deploy = ["native", "qemu-arm-baremetal"]
+"#;
+        let v: PackageMetadataNros = toml::from_str(raw).expect("parse");
+        v.validate().expect("application-shape ok");
+        let app = v.application.as_ref().expect("application present");
+        assert_eq!(app.name.as_deref(), Some("demo_app"));
+        assert_eq!(app.deploy, vec!["native", "qemu-arm-baremetal"]);
+        assert!(v.component.is_none());
+        assert!(v.components.is_empty());
+
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: PackageMetadataNros = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
+    }
+
+    /// `[package.metadata.nros.deploy.<target>]` populates the typed
+    /// per-target table.
+    #[test]
+    fn loads_deploy_target_metadata() {
+        let raw = r#"
+[component]
+class = "alpha_pkg::Node"
+name = "alpha"
+
+[deploy.native]
+board = "native_sim/native/64"
+rmw = "zenoh"
+domain_id = 7
+locator = "tcp/127.0.0.1:7447"
+
+[deploy.qemu-mps2-an385]
+board = "mps2-an385"
+rmw = "cyclonedds"
+"#;
+        let v: PackageMetadataNros = toml::from_str(raw).expect("parse");
+        v.validate().expect("valid");
+        assert!(v.is_self_bringup_eligible());
+        assert_eq!(v.deploy.len(), 2);
+        let native = v.deploy.get("native").expect("native present");
+        assert_eq!(native.board.as_deref(), Some("native_sim/native/64"));
+        assert_eq!(native.rmw.as_deref(), Some("zenoh"));
+        assert_eq!(native.domain_id, Some(7));
+        assert_eq!(native.locator.as_deref(), Some("tcp/127.0.0.1:7447"));
+        let qemu = v.deploy.get("qemu-mps2-an385").expect("qemu present");
+        assert_eq!(qemu.board.as_deref(), Some("mps2-an385"));
+        assert_eq!(qemu.rmw.as_deref(), Some("cyclonedds"));
+        assert!(qemu.domain_id.is_none());
+        assert!(qemu.locator.is_none());
+
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: PackageMetadataNros = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
+    }
+
+    /// `deny_unknown_fields` rejects typos on `[component]` w/ the new
+    /// `class` + `name` siblings.
+    #[test]
+    fn rejects_unknown_field_in_component() {
+        let raw = r#"
+[component]
+class = "alpha_pkg::Node"
+name = "alpha"
+bogus = true
+"#;
+        let err =
+            toml::from_str::<PackageMetadataNros>(raw).expect_err("unknown field must reject");
+        let s = err.to_string();
+        assert!(s.contains("bogus") || s.contains("unknown field"), "{s}");
+    }
+
+    /// `deny_unknown_fields` on `[application]`.
+    #[test]
+    fn rejects_unknown_field_in_application() {
+        let raw = r#"
+[application]
+deploy = ["native"]
+oops = 1
+"#;
+        let err = toml::from_str::<PackageMetadataNros>(raw)
+            .expect_err("unknown field on application must reject");
+        let s = err.to_string();
+        assert!(s.contains("oops") || s.contains("unknown field"), "{s}");
+    }
+
+    /// `deny_unknown_fields` on `[deploy.<target>]`.
+    #[test]
+    fn rejects_unknown_field_in_deploy_target() {
+        let raw = r#"
+[component]
+class = "alpha_pkg::Node"
+name = "alpha"
+
+[deploy.native]
+board = "native_sim"
+mystery = "no"
+"#;
+        let err = toml::from_str::<PackageMetadataNros>(raw)
+            .expect_err("unknown field on deploy.<target> must reject");
+        let s = err.to_string();
+        assert!(s.contains("mystery") || s.contains("unknown field"), "{s}");
+    }
+
+    /// Component + application in the same pkg is rejected (mutex).
+    #[test]
+    fn rejects_component_and_application_in_same_pkg() {
+        let raw = r#"
+[component]
+class = "alpha_pkg::Node"
+name = "alpha"
+
+[application]
+deploy = ["native"]
+"#;
+        let v: PackageMetadataNros = toml::from_str(raw).expect("parse");
+        let err = v.validate().expect_err("mutex must trip");
+        assert!(
+            err.contains("application") || err.contains("component"),
+            "{err}"
+        );
     }
 
     /// `deny_unknown_fields` on `[system]` catches typos at the bringup

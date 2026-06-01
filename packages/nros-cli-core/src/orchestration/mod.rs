@@ -25,7 +25,9 @@ pub mod source_metadata;
 pub mod workspace;
 
 pub use config::ComponentConfig;
-pub use nros_config::{BringupPackageEntry, ComponentPackageEntry, NrosConfig, NrosConfigError};
+pub use nros_config::{
+    BringupPackageEntry, BringupSource, ComponentPackageEntry, NrosConfig, NrosConfigError,
+};
 pub use plan::NrosPlan;
 pub use root_config::WorkspaceConfig;
 pub use source_metadata::SourceMetadata;

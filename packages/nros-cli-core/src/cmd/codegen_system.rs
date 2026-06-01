@@ -1096,6 +1096,148 @@ name = "talker"
         assert!(out.join("nros-system/system_config.h").exists());
     }
 
+    /// Phase 212.L.7 — a self-bringup component pkg (Cargo.toml +
+    /// `[package.metadata.nros.component]` + `[package.metadata.nros.deploy.*]`,
+    /// no sibling bringup pkg) becomes its own degenerate 1-component
+    /// bringup. `nros codegen-system` (run via `run`) bakes
+    /// `system_main.c` + `system_config.h` with the component + the
+    /// deploy block's domain_id / rmw / locator.
+    #[test]
+    fn codegen_system_bakes_self_bringup_component_pkg() {
+        let dir = scratch_dir("bakes_self_bringup_component_pkg");
+        // Workspace w/ ONE self-bringup component pkg.
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["alpha_pkg"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("alpha_pkg/src")).unwrap();
+        fs::write(
+            dir.join("alpha_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "alpha_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.component]
+class = "alpha_pkg::Node"
+name = "alpha"
+
+[package.metadata.nros.deploy.native]
+board = "native_sim/native/64"
+rmw = "zenoh"
+domain_id = 7
+locator = "tcp/127.0.0.1:7447"
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("alpha_pkg/src/lib.rs"), "").unwrap();
+
+        let out = dir.join("build/alpha_pkg");
+        run(Args {
+            workspace: Some(dir.clone()),
+            bringup: Some("alpha_pkg".into()),
+            target: Some("native".into()),
+            out: Some(out.clone()),
+            ahead_of_vendor: None,
+            file: None,
+            exec: None,
+        })
+        .expect("codegen runs for self-bringup");
+
+        let bake = out.join("nros-system");
+        let header = fs::read_to_string(bake.join("system_config.h")).unwrap();
+        assert!(
+            header.contains("#define NROS_SYSTEM_DOMAIN_ID 7u"),
+            "header: {header}"
+        );
+        assert!(header.contains("#define NROS_SYSTEM_RMW \"zenoh\""));
+        assert!(header.contains("#define NROS_SYSTEM_LOCATOR \"tcp/127.0.0.1:7447\""));
+        assert!(header.contains("#define NROS_SYSTEM_COMPONENT_COUNT 1"));
+        assert!(header.contains("#define NROS_SYSTEM_COMPONENT_0_NAME \"alpha\""));
+
+        let main_c = fs::read_to_string(bake.join("system_main.c")).unwrap();
+        assert!(main_c.contains("nros_component_alpha_register"));
+
+        // Self-bringup pkg is a Rust pkg → Cargo stub emitted listing the
+        // host pkg.
+        let stub = fs::read_to_string(bake.join("Cargo.toml")).unwrap();
+        assert!(stub.contains("\"alpha_pkg\""), "stub: {stub}");
+
+        // Plan json reflects the self-bringup pkg.
+        let plan = fs::read_to_string(bake.join("nros-plan.json")).unwrap();
+        assert!(plan.contains("\"bringup\": \"alpha_pkg\""), "plan: {plan}");
+        assert!(plan.contains("\"system\": \"alpha_pkg\""), "plan: {plan}");
+    }
+
+    /// Phase 212.L.7 — `[workspace.metadata.nros].default_system` may point
+    /// at a self-bringup component pkg; `nros codegen-system` (no
+    /// `--bringup` hint) resolves through the workspace pointer.
+    #[test]
+    fn codegen_system_resolves_workspace_default_system_to_self_bringup_pkg() {
+        let dir = scratch_dir("workspace_default_self_bringup");
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["alpha_pkg"]
+
+[workspace.metadata.nros]
+default_system = "alpha_pkg"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("alpha_pkg/src")).unwrap();
+        fs::write(
+            dir.join("alpha_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "alpha_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.component]
+class = "alpha_pkg::Node"
+name = "alpha"
+
+[package.metadata.nros.deploy.native]
+rmw = "cyclonedds"
+domain_id = 3
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("alpha_pkg/src/lib.rs"), "").unwrap();
+
+        let out = dir.join("build/alpha_pkg");
+        run(Args {
+            workspace: Some(dir.clone()),
+            bringup: None, // resolves via [workspace.metadata.nros].default_system
+            target: None,
+            out: Some(out.clone()),
+            ahead_of_vendor: None,
+            file: None,
+            exec: None,
+        })
+        .expect("codegen runs via workspace pointer");
+
+        let bake = out.join("nros-system");
+        let header = fs::read_to_string(bake.join("system_config.h")).unwrap();
+        assert!(header.contains("#define NROS_SYSTEM_DOMAIN_ID 3u"));
+        assert!(header.contains("#define NROS_SYSTEM_RMW \"cyclonedds\""));
+    }
+
     /// 212.E.T4 — `--ahead-of-vendor pio` mode emits `library.json` alongside
     /// the standard bake tree.
     #[test]

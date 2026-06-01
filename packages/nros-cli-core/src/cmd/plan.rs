@@ -17,12 +17,18 @@ use std::path::PathBuf;
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// System package name used for build/<system_pkg>/nros output
+    /// System package name used for build/<system_pkg>/nros output.
+    /// When omitted, derived from the `<launch_file>` directory's
+    /// pkg name (Phase 212.L.7 self-bringup shape).
     pub system_pkg: String,
 
     /// ROS 2 launch file to parse, **or** a package directory to resolve
     /// via the Phase 212.L.6 multi-launch policy (pkg-named →
     /// system.launch.xml → single-file → synth for self-bringup pkgs).
+    /// When omitted in a Phase 212.L.7 single-arg invocation
+    /// (`nros plan <pkg-dir>`), defaults to the `<system_pkg>` argument
+    /// (treated as a directory path then).
+    #[arg(default_value = "")]
     pub launch_file: PathBuf,
 
     /// Precomputed play_launch record.json to use instead of parsing launch_file
@@ -67,12 +73,34 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let workspace_root = args.workspace.unwrap_or(std::env::current_dir()?);
-    let out_root = args.out_dir.unwrap_or_else(|| {
-        workspace_root
-            .join("build")
-            .join(&args.system_pkg)
-            .join("nros")
-    });
+
+    // Phase 212.L.7 — single-arg self-bringup shape. When the user
+    // passes only `<pkg-dir>` (no positional launch_file), `clap`
+    // sees `launch_file` as the empty path; default it to the
+    // `system_pkg` argument treated as a directory path. The
+    // launch_synth resolver handles the rest.
+    let launch_input_path = if args.launch_file.as_os_str().is_empty() {
+        PathBuf::from(&args.system_pkg)
+    } else {
+        args.launch_file.clone()
+    };
+
+    // Derive the system_pkg from the dir name when the user passed a
+    // dir as `<system_pkg>` (single-arg self-bringup shape).
+    let system_pkg =
+        if args.launch_file.as_os_str().is_empty() && PathBuf::from(&args.system_pkg).is_dir() {
+            PathBuf::from(&args.system_pkg)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&args.system_pkg)
+                .to_string()
+        } else {
+            args.system_pkg.clone()
+        };
+
+    let out_root = args
+        .out_dir
+        .unwrap_or_else(|| workspace_root.join("build").join(&system_pkg).join("nros"));
 
     // Phase 212.L.6: the positional `launch_file` may be either an
     // existing file (legacy path) or a package directory. Resolve to a
@@ -80,20 +108,20 @@ pub fn run(args: Args) -> Result<()> {
     // can consume — synthesised XML is written to a temp file whose
     // lifetime is tied to `_materialised` and removed when planning
     // returns.
-    let (resolved_path, _materialised) = if args.launch_file.is_dir() {
+    let (resolved_path, _materialised) = if launch_input_path.is_dir() {
         let input = resolve_launch(
-            &args.launch_file,
+            &launch_input_path,
             args.file.as_deref(),
             args.exec.as_deref(),
         )?;
         let materialised = input.materialise()?;
         (materialised.path.clone(), Some(materialised))
     } else {
-        (args.launch_file.clone(), None)
+        (launch_input_path.clone(), None)
     };
 
     let output = plan_system(PlanOptions {
-        system_pkg: args.system_pkg,
+        system_pkg,
         workspace_root,
         launch_file: resolved_path,
         record_file: args.record,
