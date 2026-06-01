@@ -2,6 +2,7 @@
 //! (Phase 212.F) a `<bringup>` pkg directory for pure-declarative shape.
 
 use crate::cmd::bringup::lint_bringup;
+use crate::cmd::check_workspace::check_workspace;
 use crate::cmd::emit_package_xml::{DriftStatus, check_drift};
 use crate::orchestration::{planner::check_plan_file, root_config::WorkspaceConfig};
 use clap::Args as ClapArgs;
@@ -27,9 +28,33 @@ pub struct Args {
     /// declarative (see docs/design/multi-node-workspace-layout.md §4).
     #[arg(long)]
     pub bringup: bool,
+
+    /// Phase 212.L — walk a workspace root and run L.4 / L.8 / L.11:
+    /// `<pkg>::<Class>` enforcement on every `[[component]]` row, stray
+    /// `system.toml` next to a component pkg, and per-pkg
+    /// `.cargo/config.toml` carrying `[patch.crates-io]` (warn-only). When
+    /// the flag is passed with no value the workspace defaults to the
+    /// current directory.
+    #[arg(long, num_args = 0..=1, default_missing_value = ".", value_name = "DIR")]
+    pub workspace: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
+    // Phase 212.L — `--workspace [<dir>]` runs the workspace-walk lint.
+    if let Some(ws_root) = args.workspace.as_deref() {
+        let report = check_workspace(ws_root)?;
+        for w in &report.warnings {
+            eprintln!("nros check: warning: {w}");
+        }
+        eprintln!(
+            "nros check: ok (workspace {}, {} pkg(s), {} warning(s))",
+            ws_root.display(),
+            report.pkgs_visited,
+            report.warnings.len()
+        );
+        return Ok(());
+    }
+
     // Phase 212.F — `--bringup` switches the `plan` argument into a directory
     // path and runs the pure-declarative lint.
     if args.bringup {

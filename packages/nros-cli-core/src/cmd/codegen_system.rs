@@ -39,6 +39,7 @@ use serde::Serialize;
 
 use crate::orchestration::{
     cargo_metadata_schema::{SystemComponentEntry, SystemToml},
+    launch_synth::{LaunchInput, resolve_launch},
     nros_config::{BringupPackageEntry, NrosConfig},
 };
 
@@ -76,6 +77,18 @@ pub struct Args {
     /// in addition to the standard bake tree.
     #[arg(long = "ahead-of-vendor", value_enum)]
     pub ahead_of_vendor: Option<AheadOfVendor>,
+
+    /// Phase 212.L.6 — multi-launch disambiguation: pass `<file>` and
+    /// the resolver picks `<bringup>/launch/<file>` (cwd / absolute as
+    /// fallbacks).
+    #[arg(long = "file")]
+    pub file: Option<String>,
+
+    /// Phase 212.L.6 — `<node exec="…">` override for synthesised
+    /// launches (when the bringup pkg has multiple `[[bin]]` /
+    /// `add_executable` targets).
+    #[arg(long = "exec")]
+    pub exec: Option<String>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -96,7 +109,35 @@ pub fn run(args: Args) -> Result<()> {
 
     let component_kinds = classify_components(&cfg, &bringup.system.components);
 
-    emit_bake_tree(&bake_dir, bringup, &component_kinds, args.target.as_deref())?;
+    // Phase 212.L.6 — resolve the launch input. For a Path A bringup
+    // pkg (no Cargo.toml, no CMakeLists.txt) we surface the resolver's
+    // hard error unchanged; for synthesisable pkgs the synth XML is
+    // dropped after the plan is recorded (codegen-system does not feed
+    // the XML to the launch parser today — the bake reads system.toml
+    // directly — but resolving now keeps the policy uniform across
+    // verbs and rejects nonsense input early).
+    //
+    // The resolved file path (real or synth temp) is recorded into
+    // `nros-plan.json::launch_file` so `nros check` / `nros explain` can
+    // see what was used.
+    let bringup_dir = bringup
+        .manifest_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| workspace.clone());
+    let launch_input = resolve_launch(&bringup_dir, args.file.as_deref(), args.exec.as_deref())?;
+    let resolved_launch = match &launch_input {
+        LaunchInput::File(p) => Some(p.to_string_lossy().into_owned()),
+        LaunchInput::Synth(_) => None, // not persisted; record nothing
+    };
+
+    emit_bake_tree(
+        &bake_dir,
+        bringup,
+        &component_kinds,
+        args.target.as_deref(),
+        resolved_launch.as_deref(),
+    )?;
 
     if let Some(mode) = args.ahead_of_vendor {
         emit_ahead_of_vendor(&out_dir, bringup, mode)?;
@@ -189,6 +230,7 @@ fn emit_bake_tree(
     bringup: &BringupPackageEntry,
     component_kinds: &[(String, ComponentLang)],
     target: Option<&str>,
+    resolved_launch: Option<&str>,
 ) -> Result<()> {
     fs::create_dir_all(bake_dir)
         .with_context(|| format!("create bake dir {}", bake_dir.display()))?;
@@ -224,7 +266,7 @@ fn emit_bake_tree(
 
     write_if_changed(
         &bake_dir.join("nros-plan.json"),
-        &render_plan_json(bringup, component_kinds, target)?,
+        &render_plan_json(bringup, component_kinds, target, resolved_launch)?,
     )?;
 
     Ok(())
@@ -390,12 +432,17 @@ fn render_plan_json(
     bringup: &BringupPackageEntry,
     component_kinds: &[(String, ComponentLang)],
     target: Option<&str>,
+    resolved_launch: Option<&str>,
 ) -> Result<String> {
-    let launch_file: Option<String> = bringup
-        .system
-        .deploy
-        .values()
-        .find_map(|d| d.launch.clone())
+    let launch_file: Option<String> = resolved_launch
+        .map(|s| s.to_string())
+        .or_else(|| {
+            bringup
+                .system
+                .deploy
+                .values()
+                .find_map(|d| d.launch.clone())
+        })
         .or_else(|| {
             // Fall back to the conventional path.
             let candidate = bringup
@@ -519,7 +566,7 @@ fn emit_px4(out_dir: &Path, bringup: &BringupPackageEntry) -> Result<()> {
     );
     write_if_changed(
         &out_dir.join("nros-plan.json"),
-        &render_plan_json(bringup, &kinds, Some("px4"))?,
+        &render_plan_json(bringup, &kinds, Some("px4"), None)?,
     )?;
 
     Ok(())
@@ -850,6 +897,8 @@ name = "talker"
             target: Some("x86_64-unknown-linux-gnu".into()),
             out: Some(out.clone()),
             ahead_of_vendor: None,
+            file: None,
+            exec: None,
         })
         .expect("codegen runs");
 
@@ -906,6 +955,8 @@ name = "talker"
             target: Some("x86_64-unknown-linux-gnu".into()),
             out: Some(out.clone()),
             ahead_of_vendor: None,
+            file: None,
+            exec: None,
         };
         run(args()).expect("first run");
 
@@ -942,6 +993,8 @@ name = "talker"
             target: None,
             out: Some(out.clone()),
             ahead_of_vendor: None,
+            file: None,
+            exec: None,
         })
         .expect("codegen runs");
 
@@ -976,6 +1029,8 @@ name = "talker"
             target: Some("px4".into()),
             out: Some(out.clone()),
             ahead_of_vendor: Some(AheadOfVendor::Px4),
+            file: None,
+            exec: None,
         })
         .expect("codegen runs");
 
@@ -1055,6 +1110,8 @@ name = "talker"
             target: None,
             out: Some(out.clone()),
             ahead_of_vendor: Some(AheadOfVendor::Pio),
+            file: None,
+            exec: None,
         })
         .expect("codegen runs");
 

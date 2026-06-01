@@ -1,0 +1,339 @@
+//! Phase 212.L — workspace-walk lints for `nros check --workspace`.
+//!
+//! Three lints land here:
+//!
+//! * **L.4 — `<pkg>::<Class>` enforcement.** Every `[[component]]` row in a
+//!   bringup `system.toml` carries `pkg = "<dir>"` + `class = "<dir>::<Type>"`.
+//!   The `class` MUST be prefixed by `<pkg>::` so the codegen path and a human
+//!   reader land at the same crate.
+//!
+//! * **L.8 — `system.toml` outside bringup is forbidden.** `system.toml` is a
+//!   bringup-pkg-only file. A component pkg (carries `Cargo.toml` or
+//!   `CMakeLists.txt`) with a stray `system.toml` next to it is rejected.
+//!
+//! * **L.11 — per-pkg `.cargo/config.toml` with `[patch.crates-io]` is a
+//!   warning.** Cargo reads `[patch.crates-io]` from both `Cargo.toml` AND
+//!   `.cargo/config.toml`; when both exist the config-file shadows the
+//!   manifest. Patches must live in the workspace-root `Cargo.toml` only.
+//!
+//! The walk is `nros check --workspace [<dir>]`. Each immediate child of the
+//! workspace root is classified as a bringup pkg (has `system.toml`, no
+//! `Cargo.toml` / `CMakeLists.txt` / `src/`) or a component pkg (has
+//! `Cargo.toml` or `CMakeLists.txt`). Other dirs are skipped.
+
+use std::{fs, path::Path};
+
+use eyre::{Result, WrapErr, bail};
+
+use crate::orchestration::cargo_metadata_schema::SystemToml;
+
+/// Result of one workspace walk. Hard-error lints bail through `Result`;
+/// warnings flow back as a list so the caller can stamp the final
+/// "ok (N warning(s))" summary.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceLintReport {
+    /// Number of pkg dirs visited (any kind).
+    pub pkgs_visited: usize,
+    /// Soft warnings collected during the walk (L.11 today).
+    pub warnings: Vec<String>,
+}
+
+/// Walk `workspace_root` and run the L.4 / L.8 / L.11 lints.
+///
+/// Hard-error lints (L.4 / L.8) bail with `eyre::Error` carrying a diagnostic
+/// that names the offending dir + the rule. Warnings (L.11) accumulate in
+/// the returned report.
+pub fn check_workspace(workspace_root: &Path) -> Result<WorkspaceLintReport> {
+    let mut report = WorkspaceLintReport::default();
+
+    let entries = fs::read_dir(workspace_root)
+        .wrap_err_with(|| format!("read {}", workspace_root.display()))?;
+    let mut dirs: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    // Deterministic order so diagnostics + warnings are reproducible.
+    dirs.sort();
+
+    for pkg_dir in dirs {
+        let name = match pkg_dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Skip dotted dirs (.git, .cargo, .claude, …) and build output dirs.
+        if name.starts_with('.') || name == "target" || name == "build" {
+            continue;
+        }
+
+        let has_cargo = pkg_dir.join("Cargo.toml").is_file();
+        let has_cmake = pkg_dir.join("CMakeLists.txt").is_file();
+        let has_system = pkg_dir.join("system.toml").is_file();
+        let has_src = pkg_dir.join("src").is_dir();
+
+        // Component pkg shape: Cargo.toml or CMakeLists.txt sits at the root.
+        // Bringup pkg shape: only system.toml + package.xml (no source).
+        let is_component = has_cargo || has_cmake;
+        let is_bringup = has_system && !is_component && !has_src;
+
+        if !is_component && !is_bringup {
+            continue; // Not an nros-managed pkg dir — skip.
+        }
+        report.pkgs_visited += 1;
+
+        if is_component {
+            // L.8 — component pkg with stray `system.toml`.
+            if has_system {
+                bail!(
+                    "pkg {name}: stray system.toml next to {} — `system.toml` \
+                     lives ONLY in a Path A bringup pkg (no Cargo.toml / \
+                     CMakeLists.txt / src/); move it into a sibling \
+                     <system>_bringup/ dir (see \
+                     docs/design/multi-node-workspace-layout.md §4)",
+                    if has_cargo {
+                        "Cargo.toml"
+                    } else {
+                        "CMakeLists.txt"
+                    }
+                );
+            }
+            // L.11 — per-pkg `.cargo/config.toml` shadowing patch.
+            let cargo_cfg = pkg_dir.join(".cargo/config.toml");
+            if cargo_cfg.is_file() {
+                let body = fs::read_to_string(&cargo_cfg).unwrap_or_default();
+                if has_patch_crates_io(&body) {
+                    report.warnings.push(format!(
+                        "pkg {name}: .cargo/config.toml carries \
+                         [patch.crates-io] — cargo reads patches from BOTH \
+                         Cargo.toml AND .cargo/config.toml and the config \
+                         file shadows the manifest; move the block to the \
+                         workspace-root Cargo.toml (auto-managed by \
+                         `nros ws sync`)"
+                    ));
+                }
+            }
+        }
+
+        if is_bringup {
+            // L.4 — class prefix matches pkg.
+            lint_class_pkg_prefix(&pkg_dir, &name)?;
+        }
+    }
+
+    Ok(report)
+}
+
+/// L.4 helper. Read `<bringup>/system.toml`, verify each `[[component]]`
+/// row's `class` is `<pkg>::<Type>`-shaped. Public so `lint_bringup` can
+/// reuse it on the `--bringup <dir>` flow.
+pub fn lint_class_pkg_prefix(bringup_dir: &Path, bringup_pkg_name: &str) -> Result<()> {
+    let system_toml = bringup_dir.join("system.toml");
+    if !system_toml.is_file() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&system_toml)
+        .wrap_err_with(|| format!("read {}", system_toml.display()))?;
+    let parsed: SystemToml =
+        toml::from_str(&raw).wrap_err_with(|| format!("parse {}", system_toml.display()))?;
+    let mut bad: Vec<String> = Vec::new();
+    for c in &parsed.components {
+        let prefix = format!("{}::", c.pkg);
+        if !c.class.starts_with(&prefix) {
+            bad.push(format!(
+                "[[component]] name=\"{}\" pkg=\"{}\" class=\"{}\" — class \
+                 must start with \"{}\"",
+                c.name, c.pkg, c.class, prefix
+            ));
+        }
+    }
+    if !bad.is_empty() {
+        bail!(
+            "bringup pkg {bringup_pkg_name}: system.toml component class \
+             mismatch — {}. The `class` field in a `[[component]]` row MUST \
+             be `<pkg>::<Type>` so codegen and humans land at the same crate.",
+            bad.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Cheap substring scan for `[patch.crates-io]` in a cargo config body.
+/// Avoids a full TOML parse so malformed user configs still flag.
+fn has_patch_crates_io(body: &str) -> bool {
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        // Accept `[patch.crates-io]` exactly. Be tolerant of trailing comments
+        // and whitespace; reject `[patch.crates-io.foo]` (that's a dependency
+        // override entry, not the table header — but in practice users hit
+        // both with the same shadowing risk, so flag anything starting with
+        // the patch.crates-io path).
+        if t.starts_with("[patch.crates-io]") || t.starts_with("[patch.crates-io.") {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nros-check-ws-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_component_pkg(dir: &Path, name: &str) {
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("src/lib.rs"), "// stub\n").unwrap();
+    }
+
+    fn write_bringup_with_components(dir: &Path, components: &[(&str, &str, &str)]) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("package.xml"),
+            "<?xml version=\"1.0\"?><package format=\"3\">\
+             <name>demo_bringup</name><version>0.1.0</version></package>",
+        )
+        .unwrap();
+        let mut s = String::from("[system]\nname = \"demo\"\nrmw = \"zenoh\"\ndomain_id = 0\n");
+        for (pkg, class, cname) in components {
+            s.push_str(&format!(
+                "\n[[component]]\npkg = \"{pkg}\"\nclass = \"{class}\"\nname = \"{cname}\"\n"
+            ));
+        }
+        fs::write(dir.join("system.toml"), s).unwrap();
+    }
+
+    #[test]
+    fn nros_check_rejects_class_pkg_mismatch() {
+        let root = temp_root("class_mismatch");
+        let bringup = root.join("demo_bringup");
+        write_bringup_with_components(&bringup, &[("talker_pkg", "wrong::Talker", "talker")]);
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("class mismatch"), "diag: {msg}");
+        assert!(msg.contains("talker_pkg::"), "diag: {msg}");
+        assert!(msg.contains("wrong::Talker"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_accepts_correct_class_pkg_prefix() {
+        let root = temp_root("class_ok");
+        let bringup = root.join("demo_bringup");
+        write_bringup_with_components(
+            &bringup,
+            &[
+                ("talker_pkg", "talker_pkg::Talker", "talker"),
+                ("listener_pkg", "listener_pkg::Listener", "listener"),
+            ],
+        );
+        let report = check_workspace(&root).expect("clean workspace passes");
+        assert_eq!(report.pkgs_visited, 1);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn nros_check_rejects_system_toml_in_component_pkg() {
+        let root = temp_root("stray_system");
+        let pkg = root.join("talker_pkg");
+        write_component_pkg(&pkg, "talker_pkg");
+        // Stray system.toml next to Cargo.toml — L.8 reject.
+        fs::write(
+            pkg.join("system.toml"),
+            "[system]\nname=\"x\"\nrmw=\"zenoh\"\ndomain_id=0\n",
+        )
+        .unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stray system.toml"), "diag: {msg}");
+        assert!(msg.contains("talker_pkg"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_accepts_system_toml_in_bringup_pkg() {
+        let root = temp_root("bringup_ok");
+        let bringup = root.join("demo_bringup");
+        write_bringup_with_components(&bringup, &[]);
+        // No Cargo.toml, no CMakeLists.txt, no src/ → bringup shape.
+        let report = check_workspace(&root).expect("bringup passes");
+        assert_eq!(report.pkgs_visited, 1);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn nros_check_warns_on_per_pkg_cargo_config_patch() {
+        let root = temp_root("patch_shadow");
+        let pkg = root.join("talker_pkg");
+        write_component_pkg(&pkg, "talker_pkg");
+        fs::create_dir_all(pkg.join(".cargo")).unwrap();
+        fs::write(
+            pkg.join(".cargo/config.toml"),
+            "[patch.crates-io]\nzenoh = { git = \"https://example.com/x.git\" }\n",
+        )
+        .unwrap();
+        let report = check_workspace(&root).expect("warn-only, not bail");
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        let w = &report.warnings[0];
+        assert!(w.contains("talker_pkg"), "warning: {w}");
+        assert!(w.contains("[patch.crates-io]"), "warning: {w}");
+        assert!(w.contains("shadows"), "warning: {w}");
+    }
+
+    #[test]
+    fn nros_check_silent_on_cargo_config_without_patch() {
+        let root = temp_root("patch_clean");
+        let pkg = root.join("talker_pkg");
+        write_component_pkg(&pkg, "talker_pkg");
+        fs::create_dir_all(pkg.join(".cargo")).unwrap();
+        // A plain config.toml without the patch block — no warning.
+        fs::write(
+            pkg.join(".cargo/config.toml"),
+            "[build]\ntarget = \"thumbv7m-none-eabi\"\n",
+        )
+        .unwrap();
+        let report = check_workspace(&root).expect("ok");
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn nros_check_skips_dotted_and_build_dirs() {
+        let root = temp_root("skip_dirs");
+        // .git with a stray Cargo.toml + system.toml should NOT trigger lint.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(root.join(".git/system.toml"), "[system]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/Cargo.toml"), "[package]\nname=\"y\"\n").unwrap();
+
+        let report = check_workspace(&root).expect("dotted + build dirs skipped");
+        assert_eq!(report.pkgs_visited, 0);
+    }
+}

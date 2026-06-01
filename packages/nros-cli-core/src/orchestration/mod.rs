@@ -9,6 +9,7 @@ pub mod build;
 pub mod cargo_metadata_schema;
 pub mod config;
 pub mod generate;
+pub mod launch_synth;
 pub mod manifest;
 pub mod metadata_build;
 pub mod names;
@@ -24,9 +25,7 @@ pub mod source_metadata;
 pub mod workspace;
 
 pub use config::ComponentConfig;
-pub use nros_config::{
-    BringupPackageEntry, ComponentPackageEntry, NrosConfig, NrosConfigError,
-};
+pub use nros_config::{BringupPackageEntry, ComponentPackageEntry, NrosConfig, NrosConfigError};
 pub use plan::NrosPlan;
 pub use root_config::WorkspaceConfig;
 pub use source_metadata::SourceMetadata;

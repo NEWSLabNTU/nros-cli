@@ -316,6 +316,8 @@ fn emit_entry_lib(
         system_pkg: system_pkg.clone(),
         launch_file: root.join(launch),
         record: None,
+        file: None,
+        exec: None,
         workspace: Some(root.to_path_buf()),
         out_dir: Some(paths.out_root.clone()),
         metadata: Vec::new(),

@@ -13,6 +13,7 @@ pub mod board;
 pub mod bringup;
 pub mod build;
 pub mod check;
+pub mod check_workspace;
 pub mod codegen;
 pub mod codegen_cyclonedds_descriptors;
 pub mod codegen_system;

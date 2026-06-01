@@ -71,6 +71,19 @@ pub struct Args {
     /// the given pidfile.
     #[arg(long, value_name = "PID-FILE")]
     pub stop: Option<PathBuf>,
+
+    /// Phase 212.L.6 — multi-launch disambiguation. The launcher does not
+    /// drive component spawn from XML today (it spawns from `system.toml`'s
+    /// `[[component]]` list), but accepting `--file` keeps the verb
+    /// surface uniform with `nros plan` / `nros codegen-system`, and
+    /// invokes the shared resolver so bad input fails fast.
+    #[arg(long = "file")]
+    pub file: Option<String>,
+
+    /// Phase 212.L.6 — `<node exec="…">` override for synthesised
+    /// launches. Same uniform-surface motivation as `--file`.
+    #[arg(long = "exec")]
+    pub exec: Option<String>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -82,11 +95,23 @@ pub fn run(args: Args) -> Result<()> {
         .workspace_root
         .clone()
         .map(|p| p.canonicalize().unwrap_or(p))
-        .unwrap_or_else(|| {
-            std::env::current_dir().expect("current dir readable for nros launch")
-        });
+        .unwrap_or_else(|| std::env::current_dir().expect("current dir readable for nros launch"));
 
     let bringup_dir = resolve_bringup_dir(&workspace_root, args.bringup.as_deref())?;
+
+    // Phase 212.L.6 — when `--file` or `--exec` are passed, run the
+    // shared resolver to validate the launch input early. The host
+    // launcher itself spawns from `system.toml::[[component]]`, not the
+    // launch XML, so a successful resolve is purely a sanity check;
+    // a failure surfaces with the resolver's specific error.
+    if args.file.is_some() || args.exec.is_some() {
+        let _ = crate::orchestration::launch_synth::resolve_launch(
+            &bringup_dir,
+            args.file.as_deref(),
+            args.exec.as_deref(),
+        )?;
+    }
+
     let (system, target_name, target) = load_plan(&bringup_dir, args.target.as_deref())?;
 
     // Embedded deploy kinds aren't host-spawnable. Surface a clean error.
@@ -98,18 +123,17 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
 
-    let locator = system.system.locator.clone().unwrap_or_else(|| DEFAULT_LOCATOR.to_string());
+    let locator = system
+        .system
+        .locator
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCATOR.to_string());
     let domain_id = system.system.domain_id;
 
     let mut commands: Vec<PreparedCommand> = Vec::new();
     for comp in &system.components {
-        let prepared = prepare_component(
-            &workspace_root,
-            &args.profile,
-            comp,
-            &locator,
-            domain_id,
-        )?;
+        let prepared =
+            prepare_component(&workspace_root, &args.profile, comp, &locator, domain_id)?;
         commands.push(prepared);
     }
 
@@ -146,7 +170,10 @@ fn resolve_bringup_dir(workspace_root: &Path, arg: Option<&str>) -> Result<PathB
         if by_name.is_dir() {
             return Ok(by_name);
         }
-        bail!("nros launch: bringup `{raw}` not found under {}", workspace_root.display());
+        bail!(
+            "nros launch: bringup `{raw}` not found under {}",
+            workspace_root.display()
+        );
     }
 
     // Fall back to [workspace.metadata.nros].default_system.
@@ -204,26 +231,39 @@ fn load_plan(
     let system_toml_path = bringup_dir.join("system.toml");
     let raw = fs::read_to_string(&system_toml_path)
         .wrap_err_with(|| format!("read {}", system_toml_path.display()))?;
-    let system: SystemToml = toml::from_str(&raw)
-        .wrap_err_with(|| format!("parse {}", system_toml_path.display()))?;
+    let system: SystemToml =
+        toml::from_str(&raw).wrap_err_with(|| format!("parse {}", system_toml_path.display()))?;
 
     // Pick the target: explicit arg, else first entry sorted (BTreeMap keys
     // are already sorted), else synthesize a "native" default.
     let (target_name, target) = match target_arg {
         Some(name) => {
-            let t = system
-                .deploy
-                .get(name)
-                .ok_or_else(|| eyre!("nros launch: no [deploy.{name}] in {}",
-                    system_toml_path.display()))?;
+            let t = system.deploy.get(name).ok_or_else(|| {
+                eyre!(
+                    "nros launch: no [deploy.{name}] in {}",
+                    system_toml_path.display()
+                )
+            })?;
             (
                 name.to_string(),
-                DeployTargetView { kind: t.kind.clone() },
+                DeployTargetView {
+                    kind: t.kind.clone(),
+                },
             )
         }
         None => match system.deploy.iter().next() {
-            Some((n, t)) => (n.clone(), DeployTargetView { kind: t.kind.clone() }),
-            None => ("native".to_string(), DeployTargetView { kind: "self".to_string() }),
+            Some((n, t)) => (
+                n.clone(),
+                DeployTargetView {
+                    kind: t.kind.clone(),
+                },
+            ),
+            None => (
+                "native".to_string(),
+                DeployTargetView {
+                    kind: "self".to_string(),
+                },
+            ),
         },
     };
     Ok((system, target_name, target))
@@ -270,7 +310,11 @@ fn prepare_component(
     if !remaps.is_empty() {
         env.push(("NROS_REMAPS".to_string(), encode_remaps(&remaps)));
     }
-    Ok(PreparedCommand { pkg: comp.pkg.clone(), binary, env })
+    Ok(PreparedCommand {
+        pkg: comp.pkg.clone(),
+        binary,
+        env,
+    })
 }
 
 fn resolve_binary(workspace_root: &Path, profile: &str, pkg: &str) -> PathBuf {
@@ -313,13 +357,16 @@ fn load_component_meta(
     struct MetadataTable {
         nros: Option<PackageMetadataNros>,
     }
-    let outer: Outer = toml::from_str(&raw)
-        .wrap_err_with(|| format!("parse {}", cargo_toml.display()))?;
+    let outer: Outer =
+        toml::from_str(&raw).wrap_err_with(|| format!("parse {}", cargo_toml.display()))?;
     let Some(meta) = outer.package.and_then(|p| p.metadata).and_then(|m| m.nros) else {
         return Ok((Default::default(), Vec::new(), None));
     };
     if let Err(msg) = meta.validate() {
-        bail!("nros launch: invalid [package.metadata.nros] in {}: {msg}", cargo_toml.display());
+        bail!(
+            "nros launch: invalid [package.metadata.nros] in {}: {msg}",
+            cargo_toml.display()
+        );
     }
     let resolved: Option<ComponentMetadata> = if let Some(c) = meta.component {
         Some(c)
@@ -486,8 +533,7 @@ fn spawn_detached(
 
     let pidfile = pidfile_path(workspace_root, bringup_dir);
     if let Some(parent) = pidfile.parent() {
-        fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).wrap_err_with(|| format!("create {}", parent.display()))?;
     }
     let body = render_pidfile(std::process::id(), &pids);
     fs::write(&pidfile, body).wrap_err_with(|| format!("write {}", pidfile.display()))?;
@@ -504,7 +550,10 @@ fn pidfile_path(workspace_root: &Path, bringup_dir: &Path) -> PathBuf {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("bringup");
-    workspace_root.join("target").join("nros").join(format!("{stem}.pid"))
+    workspace_root
+        .join("target")
+        .join("nros")
+        .join(format!("{stem}.pid"))
 }
 
 /// Pidfile shape: one PID per line. First line is the launcher's own PID
@@ -533,8 +582,8 @@ fn parse_pidfile(body: &str) -> Vec<i32> {
 }
 
 fn stop_pidfile(pidfile: &Path) -> Result<()> {
-    let body = fs::read_to_string(pidfile)
-        .wrap_err_with(|| format!("read {}", pidfile.display()))?;
+    let body =
+        fs::read_to_string(pidfile).wrap_err_with(|| format!("read {}", pidfile.display()))?;
     let pids = parse_pidfile(&body);
     if pids.is_empty() {
         bail!("nros launch --stop: {} has no PIDs", pidfile.display());
@@ -566,9 +615,13 @@ fn spawn_one(cmd: &PreparedCommand, detached: bool) -> Result<Child> {
         c.env(k, v);
     }
     if detached {
-        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
     } else {
-        c.stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        c.stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
     }
     c.spawn().wrap_err_with(|| {
         format!(
@@ -595,10 +648,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "nros-launch-{tag}-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nros-launch-{tag}-{}-{stamp}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -619,10 +670,7 @@ mod tests {
 
     /// Stub that writes its env to a file then exits (for env-propagation test).
     fn write_env_dump_exec(dir: &Path, exec: &str, dump: &Path) {
-        let script = format!(
-            "#!/bin/sh\nenv >\"{}\"\n",
-            dump.display(),
-        );
+        let script = format!("#!/bin/sh\nenv >\"{}\"\n", dump.display(),);
         let p = dir.join(exec);
         fs::write(&p, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -630,12 +678,7 @@ mod tests {
     }
 
     /// Build a fixture workspace with a bringup pkg + two components.
-    fn write_fixture(
-        root: &Path,
-        bringup_name: &str,
-        comps: &[(&str, &str)],
-        deploy_kind: &str,
-    ) {
+    fn write_fixture(root: &Path, bringup_name: &str, comps: &[(&str, &str)], deploy_kind: &str) {
         // Workspace Cargo.toml carrying `default_system`.
         fs::write(
             root.join("Cargo.toml"),
@@ -658,7 +701,9 @@ mod tests {
                 "[[component]]\npkg = \"{pkg}\"\nclass = \"{class}\"\nname = \"{pkg}\"\n"
             ));
         }
-        sys.push_str(&format!("[deploy.native]\nkind = \"{deploy_kind}\"\ntarget = \"x86_64-unknown-linux-gnu\"\n"));
+        sys.push_str(&format!(
+            "[deploy.native]\nkind = \"{deploy_kind}\"\ntarget = \"x86_64-unknown-linux-gnu\"\n"
+        ));
         fs::write(bringup.join("system.toml"), sys).unwrap();
         fs::write(bringup.join("launch/system.launch.xml"), "<launch/>").unwrap();
     }
@@ -669,7 +714,10 @@ mod tests {
         write_fixture(
             &root,
             "demo_bringup",
-            &[("talker_pkg", "talker_pkg::Talker"), ("listener_pkg", "listener_pkg::Listener")],
+            &[
+                ("talker_pkg", "talker_pkg::Talker"),
+                ("listener_pkg", "listener_pkg::Listener"),
+            ],
             "self",
         );
         // Pretend-built binaries: write executables to target/debug/<pkg>.
@@ -691,6 +739,8 @@ mod tests {
                 foreground: true,
                 detach: false,
                 stop: None,
+                file: None,
+                exec: None,
             };
             run(args).unwrap();
         });
@@ -736,15 +786,24 @@ mod tests {
             foreground: false,
             detach: true,
             stop: None,
+            file: None,
+            exec: None,
         };
         run(args).expect("detach run");
 
         let pidfile = root.join("target/nros/demo_bringup.pid");
-        assert!(pidfile.is_file(), "pidfile not written: {}", pidfile.display());
+        assert!(
+            pidfile.is_file(),
+            "pidfile not written: {}",
+            pidfile.display()
+        );
         let body = fs::read_to_string(&pidfile).unwrap();
         let pids = parse_pidfile(&body);
         assert_eq!(pids.len(), 1, "expected 1 child PID, got {pids:?}");
-        assert!(body.contains("parent="), "pidfile lacks parent= header: {body}");
+        assert!(
+            body.contains("parent="),
+            "pidfile lacks parent= header: {body}"
+        );
 
         // --stop sends SIGTERM. The detached child is a `while true; do sleep`
         // loop; SIGTERM kills it.
@@ -756,6 +815,8 @@ mod tests {
             foreground: false,
             detach: false,
             stop: Some(pidfile.clone()),
+            file: None,
+            exec: None,
         };
         run(stop).expect("stop run");
         // Give the OS a moment to reap.
@@ -821,6 +882,8 @@ mod tests {
             foreground: true,
             detach: false,
             stop: None,
+            file: None,
+            exec: None,
         };
         run(args).expect("foreground env-dump");
 
@@ -861,6 +924,8 @@ mod tests {
             foreground: true,
             detach: false,
             stop: None,
+            file: None,
+            exec: None,
         };
         let err = run(args).unwrap_err().to_string();
         assert!(err.contains("not a host target"), "diagnostic: {err}");
@@ -870,10 +935,7 @@ mod tests {
     #[test]
     fn read_default_system_walks_workspace_metadata_table() {
         let raw = "[workspace]\nresolver=\"2\"\n[workspace.metadata.nros]\ndefault_system=\"demo_bringup\"\n";
-        assert_eq!(
-            read_default_system(raw).as_deref(),
-            Some("demo_bringup")
-        );
+        assert_eq!(read_default_system(raw).as_deref(), Some("demo_bringup"));
         assert!(read_default_system("[workspace]\nmembers=[]\n").is_none());
     }
 
@@ -889,10 +951,19 @@ mod tests {
     fn encode_remaps_emits_ros_remap_syntax() {
         use crate::orchestration::schema::RemapRule;
         let remaps = vec![
-            RemapRule { from: "chatter".into(), to: "topic/chatter".into() },
-            RemapRule { from: "tf".into(), to: "tf_static".into() },
+            RemapRule {
+                from: "chatter".into(),
+                to: "topic/chatter".into(),
+            },
+            RemapRule {
+                from: "tf".into(),
+                to: "tf_static".into(),
+            },
         ];
-        assert_eq!(encode_remaps(&remaps), "chatter:=topic/chatter;tf:=tf_static");
+        assert_eq!(
+            encode_remaps(&remaps),
+            "chatter:=topic/chatter;tf:=tf_static"
+        );
     }
 
     #[test]
