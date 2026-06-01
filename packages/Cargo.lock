@@ -218,6 +218,7 @@ dependencies = [
  "clap",
  "eyre",
  "indicatif",
+ "nros-msg-to-idl",
  "quick-xml",
  "rayon",
  "rosidl-bindgen",

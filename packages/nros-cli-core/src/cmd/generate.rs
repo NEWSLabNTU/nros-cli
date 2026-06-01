@@ -65,6 +65,21 @@ pub struct Args {
     /// (Rust only)
     #[arg(long, value_parser = parse_rename)]
     pub rename: Vec<(String, String)>,
+
+    /// Phase 212.K — skip the Cyclone DDS descriptor emit. By default
+    /// `nros generate-rust` tries to emit Cyclone descriptor C
+    /// alongside each generated message crate so consumers get the
+    /// Zenoh-style `<pkg>/cyclonedds` feature with no per-example
+    /// `build.rs`. Pass `--no-cyclonedds` to skip even when a host
+    /// `idlc` is available.
+    #[arg(long)]
+    pub no_cyclonedds: bool,
+
+    /// Override the host `idlc` path. Defaults to
+    /// `$NROS_CYCLONEDDS_IDLC`, then `<cwd>/build/cyclonedds/bin/idlc`,
+    /// then `which idlc`. No-op under `--no-cyclonedds`.
+    #[arg(long)]
+    pub cyclonedds_idlc: Option<PathBuf>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -104,6 +119,15 @@ pub struct RustArgs {
     /// Rename a generated package: --rename old_pkg=new_crate_name
     #[arg(long, value_parser = parse_rename)]
     pub rename: Vec<(String, String)>,
+
+    /// Phase 212.K — skip the Cyclone DDS descriptor emit. See `Args`
+    /// for default behaviour.
+    #[arg(long)]
+    pub no_cyclonedds: bool,
+
+    /// Override the host `idlc` path. See `Args`.
+    #[arg(long)]
+    pub cyclonedds_idlc: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -135,6 +159,8 @@ pub fn run_rust(args: RustArgs) -> Result<()> {
         verbose: args.verbose,
         ros_edition: args.ros_edition,
         renames: args.rename.into_iter().collect(),
+        cyclonedds_descriptors: !args.no_cyclonedds,
+        cyclonedds_idlc: args.cyclonedds_idlc,
     })
 }
 
@@ -149,6 +175,8 @@ fn generate_rust(args: &Args) -> Result<()> {
         verbose: args.verbose,
         ros_edition: args.ros_edition.clone(),
         renames: args.rename.clone().into_iter().collect::<HashMap<_, _>>(),
+        cyclonedds_descriptors: !args.no_cyclonedds,
+        cyclonedds_idlc: args.cyclonedds_idlc.clone(),
     })
 }
 
