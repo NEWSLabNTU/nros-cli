@@ -132,6 +132,13 @@ fn generated_package_writes_manifest_build_script_and_main() {
     // is driven each spin via `run_tick_loop` between dispatch.
     assert!(build_rs.contains("static TICK_ENTRIES:"));
     assert!(build_rs.contains("impl nros::ActionExecutor for GenActionExec"));
+    // M-F.4.a — the codegen-side `ClientDispatch` impl ships beside
+    // `GenActionExec` and is wired into the per-instance tick closure as the
+    // third `TickCtx::new` argument (the substrate frozen in nros's
+    // `d15565efe` made `TickCtx::new` 3-arg).
+    assert!(build_rs.contains("impl nros::component::ClientDispatch for GenClientDispatch"));
+    assert!(build_rs.contains("struct GenClientDispatch<"));
+    assert!(build_rs.contains("nros::TickCtx::new("));
     assert!(build_rs.contains("pub fn run_tick_loop("));
     assert!(build_rs.contains("executor.spin_once("));
     assert!(build_rs.contains("as nros::ExecutableComponent>::tick("));
@@ -952,4 +959,45 @@ fn generated_package_wires_lifecycle_when_managed() {
     assert!(build_rs.contains("executor.register_lifecycle_services()?;"));
     assert!(build_rs.contains("nros::LifecycleTransition::Configure"));
     assert!(build_rs.contains("nros::LifecycleTransition::Activate"));
+}
+
+/// Phase 212.M-F.4.a — a rust executable component with a service-client +
+/// action-client entity on a std target emits the `GenClientDispatch` runtime
+/// `ClientDispatch` impl alongside `GenActionExec`, registers the client handles
+/// inline, and feeds them into the per-instance tick closure (the substrate
+/// `TickCtx::new` is now 3-arg). Mirrors the W.5.6 action-server tick path.
+#[test]
+fn generated_service_client_emits_gen_client_dispatch() {
+    let output_dir = generate_fixture(
+        "generated_service_client_emits_gen_client_dispatch",
+        "plan_service_client.json",
+    );
+    let build_rs = fs::read_to_string(output_dir.join("build.rs")).expect("read build.rs");
+
+    // The codegen-side `ClientDispatch` impl + struct are emitted.
+    assert!(build_rs.contains("struct GenClientDispatch<"));
+    assert!(build_rs.contains("impl nros::component::ClientDispatch for GenClientDispatch"));
+    // The service-client handle is registered through the executor (Phase 82
+    // arena-backed raw client). Reply buffer size matches the action-server
+    // path (1024) for symmetry.
+    assert!(build_rs.contains("register_service_client_raw_sized_on::<1024>"));
+    // The action-client handle is registered via the `RawActionClientSpec`
+    // shape — same buffer sizes as `register_action_client_raw`.
+    assert!(build_rs.contains("register_action_client_raw_sized::<1024, 1024, 1024>"));
+    assert!(build_rs.contains("nros::RawActionClientSpec {"));
+    // The per-instance tick closure captures both client arrays + constructs
+    // `GenClientDispatch` over them. Stable entity-id keys (`cli_reset`,
+    // `cli_count`) make the array entries auditable.
+    assert!(build_rs.contains("__tick_sclients_i"));
+    assert!(build_rs.contains("__tick_aclients_i"));
+    // Keys are emitted into the build.rs `GENERATED_TABLES: &str` constant, so
+    // the entity-id literals appear escaped in the host file (`\"cli_reset\"`).
+    assert!(build_rs.contains(r#"\"cli_reset\""#));
+    assert!(build_rs.contains(r#"\"cli_count\""#));
+    // `TickCtx::new` is called with the 3-arg shape (pub resolver, action
+    // executor, client dispatch) — the substrate signature post-M-F.4.
+    assert!(build_rs.contains("nros::TickCtx::new("));
+    // No `unsupported generated callback` — the timer callback dispatch path
+    // still wires up normally.
+    assert!(!build_rs.contains("unsupported generated callback"));
 }
