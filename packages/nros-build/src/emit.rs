@@ -45,7 +45,7 @@ pub fn emit_run_plan(plan: &NrosPlan) -> String {
     out.push('\n');
 
     out.push_str(
-        "pub fn run_plan(\n    runtime: &mut ::nros_platform::RuntimeCtx<'_>,\n) -> ::core::result::Result<(), ::nros_build::RuntimeError> {\n    let _ = runtime; // silence unused-warn on empty plans\n",
+        "pub fn run_plan(\n    runtime: &mut ::nros_platform::RuntimeCtx<'_>,\n) -> ::core::result::Result<(), ::nros_platform::RuntimeError> {\n    let _ = runtime; // silence unused-warn on empty plans\n",
     );
 
     for inst in &plan.instances {
@@ -58,7 +58,7 @@ pub fn emit_run_plan(plan: &NrosPlan) -> String {
         let pkg_label = pkg_label_from(inst);
         let _ = writeln!(
             out,
-            "    ::{pkg_ident}::register(runtime).map_err(|_| ::nros_build::RuntimeError::ComponentRegister({pkg_label:?}))?;"
+            "    ::{pkg_ident}::register(runtime).map_err(|_| ::nros_platform::RuntimeError::ComponentRegister({pkg_label:?}))?;"
         );
     }
 

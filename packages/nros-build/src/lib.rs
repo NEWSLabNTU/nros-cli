@@ -53,28 +53,12 @@ use eyre::{Context, Result};
 
 pub mod emit;
 
-/// Error returned by the generated `run_plan(runtime)` body.
-///
-/// Re-exported so the Entry pkg's `main.rs` can match on it without
-/// adding a separate dep. The variants are deliberately string-typed
-/// to keep the `no_std` surface small — bare-metal Entry pkgs would
-/// otherwise need to pull `thiserror`/`anyhow` to print the error.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum RuntimeError {
-    /// A component's `register(runtime)` call failed. The string
-    /// carries the component pkg name plus the underlying error
-    /// rendered with `{:?}`.
-    ComponentRegister(&'static str),
-}
-
-impl core::fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::ComponentRegister(msg) => write!(f, "component register failed: {msg}"),
-        }
-    }
-}
+// Phase 212.N.7 step-3 — `RuntimeError` moved to `nros-platform` (no_std)
+// so embedded Entry pkgs don't need `nros-build` as a runtime dep
+// (build-dep only). The emitted `run_plan` body references
+// `::nros_platform::RuntimeError`. The previous `nros-build`-side
+// definition is retired; downstream callers expecting it should
+// import from `nros-platform` instead.
 
 /// Options the Entry pkg's `build.rs` can tune before calling
 /// [`generate_run_plan_with`].
