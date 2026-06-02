@@ -1962,9 +1962,15 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
     // and the no_std `tick_{idx}` delegate to (no std-only constructs, so it is
     // shared by both paths).
     if has_shared_instance(plan) || has_no_std_action(plan) {
+        // M-F.4.a — the `executor` slot is `*mut Executor` (not `&mut`) so this
+        // backend can coexist with `GenClientDispatch` (which also needs mutable
+        // executor access) inside the same `TickCtx`. The substrate `TickCtx`
+        // serializes calls between the two `&mut dyn` backends — no reentrant
+        // access — and the tick closure drops both backends together, so the
+        // pointer never outlives the executor borrow.
         out.push_str(
             "struct GenActionExec<'e> {\n    \
-             executor: &'e mut nros::Executor,\n    \
+             executor: *mut nros::Executor,\n    \
              handles: &'e [(&'static str, nros::ActionServerRawHandle)],\n\
              }\n",
         );
@@ -1978,21 +1984,94 @@ fn render_generated_tables(plan: &NrosPlan) -> String {
         out.push_str(
             "    fn complete_goal_raw(&mut self, action_entity: &str, goal_id: &nros::GoalId, status: nros::GoalStatus, result: &[u8]) -> nros::ComponentResult<()> {\n        \
              let handle = self.handle(action_entity)?;\n        \
-             handle.complete_goal_raw(self.executor, goal_id, status, result);\n        \
+             let executor = unsafe { &mut *self.executor };\n        \
+             handle.complete_goal_raw(executor, goal_id, status, result);\n        \
              Ok(())\n    \
              }\n",
         );
         out.push_str(
             "    fn publish_feedback_raw(&mut self, action_entity: &str, goal_id: &nros::GoalId, feedback: &[u8]) -> nros::ComponentResult<()> {\n        \
              let handle = self.handle(action_entity)?;\n        \
-             handle.publish_feedback_raw(self.executor, goal_id, feedback).map_err(|_| nros::ComponentError::Runtime)\n    \
+             let executor = unsafe { &mut *self.executor };\n        \
+             handle.publish_feedback_raw(executor, goal_id, feedback).map_err(|_| nros::ComponentError::Runtime)\n    \
              }\n",
         );
         out.push_str(
             "    fn for_each_active_goal(&self, action_entity: &str, visit: &mut dyn FnMut(&nros::GoalId, nros::GoalStatus)) {\n        \
              if let Ok(handle) = self.handle(action_entity) {\n            \
-             handle.for_each_active_goal(&*self.executor, |g| visit(&g.goal_id, g.status));\n        \
+             let executor = unsafe { &*self.executor };\n            \
+             handle.for_each_active_goal(executor, |g| visit(&g.goal_id, g.status));\n        \
              }\n    \
+             }\n}\n\n",
+        );
+    }
+    // M-F.4.a — `GenClientDispatch` is the runtime `ClientDispatch` the std tick
+    // closures delegate service-client `call_raw` + action-client `send_goal_raw`
+    // to. Mirrors `GenActionExec`: resolves the client handle by source entity id,
+    // drives it through the live executor. Tick-only (clients need `&mut Executor`).
+    //
+    // The substrate `TickCtx::new(pubs, actions, clients)` holds both action +
+    // client backends as `&mut dyn` simultaneously, so they can't both hold
+    // `&mut Executor`. We stash the executor as `*mut Executor` (raw pointer)
+    // shared by reference between the two; each method reborrows it as
+    // `&mut Executor` inside, and the substrate `TickCtx` API serializes calls
+    // (no reentrancy: a `call_raw` runs to completion before `complete_goal_raw`
+    // gets a chance, etc.). Tick closure builds both backends + drops them at
+    // scope end, so the pointer never outlives the executor.
+    if has_shared_instance(plan) {
+        out.push_str(
+            "struct GenClientDispatch<'e> {\n    \
+             executor: *mut nros::Executor,\n    \
+             services: &'e [(&'static str, nros::HandleId)],\n    \
+             actions: &'e [(&'static str, usize)],\n\
+             }\n",
+        );
+        out.push_str("impl GenClientDispatch<'_> {\n");
+        out.push_str(
+            "    fn service(&self, entity: &str) -> nros::ComponentResult<nros::HandleId> {\n        \
+             self.services.iter().find(|(e, _)| *e == entity).map(|(_, h)| *h).ok_or(nros::ComponentError::Runtime)\n    \
+             }\n",
+        );
+        out.push_str(
+            "    fn action_entry(&self, entity: &str) -> nros::ComponentResult<usize> {\n        \
+             self.actions.iter().find(|(e, _)| *e == entity).map(|(_, ei)| *ei).ok_or(nros::ComponentError::Runtime)\n    \
+             }\n}\n",
+        );
+        out.push_str("impl nros::component::ClientDispatch for GenClientDispatch<'_> {\n");
+        // M-F.4.a — service-client `call_raw`: send the request through the
+        // arena's `RmwServiceClient`, then loop `spin_once` + `try_recv_reply_raw`
+        // until the reply lands or we exhaust the iteration cap. Mirrors the
+        // (deprecated) `ServiceClientTrait::call_raw` shape but routes the wait
+        // through the executor so callbacks on other handles keep dispatching.
+        out.push_str(
+            "    fn call_raw(&mut self, service_entity: &str, request_cdr: &[u8], response_buf: &mut [u8]) -> nros::ComponentResult<usize> {\n        \
+             let hid = self.service(service_entity)?;\n        \
+             use nros::ServiceClientTrait;\n        \
+             {\n            \
+             let executor = unsafe { &mut *self.executor };\n            \
+             let entry = unsafe { executor.service_client_entry_mut(hid.0) }.ok_or(nros::ComponentError::Runtime)?;\n            \
+             entry.handle.send_request_raw(request_cdr).map_err(|_| nros::ComponentError::Runtime)?;\n        \
+             }\n        \
+             // Bounded wait — caps total time to keep the tick loop responsive.\n        \
+             for _ in 0..200 {\n            \
+             let executor = unsafe { &mut *self.executor };\n            \
+             executor.spin_once(::core::time::Duration::from_millis(10));\n            \
+             let entry = unsafe { executor.service_client_entry_mut(hid.0) }.ok_or(nros::ComponentError::Runtime)?;\n            \
+             match entry.handle.try_recv_reply_raw(response_buf) {\n                \
+             Ok(Some(len)) => return Ok(len),\n                \
+             Ok(None) => continue,\n                \
+             Err(_) => return Err(nros::ComponentError::Runtime),\n            \
+             }\n        \
+             }\n        \
+             Err(nros::ComponentError::Runtime)\n    \
+             }\n",
+        );
+        out.push_str(
+            "    fn send_goal_raw(&mut self, action_entity: &str, goal_cdr: &[u8]) -> nros::ComponentResult<nros::GoalId> {\n        \
+             let entry_index = self.action_entry(action_entity)?;\n        \
+             let executor = unsafe { &mut *self.executor };\n        \
+             let core = unsafe { executor.action_client_core_mut(entry_index) }.ok_or(nros::ComponentError::Runtime)?;\n        \
+             core.send_goal_raw(goal_cdr).map_err(|_| nros::ComponentError::Runtime)\n    \
              }\n}\n\n",
         );
     }
@@ -2860,6 +2939,46 @@ fn render_callback_registrations(plan: &NrosPlan) -> CallbackRegistrations {
             }
             callback_index += 1;
         }
+        // M-F.4.a — register the instance's service-client + action-client
+        // handles inline (after the callback loop, before the tick entry that
+        // captures them). Only emitted on the std/shared path: clients live on
+        // the executor + need `Rc<RefCell>`-style tick wiring. Each handle gets a
+        // local var keyed by stable client entity id, fed into `GenClientDispatch`
+        // via the `__tick_sclients_i{inst}` / `__tick_aclients_i{inst}` arrays.
+        let mut inst_service_clients: Vec<(String, usize)> = Vec::new();
+        let mut inst_action_clients: Vec<(String, usize)> = Vec::new();
+        if shared_ticks {
+            for (sc_idx, (source_entity, service_name, type_name, type_hash, node_id)) in
+                instance_service_clients(instance).into_iter().enumerate()
+            {
+                out.push(format!(
+                    "    let scnode_i{inst_idx}_{sc_idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                ));
+                out.push(format!(
+                    "    let scnh_i{inst_idx}_{sc_idx} = executor.node_id_by_name(scnode_i{inst_idx}_{sc_idx}.node_name, scnode_i{inst_idx}_{sc_idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                ));
+                out.push(format!(
+                    "    let scli_i{inst_idx}_{sc_idx} = executor.register_service_client_raw_sized_on::<1024>(scnh_i{inst_idx}_{sc_idx}, {service_name:?}, {type_name:?}, {type_hash:?}, nros::QosSettings::services_default(), None, core::ptr::null_mut())?;\n"
+                ));
+                inst_service_clients.push((source_entity, inst_service_clients.len()));
+                // Re-key the local var name so the array can reference it. We use
+                // a stable name pattern `scli_{key}` where key encodes inst+seq.
+            }
+            for (ac_idx, (source_entity, action_name, type_name, type_hash, node_id)) in
+                instance_action_clients(instance).into_iter().enumerate()
+            {
+                out.push(format!(
+                    "    let acnode_i{inst_idx}_{ac_idx} = NODES.iter().find(|node| node.node_id == {node_id:?}).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                ));
+                out.push(format!(
+                    "    let acnh_i{inst_idx}_{ac_idx} = executor.node_id_by_name(acnode_i{inst_idx}_{ac_idx}.node_name, acnode_i{inst_idx}_{ac_idx}.namespace).ok_or(nros::NodeError::InvalidSchedContextBinding)?;\n"
+                ));
+                out.push(format!(
+                    "    let acli_i{inst_idx}_{ac_idx} = executor.register_action_client_raw_sized::<1024, 1024, 1024>(nros::RawActionClientSpec {{ node_id: Some(acnh_i{inst_idx}_{ac_idx}), action_name: {action_name:?}, type_name: {type_name:?}, type_hash: {type_hash:?}, goal_response_callback: None, feedback_callback: None, result_callback: None, context: core::ptr::null_mut() }})?;\n"
+                ));
+                inst_action_clients.push((source_entity, inst_action_clients.len()));
+            }
+        }
         // W.5.6 — register the instance's per-spin tick entry (it shares the same
         // `Rc<RefCell<State>>` the callbacks mutate). Emitted for every shared
         // instance: action components drive feedback/result here, timer/sub-only
@@ -2870,6 +2989,8 @@ fn render_callback_registrations(plan: &NrosPlan) -> CallbackRegistrations {
                 inst_idx,
                 comp_path.as_deref().expect("shared implies rust component"),
                 &inst_actions,
+                &inst_service_clients,
+                &inst_action_clients,
             );
         }
     }
@@ -2880,24 +3001,46 @@ fn render_callback_registrations(plan: &NrosPlan) -> CallbackRegistrations {
     }
 }
 
-/// W.5.6 — push the instance's tick closure into `TICK_ENTRIES`. The closure
-/// shares the instance's `Rc<RefCell<State>>` + resolver, and owns a `[(source
-/// entity id, action handle)]` array so `GenActionExec` can resolve the action a
-/// `tick` body completes/feeds. `run_tick_loop` invokes every entry each spin.
+/// W.5.6 + M-F.4.a — push the instance's tick closure into `TICK_ENTRIES`. The
+/// closure shares the instance's `Rc<RefCell<State>>` + resolver, and owns three
+/// arrays so `GenActionExec` / `GenClientDispatch` can resolve handles by source
+/// entity id: action-server handles (`actions`), service-client handles
+/// (`service_clients`), action-client handles (`action_clients`).
+/// `run_tick_loop` invokes every entry each spin.
 fn emit_tick_entry(
     out: &mut Vec<String>,
     inst: usize,
     comp_path: &str,
     actions: &[(String, usize)],
+    service_clients: &[(String, usize)],
+    action_clients: &[(String, usize)],
 ) {
-    let n = actions.len();
-    let arr = actions
+    let n_act = actions.len();
+    let arr_act = actions
         .iter()
         .map(|(entity, ci)| format!("({entity:?}, action_{ci})"))
         .collect::<Vec<_>>()
         .join(", ");
     out.push(format!(
-        "    let __tick_actions_i{inst}: [(&'static str, nros::ActionServerRawHandle); {n}] = [{arr}];\n"
+        "    let __tick_actions_i{inst}: [(&'static str, nros::ActionServerRawHandle); {n_act}] = [{arr_act}];\n"
+    ));
+    let n_sc = service_clients.len();
+    let arr_sc = service_clients
+        .iter()
+        .map(|(entity, ci)| format!("({entity:?}, scli_i{inst}_{ci})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(format!(
+        "    let __tick_sclients_i{inst}: [(&'static str, nros::HandleId); {n_sc}] = [{arr_sc}];\n"
+    ));
+    let n_ac = action_clients.len();
+    let arr_ac = action_clients
+        .iter()
+        .map(|(entity, ci)| format!("({entity:?}, acli_i{inst}_{ci}.entry_index())"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(format!(
+        "    let __tick_aclients_i{inst}: [(&'static str, usize); {n_ac}] = [{arr_ac}];\n"
     ));
     out.push("    {\n".to_string());
     out.push(format!(
@@ -2910,11 +3053,18 @@ fn emit_tick_entry(
         "        TICK_ENTRIES.with(|__t| __t.borrow_mut().push(::std::boxed::Box::new(move |__executor: &mut nros::Executor| {\n"
             .to_string(),
     );
+    out.push(
+        "            let __exec_ptr: *mut nros::Executor = __executor as *mut nros::Executor;\n"
+            .to_string(),
+    );
     out.push(format!(
-        "            let mut __ae = GenActionExec {{ executor: __executor, handles: &__tick_actions_i{inst} }};\n"
+        "            let mut __ae = GenActionExec {{ executor: __exec_ptr, handles: &__tick_actions_i{inst} }};\n"
     ));
     out.push(format!(
-        "            let mut __tc = nros::TickCtx::new(__rv_i{inst}.as_ref(), &mut __ae);\n"
+        "            let mut __cd = GenClientDispatch {{ executor: __exec_ptr, services: &__tick_sclients_i{inst}, actions: &__tick_aclients_i{inst} }};\n"
+    ));
+    out.push(format!(
+        "            let mut __tc = nros::TickCtx::new(__rv_i{inst}.as_ref(), &mut __ae, &mut __cd);\n"
     ));
     out.push(format!(
         "            <{comp_path} as nros::ExecutableComponent>::tick(&mut *__st_i{inst}.borrow_mut(), &mut __tc);\n"
@@ -2935,6 +3085,67 @@ fn rust_executable_component_path(plan: &NrosPlan, instance: &PlanInstance) -> O
         return None;
     }
     rust_component_type_path(&comp.id)
+}
+
+/// M-F.4.a — every service-client entity declared across an instance's nodes,
+/// as `(entity_id, service_name, type_name, type_hash, owning_node_id)`. These
+/// are the service clients the tick `ClientDispatch::call_raw` can invoke.
+fn instance_service_clients(
+    instance: &PlanInstance,
+) -> Vec<(String, String, String, String, String)> {
+    let mut clients = Vec::new();
+    for node in &instance.nodes {
+        for entity in &node.entities {
+            if let PlanEntity::ServiceClient {
+                source_entity,
+                resolved_name,
+                interface,
+                ..
+            } = entity
+            {
+                // Key on the *source* entity id (`cli_add_two`), not the
+                // plan-prefixed id (`adder_1/cli_add_two`): the component body
+                // invokes via the `EntityId` it declared in `register`.
+                clients.push((
+                    source_entity.clone(),
+                    resolved_name.clone(),
+                    interface_type_name(interface),
+                    interface_type_hash(interface),
+                    node.id.clone(),
+                ));
+            }
+        }
+    }
+    clients
+}
+
+/// M-F.4.a — every action-client entity declared across an instance's nodes,
+/// as `(entity_id, action_name, type_name, type_hash, owning_node_id)`. These
+/// are the action clients the tick `ClientDispatch::send_goal_raw` can invoke.
+fn instance_action_clients(
+    instance: &PlanInstance,
+) -> Vec<(String, String, String, String, String)> {
+    let mut clients = Vec::new();
+    for node in &instance.nodes {
+        for entity in &node.entities {
+            if let PlanEntity::ActionClient {
+                source_entity,
+                resolved_name,
+                interface,
+                ..
+            } = entity
+            {
+                clients.push((
+                    source_entity.clone(),
+                    resolved_name.clone(),
+                    interface_type_name(interface),
+                    interface_type_hash(interface),
+                    node.id.clone(),
+                ));
+            }
+        }
+    }
+    clients
 }
 
 /// W.5.3 — every publisher entity declared across an instance's nodes, as
@@ -3500,14 +3711,24 @@ fn emit_static_action(
          <{comp_path} as nros::ExecutableComponent>::on_callback(&mut actx.state, nros::CallbackId::new({callback_id:?}), &mut cb_ctx);\n    \
          resp\n}}\n"
     ));
-    // per-spin execution tick (W.5.11)
+    // per-spin execution tick (W.5.11). M-F.4.a — no_std path has no client
+    // backend (clients need spin-based call_raw / alloc); use an inline stub
+    // that errors so the substrate's 3-arg `TickCtx::new` is satisfied. A no_std
+    // codegen-side client backend is a follow-up.
     module.push(format!(
         "fn tick_{idx}(executor: &mut nros::Executor) {{\n    \
+         struct __NoStdClients;\n    \
+         impl nros::component::ClientDispatch for __NoStdClients {{\n        \
+         fn call_raw(&mut self, _: &str, _: &[u8], _: &mut [u8]) -> nros::ComponentResult<usize> {{ Err(nros::ComponentError::Runtime) }}\n        \
+         fn send_goal_raw(&mut self, _: &str, _: &[u8]) -> nros::ComponentResult<nros::GoalId> {{ Err(nros::ComponentError::Runtime) }}\n    \
+         }}\n    \
          let actx = match unsafe {{ (*core::ptr::addr_of_mut!(ACT_CTX_{idx})).as_mut() }} {{ Some(s) => s, None => return }};\n    \
          let handle = match unsafe {{ *core::ptr::addr_of!(ACT_HANDLE_{idx}) }} {{ Some(h) => h, None => return }};\n    \
          let __handles: [(&'static str, nros::ActionServerRawHandle); 1] = [({source_entity:?}, handle)];\n    \
-         let mut __ae = GenActionExec {{ executor, handles: &__handles }};\n    \
-         let mut __tc = nros::TickCtx::new(&actx.resolver, &mut __ae);\n    \
+         let __exec_ptr: *mut nros::Executor = executor as *mut nros::Executor;\n    \
+         let mut __ae = GenActionExec {{ executor: __exec_ptr, handles: &__handles }};\n    \
+         let mut __cd = __NoStdClients;\n    \
+         let mut __tc = nros::TickCtx::new(&actx.resolver, &mut __ae, &mut __cd);\n    \
          <{comp_path} as nros::ExecutableComponent>::tick(&mut actx.state, &mut __tc);\n}}\n"
     ));
     // --- inline registration ---
