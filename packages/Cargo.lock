@@ -814,6 +814,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nros-build"
+version = "0.3.7"
+dependencies = [
+ "eyre",
+ "nros-cli-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nros-cli"
 version = "0.3.7"
 dependencies = [
