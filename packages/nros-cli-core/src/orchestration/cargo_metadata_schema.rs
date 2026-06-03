@@ -360,6 +360,12 @@ pub struct SystemHeader {
     /// the resolver falls back to the literal `"system.launch.xml"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_launch: Option<String>,
+    /// Optional default `[deploy.<target>]` block key — picked by
+    /// `nros launch` when the user does not pass `--target`. When absent,
+    /// the launcher falls back to `"native"` if that block exists, else
+    /// the first deploy entry in declaration / sorted order. Phase 212.J.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 /// `[[component]]` row.
@@ -953,8 +959,8 @@ launch = "launch/system.launch.xml"
 framework = "espidf"
 board = "esp32dev"
 "#;
-        let v: SystemToml = toml::from_str(raw)
-            .expect("framework field must parse (F.4 §12 gap #3)");
+        let v: SystemToml =
+            toml::from_str(raw).expect("framework field must parse (F.4 §12 gap #3)");
         let dt = v
             .deploy
             .get("platformio")

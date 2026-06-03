@@ -46,8 +46,10 @@ pub struct Args {
     #[arg(long)]
     pub workspace_root: Option<PathBuf>,
 
-    /// `[deploy.<target>]` to use; defaults to the first deploy entry
-    /// (typically `native`). Empty `[deploy]` is allowed — the launcher
+    /// `[deploy.<target>]` to use. When unset, the launcher picks
+    /// `[system].default_target` (Phase 212.J.2) if present, else falls
+    /// back to `"native"` if that block exists, else the first deploy
+    /// entry in sorted order. Empty `[deploy]` is allowed — the launcher
     /// falls back to baked defaults.
     #[arg(long)]
     pub target: Option<String>,
@@ -234,8 +236,12 @@ fn load_plan(
     let system: SystemToml =
         toml::from_str(&raw).wrap_err_with(|| format!("parse {}", system_toml_path.display()))?;
 
-    // Pick the target: explicit arg, else first entry sorted (BTreeMap keys
-    // are already sorted), else synthesize a "native" default.
+    // Pick the target. Phase 212.J.2 resolution order:
+    //   1. explicit `--target` arg,
+    //   2. `[system].default_target`,
+    //   3. `[deploy.native]` if present,
+    //   4. first deploy entry in sorted order (BTreeMap keys are sorted),
+    //   5. synthesise a `native` self-host default when `[deploy]` is empty.
     let (target_name, target) = match target_arg {
         Some(name) => {
             let t = system.deploy.get(name).ok_or_else(|| {
@@ -251,20 +257,45 @@ fn load_plan(
                 },
             )
         }
-        None => match system.deploy.iter().next() {
-            Some((n, t)) => (
-                n.clone(),
-                DeployTargetView {
-                    kind: t.kind.clone().unwrap_or_default(),
-                },
-            ),
-            None => (
-                "native".to_string(),
-                DeployTargetView {
-                    kind: "self".to_string(),
-                },
-            ),
-        },
+        None => {
+            if let Some(default_name) = system.system.default_target.as_deref() {
+                let t = system.deploy.get(default_name).ok_or_else(|| {
+                    eyre!(
+                        "nros launch: [system].default_target = \"{default_name}\" but no \
+                         matching [deploy.{default_name}] in {}",
+                        system_toml_path.display()
+                    )
+                })?;
+                (
+                    default_name.to_string(),
+                    DeployTargetView {
+                        kind: t.kind.clone().unwrap_or_default(),
+                    },
+                )
+            } else if let Some(t) = system.deploy.get("native") {
+                (
+                    "native".to_string(),
+                    DeployTargetView {
+                        kind: t.kind.clone().unwrap_or_default(),
+                    },
+                )
+            } else {
+                match system.deploy.iter().next() {
+                    Some((n, t)) => (
+                        n.clone(),
+                        DeployTargetView {
+                            kind: t.kind.clone().unwrap_or_default(),
+                        },
+                    ),
+                    None => (
+                        "native".to_string(),
+                        DeployTargetView {
+                            kind: "self".to_string(),
+                        },
+                    ),
+                }
+            }
+        }
     };
     Ok((system, target_name, target))
 }
@@ -974,5 +1005,81 @@ mod tests {
         let enc = encode_params(&p);
         // BTreeMap iteration is sorted.
         assert_eq!(enc, "greeting=hi;rate_hz=10");
+    }
+
+    /// Phase 212.J.2 — write a bringup with multiple deploy blocks (and an
+    /// optional `[system].default_target`). Verifies:
+    ///   * explicit `--target` wins,
+    ///   * absent CLI arg + `default_target` set → that block wins,
+    ///   * absent CLI arg + no `default_target` + `[deploy.native]` present
+    ///     → `native` wins (over alphabetically-earlier siblings).
+    fn write_multi_target_fixture(root: &Path, bringup: &str, default_target: Option<&str>) {
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\nresolver = \"2\"\nmembers = []\n\
+                 [workspace.metadata.nros]\ndefault_system = \"{bringup}\"\n"
+            ),
+        )
+        .unwrap();
+        let dir = root.join(bringup);
+        fs::create_dir_all(dir.join("launch")).unwrap();
+        fs::write(dir.join("package.xml"),
+            "<?xml version=\"1.0\"?><package format=\"3\"><name>bringup</name><version>0.1.0</version></package>").unwrap();
+        let mut sys = String::new();
+        sys.push_str("[system]\nname=\"demo\"\nrmw=\"zenoh\"\ndomain_id=7\n");
+        sys.push_str("locator=\"tcp/127.0.0.1:7450\"\n");
+        if let Some(t) = default_target {
+            sys.push_str(&format!("default_target = \"{t}\"\n"));
+        }
+        sys.push_str("[[component]]\npkg = \"talker_pkg\"\nclass = \"talker_pkg::Talker\"\nname = \"talker_pkg\"\n");
+        // Deliberately list `native` LAST so we know any selection of `native`
+        // is NOT just `BTreeMap.iter().next()` falling out — must be explicit.
+        sys.push_str("[deploy.aaa_first_alpha]\nkind = \"self\"\n");
+        sys.push_str("[deploy.qemu-mps2-an385]\nkind = \"qemu\"\n");
+        sys.push_str("[deploy.native]\nkind = \"self\"\n");
+        fs::write(dir.join("system.toml"), sys).unwrap();
+        fs::write(dir.join("launch/system.launch.xml"), "<launch/>").unwrap();
+    }
+
+    #[test]
+    fn nros_launch_target_picks_deploy_slice() {
+        let root = scratch("target_slice_default");
+        // No [system].default_target → expect `native` chosen over the
+        // alphabetically-earlier `aaa_first_alpha`.
+        write_multi_target_fixture(&root, "demo_bringup", None);
+        let bringup = root.join("demo_bringup");
+        let (_sys, name, _t) = load_plan(&bringup, None).expect("load with no target");
+        assert_eq!(
+            name, "native",
+            "no --target and no default_target should fall back to [deploy.native]"
+        );
+
+        // Explicit --target overrides everything.
+        let (_sys, name, view) =
+            load_plan(&bringup, Some("qemu-mps2-an385")).expect("explicit target");
+        assert_eq!(name, "qemu-mps2-an385");
+        assert_eq!(view.kind, "qemu");
+    }
+
+    #[test]
+    fn nros_launch_target_honours_default_target_field() {
+        let root = scratch("target_slice_default_field");
+        write_multi_target_fixture(&root, "demo_bringup", Some("aaa_first_alpha"));
+        let bringup = root.join("demo_bringup");
+        let (_sys, name, _t) = load_plan(&bringup, None).expect("load");
+        assert_eq!(
+            name, "aaa_first_alpha",
+            "default_target = \"aaa_first_alpha\" should beat the [deploy.native] fallback"
+        );
+    }
+
+    #[test]
+    fn nros_launch_default_target_pointing_at_missing_block_errors() {
+        let root = scratch("target_slice_default_bad");
+        write_multi_target_fixture(&root, "demo_bringup", Some("no_such_block"));
+        let bringup = root.join("demo_bringup");
+        let err = load_plan(&bringup, None).unwrap_err().to_string();
+        assert!(err.contains("no_such_block"), "diagnostic: {err}");
     }
 }

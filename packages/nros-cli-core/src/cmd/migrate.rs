@@ -268,6 +268,7 @@ fn build_plan(ws: &Path, bringup_override: Option<&str>) -> Result<MigrationPlan
         domain_id: legacy.system.domain_id.unwrap_or(0),
         locator: legacy.system.locator,
         default_launch: None,
+        default_target: None,
     };
 
     let mut steps = vec![Step::WriteSystemToml, Step::WriteBringupPackageXml];

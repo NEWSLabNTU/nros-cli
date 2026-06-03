@@ -224,6 +224,7 @@ fn render_system_toml(pkg_name: &str, components: &[String]) -> Result<String> {
             domain_id: 0,
             locator: None,
             default_launch: None,
+            default_target: None,
         },
         components: entries,
         deploy: Default::default(),

@@ -507,6 +507,7 @@ fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry 
         domain_id: first_deploy.domain_id.unwrap_or(0),
         locator: first_deploy.locator.clone(),
         default_launch: None,
+        default_target: None,
     };
 
     // Component rows. The `node` spelling (Phase 212.N.12 rename) is
