@@ -235,6 +235,70 @@ fn is_self_bringup_eligible(pkg_dir: &Path) -> bool {
     has_cargo || has_cmake
 }
 
+/// Phase 212.L.7 strict self-entry detection.
+///
+/// Returns `true` when `<pkg-dir>/Cargo.toml` declares BOTH
+/// `[package.metadata.nros.node]` (or the canonical `.component` alias)
+/// AND `[package.metadata.nros.entry]` — the L.7 single-pkg dev-loop
+/// shape where a Node pkg eats its own Entry role (`cargo run`
+/// convenience).
+///
+/// This is a stricter check than [`is_self_bringup_eligible`] above:
+/// L.6 synthesis accepts any pkg with a Cargo.toml / CMakeLists.txt;
+/// the L.7 self-entry hook only kicks in when both role markers are
+/// present. Callers ([`super::planner`] and `cmd::codegen_system`) use
+/// it to short-circuit launch-file resolution to the L.6 resolver
+/// (real launch.xml file if present, synth XML otherwise) without
+/// requiring a sibling bringup pkg.
+///
+/// Returns `false` (no error) when the Cargo.toml is missing or fails
+/// to parse — the planner/codegen-system fall back to their normal
+/// resolution path in those cases, and the strict parser errors
+/// surface later when the user explicitly invokes the loader. Errors
+/// from this fn would forbid a legitimate dual-purpose pkg from being
+/// passed to `nros plan`.
+pub fn is_self_entry_pkg(pkg_dir: &Path) -> bool {
+    let cargo_toml = pkg_dir.join("Cargo.toml");
+    if !cargo_toml.is_file() {
+        return false;
+    }
+    let raw = match fs::read_to_string(&cargo_toml) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let doc: toml::Value = match toml::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let Some(nros) = doc
+        .get("package")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("nros"))
+    else {
+        return false;
+    };
+    let has_node = nros.get("node").is_some() || nros.get("component").is_some();
+    let has_entry = nros.get("entry").is_some();
+    has_node && has_entry
+}
+
+/// Phase 212.L.7 helper — resolve a launch input for a self-entry
+/// (`[package.metadata.nros.node]` + `[package.metadata.nros.entry]`)
+/// pkg dir using the standard L.6 resolution policy. Thin wrapper
+/// around [`resolve_launch`] that the planner + codegen-system both
+/// share so the L.7 self-entry behaviour is centralised in one place.
+///
+/// Callers MUST check [`is_self_entry_pkg`] first; this fn does not
+/// re-verify the role markers and will happily resolve a launch for
+/// any pkg dir.
+pub fn resolve_self_entry_launch(
+    pkg_dir: &Path,
+    file_arg: Option<&str>,
+    exec_arg: Option<&str>,
+) -> Result<LaunchInput> {
+    resolve_launch(pkg_dir, file_arg, exec_arg)
+}
+
 /// Enumerate `*.launch.xml` files directly under `<pkg>/launch/` (no
 /// recursion). Returns sorted basenames.
 pub fn enumerate_launch_files(pkg_dir: &Path) -> Vec<String> {
@@ -715,5 +779,162 @@ path = "src/b.rs"
         .unwrap();
         let name = discover_pkg_name(&p).unwrap();
         assert_eq!(name, "my_cpp_pkg");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 212.L.7 — strict self-entry detection + planner hook
+    // -----------------------------------------------------------------
+
+    fn write_self_entry_cargo(dir: &Path, pkg: &str, board: &str) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "{pkg}"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "{pkg}"
+path = "src/main.rs"
+
+[package.metadata.nros.node]
+class = "{pkg}::Node"
+name  = "{pkg}"
+
+[package.metadata.nros.entry]
+deploy = "{board}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn is_self_entry_pkg_true_when_both_node_and_entry_present() {
+        let p = temp_pkg("l7-self-entry-true");
+        write_self_entry_cargo(&p, "alpha_pkg", "freertos");
+        assert!(is_self_entry_pkg(&p));
+    }
+
+    #[test]
+    fn is_self_entry_pkg_false_when_only_node_present() {
+        let p = temp_pkg("l7-self-entry-node-only");
+        fs::write(
+            p.join("Cargo.toml"),
+            r#"[package]
+name = "alpha_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.nros.node]
+class = "alpha_pkg::Node"
+name  = "alpha"
+"#,
+        )
+        .unwrap();
+        assert!(!is_self_entry_pkg(&p));
+    }
+
+    #[test]
+    fn is_self_entry_pkg_false_when_only_entry_present() {
+        let p = temp_pkg("l7-self-entry-entry-only");
+        fs::write(
+            p.join("Cargo.toml"),
+            r#"[package]
+name = "alpha_entry"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.nros.entry]
+deploy = "freertos"
+"#,
+        )
+        .unwrap();
+        assert!(!is_self_entry_pkg(&p));
+    }
+
+    #[test]
+    fn is_self_entry_pkg_accepts_deprecated_component_alias() {
+        let p = temp_pkg("l7-self-entry-component-alias");
+        fs::write(
+            p.join("Cargo.toml"),
+            r#"[package]
+name = "alpha_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.nros.component]
+class = "alpha_pkg::Node"
+name  = "alpha"
+
+[package.metadata.nros.entry]
+deploy = "freertos"
+"#,
+        )
+        .unwrap();
+        assert!(
+            is_self_entry_pkg(&p),
+            "deprecated `.component` alias should also activate self-entry"
+        );
+    }
+
+    #[test]
+    fn is_self_entry_pkg_false_when_cargo_toml_missing() {
+        let p = temp_pkg("l7-self-entry-nocargo");
+        // No Cargo.toml at all → false (planner falls back to its
+        // normal Path A bringup resolution).
+        assert!(!is_self_entry_pkg(&p));
+    }
+
+    /// Self-entry pkg w/ no launch dir → resolver synthesises a 1-node
+    /// `<launch>` body in memory (the "1-node plan from Cargo metadata"
+    /// shape per the L.7 spec).
+    #[test]
+    fn nros_plan_self_entry_synthesises_single_node_plan() {
+        let p = temp_pkg("l7-synth-no-launch");
+        write_self_entry_cargo(&p, "alpha_pkg", "freertos");
+        assert!(is_self_entry_pkg(&p));
+        let r = resolve_self_entry_launch(&p, None, None).unwrap();
+        match r {
+            LaunchInput::Synth(body) => {
+                assert!(body.contains("pkg=\"alpha_pkg\""), "body={body}");
+                assert!(body.contains("exec=\"alpha_pkg\""), "body={body}");
+            }
+            other => panic!("expected Synth for self-entry pkg, got {other:?}"),
+        }
+    }
+
+    /// Self-entry pkg with a sibling `launch/<pkg>.launch.xml` → resolver
+    /// picks that file instead of synthesising.
+    #[test]
+    fn nros_plan_self_entry_uses_synth_launch_when_absent() {
+        // Two sub-cases — proves the resolver covers both branches of
+        // the spec ("try real launch file first, synth otherwise").
+
+        // Branch 1: launch file present.
+        let p1 = temp_pkg("l7-real-launch");
+        write_self_entry_cargo(&p1, "alpha_pkg", "freertos");
+        fs::create_dir_all(p1.join("launch")).unwrap();
+        let target = p1.join("launch/alpha_pkg.launch.xml");
+        fs::write(&target, "<launch/>").unwrap();
+        let r1 = resolve_self_entry_launch(&p1, None, None).unwrap();
+        match r1 {
+            LaunchInput::File(path) => assert_eq!(path, target),
+            other => panic!("expected File for present launch, got {other:?}"),
+        }
+
+        // Branch 2: no launch file → synth.
+        let p2 = temp_pkg("l7-synth-launch");
+        write_self_entry_cargo(&p2, "beta_pkg", "freertos");
+        // No launch dir at all.
+        let r2 = resolve_self_entry_launch(&p2, None, None).unwrap();
+        match r2 {
+            LaunchInput::Synth(body) => {
+                assert!(body.contains("pkg=\"beta_pkg\""), "body={body}");
+                assert!(body.contains("exec=\"beta_pkg\""), "body={body}");
+            }
+            other => panic!("expected Synth fallback, got {other:?}"),
+        }
     }
 }

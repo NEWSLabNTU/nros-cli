@@ -8,7 +8,7 @@
 //! one-node `<launch>` body in-memory for self-bringup pkgs.
 
 use crate::orchestration::{
-    launch_synth::resolve_launch,
+    launch_synth::{is_self_entry_pkg, resolve_launch},
     planner::{PlanOptions, plan_system},
 };
 use clap::Args as ClapArgs;
@@ -108,7 +108,23 @@ pub fn run(args: Args) -> Result<()> {
     // can consume — synthesised XML is written to a temp file whose
     // lifetime is tied to `_materialised` and removed when planning
     // returns.
+    //
+    // Phase 212.L.7: when the pkg dir carries BOTH
+    // `[package.metadata.nros.node]` AND `[package.metadata.nros.entry]`
+    // it eats its own Entry role (single-pkg dev loop). The L.6 resolver
+    // covers both branches uniformly — real launch file under
+    // `<dir>/launch/` first, synthesised `<launch><node …/>` body when
+    // absent. We just log when L.7 self-entry mode kicks in so users
+    // see what shape the CLI picked.
     let (resolved_path, _materialised) = if launch_input_path.is_dir() {
+        if is_self_entry_pkg(&launch_input_path) {
+            eprintln!(
+                "nros plan: {} is a self-entry pkg \
+                 ([package.metadata.nros.node] + [package.metadata.nros.entry]); \
+                 resolving launch via L.6 (real launch.xml or synth)",
+                launch_input_path.display()
+            );
+        }
         let input = resolve_launch(
             &launch_input_path,
             args.file.as_deref(),
