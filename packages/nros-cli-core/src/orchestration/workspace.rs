@@ -273,7 +273,13 @@ fn discover_package(root: &Path) -> Result<Package> {
     let package_xml = root.join("package.xml");
     let parsed = PackageXml::parse(&package_xml)
         .wrap_err_with(|| format!("failed to parse {}", package_xml.display()))?;
-    let cargo_component_metadata = discover_cargo_component_metadata(root)?;
+    // Phase 212.M-F.17 fix: the synth artifact's `package` field must match
+    // what `<node pkg="…"/>` in the launch XML references. ROS convention
+    // makes `package.xml` `<name>` the canonical pkg key; Cargo.toml
+    // `[package].name` is often a *crate* name that diverges (e.g.
+    // `talker_pkg` vs `talker_pkg_component`). Drive synthesis from the
+    // package.xml name so `find_source_metadata` matches.
+    let cargo_component_metadata = discover_cargo_component_metadata(root, &parsed.name)?;
     Ok(Package {
         name: parsed.name,
         root: root.to_path_buf(),
@@ -311,7 +317,10 @@ fn discover_package(root: &Path) -> Result<Package> {
 ///
 /// Parse errors are propagated so a malformed `Cargo.toml` surfaces at
 /// discovery time rather than silently dropping the package.
-fn discover_cargo_component_metadata(root: &Path) -> Result<Vec<CargoComponentSummary>> {
+fn discover_cargo_component_metadata(
+    root: &Path,
+    pkg_xml_name: &str,
+) -> Result<Vec<CargoComponentSummary>> {
     let cargo_toml = root.join("Cargo.toml");
     if !cargo_toml.is_file() {
         return Ok(Vec::new());
@@ -323,7 +332,12 @@ fn discover_cargo_component_metadata(root: &Path) -> Result<Vec<CargoComponentSu
     let Some(package) = envelope.package else {
         return Ok(Vec::new());
     };
-    let pkg_name = package.name.clone();
+    // M-F.17 fix: `pkg_name` drives the synthetic artifact's `package`
+    // field which must match what `<node pkg="…"/>` references — that's
+    // the package.xml `<name>`, NOT the Cargo.toml `[package].name`
+    // (which is the crate name, often suffixed `_component` / `_pkg`).
+    let pkg_name = pkg_xml_name.to_string();
+    let _ = package.name; // crate name kept readable for diagnostics if needed
     let Some(metadata) = package.metadata else {
         return Ok(Vec::new());
     };
@@ -409,7 +423,16 @@ fn synthesise_summary(
     // `[[bin]]` rows happens to share the component name, prefer it
     // (the planner expects `executable` to point at the actual binary
     // a build tree drops on disk).
+    // M-F.17 fix: launch XML `<node exec="…"/>` references the component
+    // name (e.g. `talker`), not the cargo pkg / crate name (e.g.
+    // `talker_pkg_component`). When a `[[bin]] name = component_name`
+    // exists, that's the executable — clean Application-pkg case. For a
+    // staticlib Component pkg (no `[[bin]]`), the executable IS the
+    // component name (it's the symbolic identity the launcher resolves;
+    // the actual binary is the Entry pkg that links the component in).
     let executable = if bins.iter().any(|n| n == &component_name) {
+        component_name.clone()
+    } else if bins.is_empty() {
         component_name.clone()
     } else {
         pkg_name.to_string()
@@ -728,8 +751,11 @@ default_namespace = "/demo"
         assert_eq!(summary.package, "talker_pkg");
         // `metadata.name` absent → class basename wins.
         assert_eq!(summary.component, "Talker");
-        // No `[[bin]]` row → executable is the package name.
-        assert_eq!(summary.executable, "talker_pkg");
+        // No `[[bin]]` row → executable is the component name (the
+        // symbolic identity the launch XML `<node exec="…"/>` references).
+        // M-F.17 fix-up: previously fell back to pkg_name which broke
+        // staticlib Component pkgs whose crate name != component name.
+        assert_eq!(summary.executable, "Talker");
         assert_eq!(summary.class.as_deref(), Some("talker_pkg::Talker"));
         assert_eq!(summary.default_namespace.as_deref(), Some("/demo"));
         assert!(summary.manifest_path.ends_with("Cargo.toml"));
@@ -741,7 +767,7 @@ default_namespace = "/demo"
         assert_eq!(value["version"], 1);
         assert_eq!(value["package"], "talker_pkg");
         assert_eq!(value["component"], "Talker");
-        assert_eq!(value["executable"], "talker_pkg");
+        assert_eq!(value["executable"], "Talker");
         assert_eq!(value["language"], "rust");
         assert_eq!(value["class"], "talker_pkg::Talker");
         assert_eq!(value["default_namespace"], "/demo");

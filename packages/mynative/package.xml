@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mynative</name>
+  <version>0.1.0</version>
+  <description>mynative — nano-ros native package</description>
+  <maintainer email="TODO@todo.com">TODO</maintainer>
+  <license>Apache-2.0</license>
+  <depend>std_msgs</depend>
+  <export>
+    <build_type>nros.rust.native</build_type>
+  </export>
+</package>

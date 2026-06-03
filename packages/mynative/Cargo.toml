@@ -1,0 +1,36 @@
+[package]
+name = "mynative"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[[bin]]
+name = "mynative"
+path = "src/main.rs"
+
+[dependencies]
+# nros = { version = "0.1", features = ["std", "rmw-zenoh", "platform-posix", "ros-humble"] }
+
+
+# Phase 204.15 inc 3 — named size/speed profiles so the plain-cargo path honours
+# the same intent as `nros build`'s `[build].optimize` (`cargo build --profile
+# size|speed`), no hand-editing. (panic is left to the target/profile — embedded
+# triples are already abort; host keeps its default.)
+#
+# Phase 204.3 — `opt-level = "s"`, NOT `"z"`: on smoltcp/IP examples `-Oz`'s
+# weaker DCE keeps a non-inlined socket-buffer accessor that defeats opt-3's
+# per-socket dead-buffer elimination (grew `.bss` +24 KB on a measured talker);
+# `"s"` shrinks `.text` *more* and preserves the DCE.
+[profile.size]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.speed]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
