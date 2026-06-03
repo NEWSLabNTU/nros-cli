@@ -819,9 +819,11 @@ version = "0.3.7"
 dependencies = [
  "eyre",
  "nros-cli-core",
+ "quick-xml",
  "serde",
  "serde_json",
  "tempfile",
+ "walkdir",
 ]
 
 [[package]]

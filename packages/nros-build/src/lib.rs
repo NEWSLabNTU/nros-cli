@@ -52,6 +52,11 @@ use std::{
 use eyre::{Context, Result};
 
 pub mod emit;
+// Phase 212.N.10 — language-agnostic workspace pkg-index + `$(find <pkg>)`
+// substitution resolver. Surfaced through this crate so both `nros-build`
+// proc-macro consumers (N.9) and the future cmake fn `nros_entry(...)`
+// share a single implementation.
+pub mod pkg_index;
 
 // Phase 212.N.7 step-3 — `RuntimeError` moved to `nros-platform` (no_std)
 // so embedded Entry pkgs don't need `nros-build` as a runtime dep
