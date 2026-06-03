@@ -299,8 +299,8 @@ fn convert_deploy(
     let target = tbl.get("target")?.as_str()?.to_string();
     Some(
         crate::orchestration::cargo_metadata_schema::DeployTarget {
-            kind,
-            target,
+            kind: Some(kind),
+            target: Some(target),
             launch: tbl.get("launch").and_then(|v| v.as_str()).map(str::to_string),
             board: tbl.get("board").and_then(|v| v.as_str()).map(str::to_string),
         },

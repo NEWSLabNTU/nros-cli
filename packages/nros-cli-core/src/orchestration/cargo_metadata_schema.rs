@@ -292,14 +292,32 @@ pub struct SystemComponentEntry {
 }
 
 /// `[deploy.<target>]` block.
+///
+/// Per the F.4 §12 known-gap #2 resolution (path a — relax parser): both
+/// `kind` and `target` are OPTIONAL. The deploy block is configuration-
+/// by-target — the `<target>` map key (e.g. `native`, `qemu-mps2-an385`,
+/// `threadx-linux`, `platformio`) already names the runner, and the
+/// runner stage derives sensible defaults for `kind` / `target` from
+/// the target name when these fields are absent. Strict
+/// `deny_unknown_fields` is preserved — widening the schema, not
+/// loosening the policy.
+///
+/// `nros check` is the place to surface a heads-up when `kind`/`target`
+/// is absent AND the runner can't synthesise defaults from the target
+/// name; that's a lint, not a parser error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeployTarget {
     /// `"self"`, `"qemu"`, `"flash"`, … — interpreted by the runner stage.
-    pub kind: String,
-    /// Target triple / board id / runner key. The exact semantics depend on
-    /// `kind`.
-    pub target: String,
+    /// Optional (F.4 §12 gap #2): absent ⇒ runner derives from the
+    /// `<target>` map key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Target triple / board id / runner key. The exact semantics depend
+    /// on `kind`. Optional (F.4 §12 gap #2): absent ⇒ runner derives
+    /// from the `<target>` map key + the chosen `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// Optional path (relative to the bringup pkg root) to a
     /// `launch/*.launch.xml` used for this deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,7 +577,7 @@ to = "zenoh:default"
         assert_eq!(v1.components[1].name, "listener");
         assert_eq!(v1.deploy.len(), 2);
         let native = v1.deploy.get("native").expect("native deploy present");
-        assert_eq!(native.kind, "self");
+        assert_eq!(native.kind.as_deref(), Some("self"));
         assert_eq!(native.launch.as_deref(), Some("launch/system.launch.xml"));
         let qemu = v1
             .deploy
@@ -789,6 +807,40 @@ domain_id = 0
 "#;
         let v_min: SystemToml = toml::from_str(raw_minimal).expect("parse minimal");
         assert!(v_min.system.default_launch.is_none());
+    }
+
+    /// `[deploy.<target>]` accepts a block with neither `kind` nor `target`
+    /// — both fields are optional per F.4 §12 known-gap #2 path (a). The
+    /// in-tree `multi_pkg_workspace_threadx` / `multi_pkg_workspace_platformio`
+    /// fixtures carry such blocks; the runner derives sensible defaults
+    /// from the `<target>` map key.
+    #[test]
+    fn accepts_deploy_target_without_kind() {
+        // Mirrors the `multi_pkg_workspace_threadx` fixture shape.
+        let raw = r#"
+[system]
+name = "demo"
+rmw = "zenoh"
+domain_id = 0
+
+[[component]]
+pkg = "talker_pkg"
+class = "talker_pkg::Talker"
+name = "talker"
+
+[deploy.threadx-linux]
+launch = "launch/system.launch.xml"
+"#;
+        let v: SystemToml = toml::from_str(raw)
+            .expect("deploy block without kind/target must parse (F.4 §12 gap #2)");
+        let dt = v
+            .deploy
+            .get("threadx-linux")
+            .expect("threadx-linux deploy present");
+        assert!(dt.kind.is_none(), "kind absent when omitted");
+        assert!(dt.target.is_none(), "target absent when omitted");
+        assert_eq!(dt.launch.as_deref(), Some("launch/system.launch.xml"));
+        assert!(dt.board.is_none());
     }
 
     /// `deny_unknown_fields` on `[system]` catches typos at the bringup

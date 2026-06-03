@@ -550,8 +550,8 @@ fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry 
         deploy.insert(
             target_name.clone(),
             DeployTarget {
-                kind: "self".to_string(),
-                target: target_name.clone(),
+                kind: Some("self".to_string()),
+                target: Some(target_name.clone()),
                 launch: None,
                 board: dt.board.clone(),
             },
@@ -897,7 +897,7 @@ locator = "tcp/127.0.0.1:7447"
             .deploy
             .get("native")
             .expect("native deploy block synthesised");
-        assert_eq!(native.kind, "self");
+        assert_eq!(native.kind.as_deref(), Some("self"));
         assert_eq!(native.board.as_deref(), Some("native_sim/native/64"));
     }
 
@@ -1063,7 +1063,7 @@ name = "alpha"
             .deploy
             .get("native")
             .expect("native deploy present");
-        assert_eq!(native.kind, "self");
+        assert_eq!(native.kind.as_deref(), Some("self"));
 
         // The bringup pkg's ament block is preserved.
         assert_eq!(

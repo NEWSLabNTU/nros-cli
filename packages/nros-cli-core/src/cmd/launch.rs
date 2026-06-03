@@ -247,7 +247,7 @@ fn load_plan(
             (
                 name.to_string(),
                 DeployTargetView {
-                    kind: t.kind.clone(),
+                    kind: t.kind.clone().unwrap_or_default(),
                 },
             )
         }
@@ -255,7 +255,7 @@ fn load_plan(
             Some((n, t)) => (
                 n.clone(),
                 DeployTargetView {
-                    kind: t.kind.clone(),
+                    kind: t.kind.clone().unwrap_or_default(),
                 },
             ),
             None => (
