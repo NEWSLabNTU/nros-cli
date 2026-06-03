@@ -223,6 +223,7 @@ fn render_system_toml(pkg_name: &str, components: &[String]) -> Result<String> {
             rmw: "zenoh".to_string(),
             domain_id: 0,
             locator: None,
+            default_launch: None,
         },
         components: entries,
         deploy: Default::default(),

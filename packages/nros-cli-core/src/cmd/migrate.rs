@@ -251,6 +251,7 @@ fn build_plan(ws: &Path, bringup_override: Option<&str>) -> Result<MigrationPlan
         rmw: legacy.system.rmw.unwrap_or_else(|| "zenoh".into()),
         domain_id: legacy.system.domain_id.unwrap_or(0),
         locator: legacy.system.locator,
+        default_launch: None,
     };
 
     let mut steps = vec![Step::WriteSystemToml, Step::WriteBringupPackageXml];

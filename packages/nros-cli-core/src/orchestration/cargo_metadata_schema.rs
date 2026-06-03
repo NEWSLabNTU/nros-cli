@@ -273,6 +273,13 @@ pub struct SystemHeader {
     /// Optional default locator. Per-deploy blocks can override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<String>,
+    /// Optional default launch filename — RELATIVE to `<bringup>/launch/`
+    /// (per docs/system-toml-schema-v0.1.md §3.1, design-doc §11.3
+    /// 2026-06-03). Names the launch file picked when neither CLI flag nor
+    /// macro arg nor per-deploy `launch` override selects one. When absent,
+    /// the resolver falls back to the literal `"system.launch.xml"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_launch: Option<String>,
 }
 
 /// `[[component]]` row.
@@ -748,6 +755,40 @@ deploy = ["native"]
             err.contains("application") || err.contains("component"),
             "{err}"
         );
+    }
+
+    /// `[system].default_launch` is accepted by `SystemHeader` per
+    /// docs/system-toml-schema-v0.1.md §3.1 (resolves the 2026-06-03 §11.3
+    /// design lock — F.4 §12 known gap #1).
+    #[test]
+    fn parses_system_toml_with_default_launch() {
+        let raw = r#"
+[system]
+name = "demo"
+rmw = "zenoh"
+domain_id = 0
+default_launch = "talker_only.launch.xml"
+
+[[component]]
+pkg = "talker_pkg"
+class = "talker_pkg::TalkerNode"
+name = "talker"
+"#;
+        let v: SystemToml = toml::from_str(raw).expect("parse with default_launch");
+        assert_eq!(
+            v.system.default_launch.as_deref(),
+            Some("talker_only.launch.xml")
+        );
+        // Absence keeps the field None — resolver supplies the literal
+        // "system.launch.xml" fallback.
+        let raw_minimal = r#"
+[system]
+name = "demo"
+rmw = "zenoh"
+domain_id = 0
+"#;
+        let v_min: SystemToml = toml::from_str(raw_minimal).expect("parse minimal");
+        assert!(v_min.system.default_launch.is_none());
     }
 
     /// `deny_unknown_fields` on `[system]` catches typos at the bringup

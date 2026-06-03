@@ -506,6 +506,7 @@ fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry 
             .unwrap_or_else(|| "zenoh".to_string()),
         domain_id: first_deploy.domain_id.unwrap_or(0),
         locator: first_deploy.locator.clone(),
+        default_launch: None,
     };
 
     // Component rows.
