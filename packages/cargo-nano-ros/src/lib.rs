@@ -26,8 +26,6 @@
 //!     verbose: false,
 //!     ros_edition: "humble".to_string(),
 //!     renames: std::collections::HashMap::new(),
-//!     cyclonedds_descriptors: false,
-//!     cyclonedds_idlc: None,
 //! };
 //!
 //! generate_from_package_xml(config).expect("Failed to generate bindings");
@@ -36,7 +34,13 @@
 pub mod ament_installer;
 pub mod cache;
 pub mod config_patcher;
-pub mod cyclonedds_emit;
+// Phase 212.K.7.1 — `cyclonedds_emit` (msg-crate-side cyclonedds
+// feature + descriptor build.rs) is retired. Generated msg crates are
+// RMW-agnostic; cyclonedds type registration happens at runtime
+// inside `nros-rmw-cyclonedds` via the `nros-serdes` schema API
+// (K.7.3) + descriptor builder (K.7.4). The standalone
+// `nros codegen cyclonedds-descriptors` verb (K.4) still emits
+// host-side descriptor C and lives in `nros-cli-core`.
 pub mod dependency_parser;
 pub mod package_discovery;
 pub mod package_xml;
@@ -103,17 +107,6 @@ pub struct GenerateConfig {
     /// and Cargo.toml dependency names. Used by nano-ros to generate
     /// `nros-rcl-interfaces` instead of `rcl_interfaces`.
     pub renames: std::collections::HashMap<String, String>,
-    /// Phase 212.K — emit Cyclone DDS descriptor C alongside each
-    /// generated message crate so consumers get the Zenoh-shaped
-    /// `<pkg>/cyclonedds` Cargo feature with no per-example `build.rs`.
-    ///
-    /// `None`/`Some(false)` → skip the emit entirely (no warning).
-    /// `Some(true)` → try to resolve a host `idlc` and emit; warn if
-    /// none is found and leave the generated crates untouched.
-    pub cyclonedds_descriptors: bool,
-    /// Override the resolved `idlc` path (precedence over
-    /// `NROS_CYCLONEDDS_IDLC` / `build/cyclonedds/bin/idlc` / `PATH`).
-    pub cyclonedds_idlc: Option<PathBuf>,
 }
 
 /// Configuration for binding generation (single package)
@@ -261,15 +254,13 @@ pub fn generate_from_package_xml(config: GenerateConfig) -> Result<()> {
             pkg_name, result.message_count, result.service_count, result.action_count
         );
 
-        // Phase 212.K — Cyclone descriptors emit (opt-in).
-        if config.cyclonedds_descriptors {
-            maybe_emit_cyclonedds(
-                package,
-                &pkg_output,
-                config.cyclonedds_idlc.as_deref(),
-                config.verbose,
-            )?;
-        }
+        // Phase 212.K.7.1 — msg crates are RMW-agnostic. The K.4
+        // per-msg-crate cyclonedds descriptor emit (+ Cargo `cyclonedds`
+        // feature + build.rs) was removed; cyclonedds type registration
+        // now happens at runtime inside `nros-rmw-cyclonedds` via the
+        // `nros-serdes` schema API (K.7.3) + descriptor builder
+        // (K.7.4). The standalone `nros codegen cyclonedds-descriptors`
+        // verb still emits host-side descriptor C for app-side use.
 
         generated_packages.push(pkg_name.clone());
     }
@@ -296,40 +287,6 @@ pub fn generate_from_package_xml(config: GenerateConfig) -> Result<()> {
         config.output_dir.display()
     );
 
-    Ok(())
-}
-
-/// Phase 212.K — try to drive the cyclonedds descriptor emit for a
-/// single generated message crate. If no host `idlc` can be resolved,
-/// print a one-line note + continue (the consumer can still build
-/// every non-cyclonedds RMW variant; enabling the `cyclonedds`
-/// feature against an un-descriptor'd crate fails at compile time
-/// because the gated `build.rs` references a missing
-/// `DEP_DDSC_INCLUDE`).
-fn maybe_emit_cyclonedds(
-    package: &Package,
-    package_output: &Path,
-    idlc_override: Option<&Path>,
-    verbose: bool,
-) -> Result<()> {
-    let Some(idlc) = cyclonedds_emit::resolve_idlc(idlc_override) else {
-        if verbose {
-            println!(
-                "  · cyclonedds descriptors skipped for {}: no host `idlc` \
-                 (looked for --cyclonedds-idlc, $NROS_CYCLONEDDS_IDLC, \
-                 build/cyclonedds/bin/idlc, and `which idlc`)",
-                package.name
-            );
-        }
-        return Ok(());
-    };
-    let outcome = cyclonedds_emit::emit_for_package(package, package_output, &idlc, verbose)?;
-    if outcome.feature_emitted {
-        cyclonedds_emit::patch_cargo_toml_with_cyclonedds_feature(
-            &package_output.join("Cargo.toml"),
-            &package.name,
-        )?;
-    }
     Ok(())
 }
 

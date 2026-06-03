@@ -451,6 +451,14 @@ mod tests {
         assert!(!cargo_toml.contains("rosidl_runtime_rs"));
         // Should NOT have standalone workspace declaration (to avoid conflicts)
         assert!(!cargo_toml.contains("[workspace]"));
+        // Phase 212.K.7.1 — generated msg crates are RMW-agnostic.
+        // No `cyclonedds` Cargo feature, no `cyclonedds-sys` dep, no
+        // `<other>/cyclonedds` feature ref, no `links = "*_cyclonedds_*"`.
+        assert!(
+            !cargo_toml.contains("cyclonedds"),
+            "generated Cargo.toml leaked a cyclonedds reference (msg crates \
+             must be RMW-agnostic — see Phase 212.K.7.1):\n{cargo_toml}"
+        );
     }
 
     #[test]

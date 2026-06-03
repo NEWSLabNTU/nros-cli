@@ -66,19 +66,16 @@ pub struct Args {
     #[arg(long, value_parser = parse_rename)]
     pub rename: Vec<(String, String)>,
 
-    /// Phase 212.K — skip the Cyclone DDS descriptor emit. By default
-    /// `nros generate-rust` tries to emit Cyclone descriptor C
-    /// alongside each generated message crate so consumers get the
-    /// Zenoh-style `<pkg>/cyclonedds` feature with no per-example
-    /// `build.rs`. Pass `--no-cyclonedds` to skip even when a host
-    /// `idlc` is available.
-    #[arg(long)]
+    /// Phase 212.K.7.1 (deprecated, no-op) — accepted for backwards
+    /// compatibility with K.5 invocation sites. Generated msg crates
+    /// are now RMW-agnostic; the `<pkg>/cyclonedds` Cargo feature is
+    /// no longer emitted. Use `nros codegen cyclonedds-descriptors`
+    /// for host-side descriptor C emit.
+    #[arg(long, hide = true)]
     pub no_cyclonedds: bool,
 
-    /// Override the host `idlc` path. Defaults to
-    /// `$NROS_CYCLONEDDS_IDLC`, then `<cwd>/build/cyclonedds/bin/idlc`,
-    /// then `which idlc`. No-op under `--no-cyclonedds`.
-    #[arg(long)]
+    /// Phase 212.K.7.1 (deprecated, no-op) — see `--no-cyclonedds`.
+    #[arg(long, hide = true)]
     pub cyclonedds_idlc: Option<PathBuf>,
 }
 
@@ -120,13 +117,12 @@ pub struct RustArgs {
     #[arg(long, value_parser = parse_rename)]
     pub rename: Vec<(String, String)>,
 
-    /// Phase 212.K — skip the Cyclone DDS descriptor emit. See `Args`
-    /// for default behaviour.
-    #[arg(long)]
+    /// Phase 212.K.7.1 (deprecated, no-op) — see `Args::no_cyclonedds`.
+    #[arg(long, hide = true)]
     pub no_cyclonedds: bool,
 
-    /// Override the host `idlc` path. See `Args`.
-    #[arg(long)]
+    /// Phase 212.K.7.1 (deprecated, no-op) — see `Args::cyclonedds_idlc`.
+    #[arg(long, hide = true)]
     pub cyclonedds_idlc: Option<PathBuf>,
 }
 
@@ -149,6 +145,11 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 pub fn run_rust(args: RustArgs) -> Result<()> {
+    // Phase 212.K.7.1 — `--no-cyclonedds` / `--cyclonedds-idlc` are
+    // accepted-but-no-op flags; the per-msg-crate cyclonedds emit has
+    // been removed. Drain the values so unused-warning silence isn't
+    // load-bearing.
+    let _ = (args.no_cyclonedds, args.cyclonedds_idlc);
     generate_rust_from_config(GenerateConfig {
         manifest_path: args.manifest,
         output_dir: args.output,
@@ -159,12 +160,12 @@ pub fn run_rust(args: RustArgs) -> Result<()> {
         verbose: args.verbose,
         ros_edition: args.ros_edition,
         renames: args.rename.into_iter().collect(),
-        cyclonedds_descriptors: !args.no_cyclonedds,
-        cyclonedds_idlc: args.cyclonedds_idlc,
     })
 }
 
 fn generate_rust(args: &Args) -> Result<()> {
+    // Phase 212.K.7.1 — see `run_rust`.
+    let _ = (args.no_cyclonedds, &args.cyclonedds_idlc);
     generate_rust_from_config(GenerateConfig {
         manifest_path: args.manifest.clone(),
         output_dir: args.output.clone(),
@@ -175,8 +176,6 @@ fn generate_rust(args: &Args) -> Result<()> {
         verbose: args.verbose,
         ros_edition: args.ros_edition.clone(),
         renames: args.rename.clone().into_iter().collect::<HashMap<_, _>>(),
-        cyclonedds_descriptors: !args.no_cyclonedds,
-        cyclonedds_idlc: args.cyclonedds_idlc.clone(),
     })
 }
 
