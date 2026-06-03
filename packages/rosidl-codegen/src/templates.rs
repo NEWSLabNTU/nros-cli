@@ -196,6 +196,14 @@ pub struct MessageNrosTemplate<'a> {
     pub has_large_array: bool,
     /// When true, uses nros_core:: prefixed imports instead of direct use statements
     pub inline_mode: bool,
+    /// Pre-rendered `::nros_serdes::NestedType` / `FieldType` helper `pub const`
+    /// items hoisted to module scope so recursive variants
+    /// (`FieldType::Array(_, &FT_X)`) can reference `'static` addresses.
+    pub schema_helper_consts: String,
+    /// Pre-rendered body of `<Msg as ::nros_serdes::Message>::FIELDS`.
+    pub schema_fields_block: String,
+    /// `package/msg/MessageName` form for `Message::TYPE_NAME`.
+    pub schema_type_name: String,
 }
 
 #[derive(Template)]

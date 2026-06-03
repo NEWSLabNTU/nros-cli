@@ -167,3 +167,16 @@ impl RosMessage for {{ message_name }} {
     const TYPE_NAME: &'static str = "{{ package_name }}::msg::dds_::{{ message_name }}_";
     const TYPE_HASH: &'static str = "{{ type_hash }}";
 }
+
+// ── nros_serdes::Message — runtime field schema ─────────────────────────────
+// Consumed by RMW backends that build wire-type descriptors at runtime
+// (Cyclone DDS dynamic types, …) without per-RMW codegen at compile time.
+
+{{ schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ message_name }} {
+    const TYPE_NAME: &'static str = "{{ schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ schema_fields_block -}}
+    ];
+}

@@ -1,6 +1,6 @@
 use super::common::{
-    GeneratorError, build_c_field, determine_field_kind, field_to_nros_field,
-    field_to_nros_field_with_mode,
+    GeneratorError, build_c_field, build_nros_message_schema, determine_field_kind,
+    field_to_nros_field, field_to_nros_field_with_mode,
 };
 use crate::{
     templates::{
@@ -209,6 +209,7 @@ pub fn generate_nros_message_package(
 
     let has_fields = !fields.is_empty();
     let has_large_array = fields.iter().any(|f| f.is_large_array);
+    let schema = build_nros_message_schema(package_name, message_name, &message.fields);
     let message_template = MessageNrosTemplate {
         package_name,
         message_name,
@@ -218,6 +219,9 @@ pub fn generate_nros_message_package(
         has_fields,
         has_large_array,
         inline_mode: false,
+        schema_helper_consts: schema.helper_consts,
+        schema_fields_block: schema.fields_block,
+        schema_type_name: schema.nros_type_name,
     };
     let message_rs = message_template.render()?;
 
@@ -259,6 +263,7 @@ pub fn generate_nros_inline_message(
     let type_hash = edition.type_hash();
     let has_fields = !fields.is_empty();
     let has_large_array = fields.iter().any(|f| f.is_large_array);
+    let schema = build_nros_message_schema(package_name, message_name, &message.fields);
 
     let template = MessageNrosTemplate {
         package_name,
@@ -269,6 +274,9 @@ pub fn generate_nros_inline_message(
         has_fields,
         has_large_array,
         inline_mode: true,
+        schema_helper_consts: schema.helper_consts,
+        schema_fields_block: schema.fields_block,
+        schema_type_name: schema.nros_type_name,
     };
 
     Ok(template.render()?)
