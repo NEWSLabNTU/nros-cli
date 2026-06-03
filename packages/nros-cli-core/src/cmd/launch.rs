@@ -64,7 +64,7 @@ pub struct Args {
     #[arg(long, conflicts_with_all = ["detach", "stop"])]
     pub foreground: bool,
 
-    /// Detach mode: write `<ws>/target/nros/<bringup>.pid` and return
+    /// Detach mode: write `<ws>/.nros/launch/<bringup>.pids` and return
     /// immediately. The user later runs `nros launch --stop <pidfile>`.
     #[arg(long, conflicts_with_all = ["foreground", "stop"])]
     pub detach: bool,
@@ -481,10 +481,32 @@ fn spawn_foreground(commands: &[PreparedCommand]) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Propagate SIGTERM, then wait.
+    // Phase 212.J.3 — Propagate SIGTERM, wait up to GRACE_PERIOD for clean
+    // shutdown, then escalate to SIGKILL for stragglers.
+    const GRACE_PERIOD: Duration = Duration::from_secs(5);
     let mut guard = children.lock().unwrap();
     for child in guard.iter_mut() {
         send_sigterm(child.id() as i32);
+    }
+    let deadline = std::time::Instant::now() + GRACE_PERIOD;
+    loop {
+        let mut all_done = true;
+        for child in guard.iter_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => all_done = false,
+            }
+        }
+        if all_done || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Escalate: SIGKILL anything still alive, then reap.
+    for child in guard.iter_mut() {
+        if matches!(child.try_wait(), Ok(None)) {
+            send_sigkill(child.id() as i32);
+        }
     }
     for child in guard.iter_mut() {
         let _ = child.wait();
@@ -544,6 +566,16 @@ fn send_sigterm(pid: i32) {
 #[cfg(not(unix))]
 fn send_sigterm(_pid: i32) {}
 
+#[cfg(unix)]
+fn send_sigkill(pid: i32) {
+    unsafe {
+        let _ = libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn send_sigkill(_pid: i32) {}
+
 // ---------------------------------------------------------------------------
 // Detach spawn — write PID file, return immediately.
 // ---------------------------------------------------------------------------
@@ -581,10 +613,12 @@ fn pidfile_path(workspace_root: &Path, bringup_dir: &Path) -> PathBuf {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("bringup");
+    // Phase 212.J.3 — `.nros/launch/<bringup>.pids` (NOT under `target/`,
+    // which `cargo clean` blasts away mid-run).
     workspace_root
-        .join("target")
-        .join("nros")
-        .join(format!("{stem}.pid"))
+        .join(".nros")
+        .join("launch")
+        .join(format!("{stem}.pids"))
 }
 
 /// Pidfile shape: one PID per line. First line is the launcher's own PID
@@ -622,6 +656,14 @@ fn stop_pidfile(pidfile: &Path) -> Result<()> {
     for pid in pids {
         send_sigterm(pid);
         eprintln!("nros launch: sent SIGTERM to {pid}");
+    }
+    // Phase 212.J.3.b — drop the pidfile so a second `--stop` doesn't
+    // try to re-signal stale PIDs (the OS may have recycled them).
+    if let Err(e) = fs::remove_file(pidfile) {
+        eprintln!(
+            "nros launch: warning: failed to remove {}: {e}",
+            pidfile.display()
+        );
     }
     Ok(())
 }
@@ -822,7 +864,7 @@ mod tests {
         };
         run(args).expect("detach run");
 
-        let pidfile = root.join("target/nros/demo_bringup.pid");
+        let pidfile = root.join(".nros/launch/demo_bringup.pids");
         assert!(
             pidfile.is_file(),
             "pidfile not written: {}",
