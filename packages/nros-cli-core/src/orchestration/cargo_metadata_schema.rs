@@ -29,18 +29,37 @@ use super::schema::RemapRule;
 ///
 /// Thin pointer (see `docs/design/multi-node-workspace-layout.md` §5). The
 /// authoritative system spec lives in `<bringup>/system.toml`; this table
-/// only disambiguates which bringup the workspace defaults to.
+/// only disambiguates which bringup the workspace defaults to plus a small
+/// set of rarely-used workspace-wide overrides.
+///
+/// Per the Phase 212.L.7 redesign, `default_system` may name EITHER a
+/// bringup package (`<system>_bringup`) OR a Node/Entry pkg that eats its
+/// own Entry role (single-pkg `cargo run` dev loop). The launcher walks
+/// the workspace and resolves the pointer against either category.
+///
+/// All fields are optional; an absent `[workspace.metadata.nros]` table
+/// parses as `WorkspaceMetadataNros::default()`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadataNros {
-    /// Bringup package name (`<system>_bringup`). `cargo nros plan` with no
-    /// args resolves the system via this pointer.
+    /// Bringup package name (`<system>_bringup`) OR Entry pkg name
+    /// (Phase 212.L.7 self-entry shape). `nros plan` / `nros launch` /
+    /// `nros codegen-system` with no `--bringup` hint resolves the
+    /// system via this pointer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_system: Option<String>,
     /// Optional workspace-wide RMW override — rare, intended for
-    /// `nros plan --override` workflows.
+    /// `nros plan --override` workflows. Values are `"zenoh"` /
+    /// `"xrce"` / `"cyclonedds"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rmw_override: Option<String>,
+    /// Optional workspace-wide `ROS_DOMAIN_ID` override. When present,
+    /// `nros plan` / `nros codegen-system` propagate it into the
+    /// generated `system_config.h` instead of the per-deploy /
+    /// `[system].domain_id` value. Rare — used for one-off bring-ups
+    /// against a shared ROS 2 graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id_override: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,18 +317,71 @@ pub type RemapEntry = RemapRule;
 /// `[package.metadata.ament]` — the source of truth for `nros emit
 /// package-xml` (Phase 212.G). Mirrors ament/colcon's `package.xml`
 /// vocabulary 1-to-1.
+///
+/// Vocabulary (Phase 212.B.4):
+///
+/// * `description` / `license` — passthrough to `<description>` /
+///   `<license>` in the emitted `package.xml`. When absent the emitter
+///   falls back to a synthesised description + `"Apache-2.0"`.
+/// * `maintainer = { name, email }` — populates the single
+///   `<maintainer email="…">…</maintainer>` row. Multiple maintainers
+///   are not modelled yet — ROS allows several `<maintainer>` rows,
+///   but every in-tree fixture authors at most one.
+/// * `build_depend` / `exec_depend` / `test_depend` /
+///   `buildtool_depend` — each row emits a corresponding `<*_depend>`
+///   entry. Sorted + deduped at emit time so list ordering doesn't
+///   drift between edits.
+/// * `build_type` — `<export><build_type>…</build_type></export>`.
+///   Defaults differ between component pkgs (`ament_cargo`) and
+///   bringup pkgs (`ament_cmake`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageMetadataAment {
+    /// `<description>` body. Absent → emitter synthesises a generic
+    /// "`nano-ros component package <name>`" line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `<license>` body (SPDX identifier). Absent → `"Apache-2.0"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// `<maintainer email="…">name</maintainer>` row. Absent →
+    /// emitter falls back to a placeholder `Developer <dev@example.com>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintainer: Option<AmentMaintainer>,
+    /// `<build_depend>` rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build_depend: Vec<String>,
+    /// `<buildtool_depend>` rows (e.g. `"ament_cargo"`, `"ament_cmake"`).
+    /// Phase 212.B.4: explicit dependency category so users opting in
+    /// to colcon interop can author `buildtool_depend = ["ament_cmake"]`
+    /// without polluting `<build_depend>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buildtool_depend: Vec<String>,
+    /// `<exec_depend>` rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exec_depend: Vec<String>,
+    /// `<test_depend>` rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_depend: Vec<String>,
-    /// e.g. `"ament_cargo"`, `"ament_cmake"`, `"ament_nros"`.
+    /// `<export><build_type>…</build_type></export>` body. Component
+    /// pkgs default to `"ament_cargo"`; bringup pkgs default to
+    /// `"ament_cmake"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_type: Option<String>,
+}
+
+/// `maintainer = { name = "…", email = "…" }` — Phase 212.B.4.
+///
+/// Modelled as a strict struct so a stray `affiliation = "…"` or
+/// `github = "…"` typo surfaces as `unknown field` at parse time.
+/// Both `name` and `email` are mandatory when the table is present;
+/// `package.xml` requires the email attribute and a non-empty body,
+/// so we mirror that policy verbatim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmentMaintainer {
+    pub name: String,
+    pub email: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +662,93 @@ not_a_field = 42
         );
     }
 
-    /// `[package.metadata.ament]` round-trip.
+    /// Phase 212.B.4 — extended `[package.metadata.ament]` carries
+    /// `description` / `maintainer = { name, email }` / `license` /
+    /// `buildtool_depend` alongside the dependency lists.
+    #[test]
+    fn parses_ament_metadata_basic() {
+        let raw = r#"
+description = "A talker that publishes std_msgs/String at 10 Hz."
+license = "Apache-2.0"
+maintainer = { name = "Ada Lovelace", email = "ada@example.com" }
+buildtool_depend = ["ament_cargo"]
+exec_depend = ["std_msgs", "rcl_interfaces"]
+build_depend = ["std_msgs"]
+test_depend = []
+"#;
+        let v: PackageMetadataAment = toml::from_str(raw).expect("parse");
+        assert_eq!(
+            v.description.as_deref(),
+            Some("A talker that publishes std_msgs/String at 10 Hz.")
+        );
+        assert_eq!(v.license.as_deref(), Some("Apache-2.0"));
+        let m = v.maintainer.as_ref().expect("maintainer present");
+        assert_eq!(m.name, "Ada Lovelace");
+        assert_eq!(m.email, "ada@example.com");
+        assert_eq!(v.buildtool_depend, vec!["ament_cargo"]);
+        assert_eq!(v.exec_depend, vec!["std_msgs", "rcl_interfaces"]);
+        assert_eq!(v.build_depend, vec!["std_msgs"]);
+        assert!(v.test_depend.is_empty());
+
+        // Round-trip cleanly.
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: PackageMetadataAment = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
+    }
+
+    /// `deny_unknown_fields` rejects typos on the extended ament table.
+    #[test]
+    fn rejects_unknown_field_in_ament_metadata() {
+        let raw = r#"
+description = "x"
+license = "Apache-2.0"
+not_a_field = true
+"#;
+        let err = toml::from_str::<PackageMetadataAment>(raw)
+            .expect_err("unknown field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not_a_field") || msg.contains("unknown field"),
+            "diagnostic: {msg}"
+        );
+    }
+
+    /// `maintainer = { name, email }` is strict: a stray
+    /// `affiliation = …` field fails at parse time.
+    #[test]
+    fn rejects_unknown_field_in_ament_maintainer() {
+        let raw = r#"
+maintainer = { name = "Ada", email = "a@b.c", affiliation = "ACME" }
+"#;
+        let err = toml::from_str::<PackageMetadataAment>(raw)
+            .expect_err("unknown field on maintainer must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("affiliation") || msg.contains("unknown field"),
+            "diagnostic: {msg}"
+        );
+    }
+
+    /// Phase 212.L.7 — `[workspace.metadata.nros] default_system = "..."`
+    /// + `rmw_override` + `domain_id_override` round-trips.
+    #[test]
+    fn loads_workspace_metadata_default_system() {
+        let raw = r#"
+default_system = "demo_bringup"
+rmw_override = "cyclonedds"
+domain_id_override = 7
+"#;
+        let v: WorkspaceMetadataNros = toml::from_str(raw).expect("parse");
+        assert_eq!(v.default_system.as_deref(), Some("demo_bringup"));
+        assert_eq!(v.rmw_override.as_deref(), Some("cyclonedds"));
+        assert_eq!(v.domain_id_override, Some(7));
+
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: WorkspaceMetadataNros = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
+    }
+
+    /// `[package.metadata.ament]` round-trip (legacy fields only).
     #[test]
     fn ament_metadata_round_trip() {
         let raw = r#"

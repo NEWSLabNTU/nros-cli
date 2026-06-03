@@ -40,8 +40,9 @@ use std::path::{Path, PathBuf};
 use eyre::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::orchestration::ament::parse_ament_metadata;
 use crate::orchestration::cargo_metadata_schema::{
-    PackageMetadataAment, PackageMetadataNros, SystemComponentEntry, SystemToml,
+    AmentMaintainer, PackageMetadataAment, PackageMetadataNros, SystemComponentEntry, SystemToml,
 };
 
 /// Sentinel header injected at the top of every emitted `package.xml`.
@@ -149,29 +150,47 @@ fn render_component(cargo_toml: &Path) -> Result<String> {
         .package
         .version
         .unwrap_or_else(|| DEFAULT_VERSION.into());
-    let description = manifest
-        .package
+    // Phase 212.B.4 — `[package.metadata.ament]` is the source of
+    // truth for description / license / maintainer. Cargo's
+    // `[package].description` / `[package].license` are kept as
+    // fallbacks (most users author them anyway); the synthesised
+    // default lands only when neither is present.
+    let description = ament
         .description
+        .clone()
+        .or(manifest.package.description)
         .unwrap_or_else(|| format!("nano-ros component package {pkg_name}"));
-    let license = manifest
-        .package
+    let license = ament
         .license
+        .clone()
+        .or(manifest.package.license)
         .unwrap_or_else(|| DEFAULT_LICENSE.into());
     let build_type = ament
         .build_type
         .clone()
         .unwrap_or_else(|| DEFAULT_BUILD_TYPE_COMPONENT.into());
+    let maintainer = ament.maintainer.clone();
 
     Ok(render_xml(RenderInputs {
         pkg_name: &pkg_name,
         version: &version,
         description: &description,
         license: &license,
+        maintainer: maintainer.as_ref(),
         build_depend: sorted_unique(&ament.build_depend),
+        buildtool_depend: sorted_unique(&ament.buildtool_depend),
         exec_depend: sorted_unique(&ament.exec_depend),
         test_depend: sorted_unique(&ament.test_depend),
         build_type: &build_type,
     }))
+}
+
+/// Phase 212.B.4 — convenience helper for callers that already have a
+/// pkg dir and want the parsed `[package.metadata.ament]` table
+/// without re-reading the manifest. Delegates to
+/// [`crate::orchestration::ament::parse_ament_metadata`].
+pub fn parse_pkg_ament_metadata(pkg_dir: &Path) -> Result<PackageMetadataAment> {
+    parse_ament_metadata(pkg_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +231,9 @@ fn render_bringup(system_toml: &Path) -> Result<String> {
         version: DEFAULT_VERSION,
         description: &description,
         license: DEFAULT_LICENSE,
+        maintainer: None,
         build_depend: Vec::new(),
+        buildtool_depend: Vec::new(),
         exec_depend,
         test_depend: Vec::new(),
         build_type: DEFAULT_BUILD_TYPE_BRINGUP,
@@ -232,7 +253,12 @@ struct RenderInputs<'a> {
     version: &'a str,
     description: &'a str,
     license: &'a str,
+    /// Phase 212.B.4 — when present, replaces the default
+    /// `Developer <dev@example.com>` placeholder maintainer.
+    maintainer: Option<&'a AmentMaintainer>,
     build_depend: Vec<String>,
+    /// Phase 212.B.4 — explicit `<buildtool_depend>` rows.
+    buildtool_depend: Vec<String>,
     exec_depend: Vec<String>,
     test_depend: Vec<String>,
     build_type: &'a str,
@@ -247,9 +273,15 @@ fn render_xml(inp: RenderInputs<'_>) -> String {
     push_text_elem(&mut out, "name", inp.pkg_name, 2);
     push_text_elem(&mut out, "version", inp.version, 2);
     push_text_elem(&mut out, "description", inp.description, 2);
-    push_maintainer(&mut out, 2);
+    push_maintainer(&mut out, 2, inp.maintainer);
     push_text_elem(&mut out, "license", inp.license, 2);
 
+    if !inp.buildtool_depend.is_empty() {
+        out.push('\n');
+        for d in &inp.buildtool_depend {
+            push_text_elem(&mut out, "buildtool_depend", d, 2);
+        }
+    }
     if !inp.build_depend.is_empty() {
         out.push('\n');
         for d in &inp.build_depend {
@@ -277,14 +309,18 @@ fn render_xml(inp: RenderInputs<'_>) -> String {
     out
 }
 
-fn push_maintainer(out: &mut String, indent: usize) {
+fn push_maintainer(out: &mut String, indent: usize, m: Option<&AmentMaintainer>) {
     for _ in 0..indent {
         out.push(' ');
     }
+    let (name, email) = match m {
+        Some(m) => (m.name.as_str(), m.email.as_str()),
+        None => (DEFAULT_MAINTAINER_NAME, DEFAULT_MAINTAINER_EMAIL),
+    };
     out.push_str("<maintainer email=\"");
-    push_attr_escaped(out, DEFAULT_MAINTAINER_EMAIL);
+    push_attr_escaped(out, email);
     out.push_str("\">");
-    push_text_escaped(out, DEFAULT_MAINTAINER_NAME);
+    push_text_escaped(out, name);
     out.push_str("</maintainer>\n");
 }
 
