@@ -57,6 +57,10 @@ pub mod emit;
 // proc-macro consumers (N.9) and the future cmake fn `nros_entry(...)`
 // share a single implementation.
 pub mod pkg_index;
+// Phase 212.N.11 — ROS 2 launch.xml parser (v1 tag set). Copy-paste
+// compatibility with nav2 / Autoware / turtlebot3 launch.xml files;
+// consumes [`pkg_index::PkgIndex`] for the `$(find <pkg>)` substitution.
+pub mod launch_parser;
 
 // Phase 212.N.7 step-3 — `RuntimeError` moved to `nros-platform` (no_std)
 // so embedded Entry pkgs don't need `nros-build` as a runtime dep
