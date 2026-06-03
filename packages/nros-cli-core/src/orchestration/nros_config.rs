@@ -4,7 +4,8 @@
 //!
 //! * `[workspace.metadata.nros]` in the workspace-root `Cargo.toml`
 //! * `[package.metadata.nros]` in every workspace-member `Cargo.toml`
-//!   (single-shape `component` or multi-shape `components.<Name>`)
+//!   (single-shape `node` — canonical post Phase 212.N.12, or
+//!   deprecated alias `component` — or multi-shape `components.<Name>`)
 //! * `[package.metadata.ament]` in every workspace-member `Cargo.toml`
 //! * `<bringup-pkg>/system.toml` for every bringup package the workspace
 //!   exposes (a bringup package is a workspace member whose
@@ -402,15 +403,65 @@ fn parse_workspace_metadata(value: &serde_json::Value) -> Result<WorkspaceMetada
 
 /// `package.metadata` likewise. Returns `Ok(None)` when the `nros` key is
 /// absent.
+///
+/// Phase 212.N.12 — accept `[package.metadata.nros.node]` as the canonical
+/// key (renamed from `.component`). The deprecated `.component` key still
+/// parses (with a stderr warning); declaring both is a hard error.
 fn parse_package_metadata_nros(
     value: &serde_json::Value,
 ) -> Result<Option<PackageMetadataNros>, String> {
     let Some(nros) = value.get("nros") else {
         return Ok(None);
     };
-    PackageMetadataNros::deserialize(nros.clone())
+    let normalised = normalise_node_alias(nros.clone())?;
+    PackageMetadataNros::deserialize(normalised)
         .map(Some)
         .map_err(|e| e.to_string())
+}
+
+/// Phase 212.N.12 — accept `node` as the canonical alias for `component`
+/// (single-shape) inside `[package.metadata.nros]`. Rules:
+///
+/// 1. `node` only → rename to `component` (canonical).
+/// 2. `component` only → warn to stderr (deprecated), keep as-is.
+/// 3. Both `node` and `component` → hard error (ambiguous).
+/// 4. Neither → unchanged.
+///
+/// Multi-shape (`components.<Name>` table-of-tables) and `application`
+/// are untouched — the rename in the design doc only renamed the
+/// single-shape `component` to `node`; the multi-shape and other tables
+/// keep their existing keys.
+fn normalise_node_alias(mut nros: serde_json::Value) -> Result<serde_json::Value, String> {
+    let Some(obj) = nros.as_object_mut() else {
+        return Ok(nros);
+    };
+    let has_node = obj.contains_key("node");
+    let has_component = obj.contains_key("component");
+    match (has_node, has_component) {
+        (true, true) => Err(
+            "`[package.metadata.nros]` declares BOTH `node` (canonical) and \
+             `component` (deprecated alias) — pick exactly one (Phase 212.N.12)"
+                .to_string(),
+        ),
+        (true, false) => {
+            // Rename `node` → `component` so the existing
+            // `PackageMetadataNros` schema (still field-named
+            // `component`) deserialises cleanly.
+            if let Some(v) = obj.remove("node") {
+                obj.insert("component".to_string(), v);
+            }
+            Ok(nros)
+        }
+        (false, true) => {
+            // Deprecated alias kept working — warn once per parse.
+            eprintln!(
+                "warning: `[package.metadata.nros.component]` is the pre-N.12 \
+                 alias; use `[package.metadata.nros.node]` (Phase 212.N.12)."
+            );
+            Ok(nros)
+        }
+        (false, false) => Ok(nros),
+    }
 }
 
 fn parse_ament_metadata(value: &serde_json::Value) -> Result<PackageMetadataAment, String> {
@@ -1024,5 +1075,166 @@ name = "alpha"
             bringup.system_toml_path,
             dir.join("demo_bringup/system.toml")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 212.N.12 — accept `[package.metadata.nros.node]` as the
+    // canonical key (alias for the pre-N.12 `.component` key).
+    // -----------------------------------------------------------------
+
+    /// Write a tiny workspace whose single member uses the canonical
+    /// `[package.metadata.nros.node]` key shape.
+    fn write_node_key_workspace(dir: &Path) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["talker_pkg"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("talker_pkg/src")).unwrap();
+        fs::write(
+            dir.join("talker_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "talker_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.node]
+class = "talker_pkg::TalkerNode"
+name = "talker"
+default_namespace = "/demo"
+
+[package.metadata.nros.node.parameters]
+rate_hz = 10
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("talker_pkg/src/lib.rs"), "").unwrap();
+    }
+
+    /// Canonical `[package.metadata.nros.node]` key loads through the
+    /// loader and surfaces on `ComponentPackageEntry::nros.component`
+    /// (renamed-from alias internally).
+    #[test]
+    fn loads_node_key_as_canonical() {
+        let dir = scratch_dir("loads_node_key_as_canonical");
+        write_node_key_workspace(&dir);
+
+        let cfg = NrosConfig::from_cargo_metadata(&dir).expect("loads");
+        let talker = cfg
+            .component_packages
+            .get("talker_pkg")
+            .expect("talker present");
+        let node = talker
+            .nros
+            .component
+            .as_ref()
+            .expect("`.node` key landed on the canonical struct field");
+        assert_eq!(node.class.as_deref(), Some("talker_pkg::TalkerNode"));
+        assert_eq!(node.name.as_deref(), Some("talker"));
+        assert_eq!(node.default_namespace.as_deref(), Some("/demo"));
+        assert_eq!(
+            node.parameters.get("rate_hz").map(|v| v.as_integer()),
+            Some(Some(10))
+        );
+    }
+
+    /// Both keys present → hard error (ambiguous; user must pick one).
+    #[test]
+    fn rejects_both_node_and_component_keys() {
+        let dir = scratch_dir("rejects_both_node_and_component_keys");
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["ambig_pkg"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("ambig_pkg/src")).unwrap();
+        fs::write(
+            dir.join("ambig_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "ambig_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.node]
+class = "ambig_pkg::A"
+name = "a"
+
+[package.metadata.nros.component]
+class = "ambig_pkg::B"
+name = "b"
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("ambig_pkg/src/lib.rs"), "").unwrap();
+
+        let err = NrosConfig::from_cargo_metadata(&dir)
+            .expect_err("both keys must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("node") && msg.contains("component"),
+            "diagnostic mentions both keys: {msg}"
+        );
+    }
+
+    /// Deprecated `.component` key still parses (back-compat).
+    #[test]
+    fn loads_deprecated_component_key() {
+        let dir = scratch_dir("loads_deprecated_component_key");
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["legacy_pkg"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("legacy_pkg/src")).unwrap();
+        fs::write(
+            dir.join("legacy_pkg/Cargo.toml"),
+            r#"
+[package]
+name = "legacy_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.nros.component]
+class = "legacy_pkg::Node"
+name = "legacy"
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("legacy_pkg/src/lib.rs"), "").unwrap();
+
+        let cfg = NrosConfig::from_cargo_metadata(&dir).expect("loads");
+        let legacy = cfg
+            .component_packages
+            .get("legacy_pkg")
+            .expect("legacy present");
+        let c = legacy
+            .nros
+            .component
+            .as_ref()
+            .expect("component table present");
+        assert_eq!(c.class.as_deref(), Some("legacy_pkg::Node"));
     }
 }

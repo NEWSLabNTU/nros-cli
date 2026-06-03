@@ -52,8 +52,11 @@ pub struct WorkspaceMetadataNros {
 ///
 /// Three top-level shapes (mutually exclusive):
 ///
-/// * Single-component crate — `[package.metadata.nros.component]` describes
-///   the one component the crate exposes.
+/// * Single-node crate — `[package.metadata.nros.node]` describes the
+///   one node the crate exposes. (The Phase 212.N.12 rename made
+///   `node` the canonical key; `[package.metadata.nros.component]`
+///   remains accepted as a deprecated alias — declaring both is a
+///   hard error. See `nros_config::parse_package_metadata_nros`.)
 /// * Multi-component crate — `[package.metadata.nros.components.<Name>]`
 ///   table-of-tables enumerates each.
 /// * Application crate — `[package.metadata.nros.application]` describes a
@@ -125,8 +128,9 @@ impl PackageMetadataNros {
     }
 }
 
-/// `[package.metadata.nros.component]` (single shape) or
-/// `[package.metadata.nros.components.<Name>]` (multi shape).
+/// `[package.metadata.nros.node]` (single shape, canonical post Phase
+/// 212.N.12) — or `[package.metadata.nros.component]` (deprecated alias)
+/// — or `[package.metadata.nros.components.<Name>]` (multi shape).
 ///
 /// Pure deployment intent — no build-system knobs (Cargo + CMake own those).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
