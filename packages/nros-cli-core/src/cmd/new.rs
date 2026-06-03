@@ -39,10 +39,29 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub components: Vec<String>,
 
+    /// Phase 212.F — repeatable single-component form (alternative to
+    /// `--components <a,b,c>` when commas in the shell are awkward). Merged
+    /// with `--components` at dispatch time.
+    #[arg(long = "component-name")]
+    pub component_name: Vec<String>,
+
     /// Phase 212.F — workspace root holding the cargo `Cargo.toml` to
     /// update. Defaults to the parent of the bringup dir.
     #[arg(long)]
     pub workspace_root: Option<PathBuf>,
+
+    /// Phase 212.F — parent dir under which the bringup pkg is created.
+    /// Defaults to the current working directory.
+    #[arg(long)]
+    pub into: Option<PathBuf>,
+
+    /// Phase 212.F — skip the optional `config/` sub-dir.
+    #[arg(long)]
+    pub no_config: bool,
+
+    /// Phase 212.F — skip the optional `README.md`.
+    #[arg(long)]
+    pub no_readme: bool,
 
     /// Target platform (required in project mode)
     #[arg(long, value_parser = ["native", "freertos", "nuttx", "threadx", "zephyr", "esp32", "posix", "baremetal"])]
@@ -112,17 +131,26 @@ pub fn run(args: Args) -> Result<()> {
             .system_name
             .clone()
             .ok_or_else(|| eyre::eyre!("`nros new system <name>_bringup` requires a bringup pkg name"))?;
-        if args.components.is_empty() {
+        // Phase 212.F: validate the user-supplied name early so
+        // `foo/bar`, `..`, absolute paths surface a clean diagnostic
+        // before we touch the filesystem.
+        crate::cmd::new_system::validate_bringup_name(&bringup_path)?;
+        // Merge --components <a,b,c> with repeatable --component-name <x>.
+        let mut components: Vec<String> = args.components.clone();
+        components.extend(args.component_name.clone());
+        if components.is_empty() {
             bail!(
                 "`nros new system <bringup>` requires --components <pkg1,pkg2,...> \
-                 (at least one component)"
+                 (at least one component); --component-name <x> may be repeated as an alternative"
             );
         }
         let cwd = std::env::current_dir()?;
+        // --into <dir> overrides cwd as the parent directory for the bringup.
+        let into = args.into.clone().unwrap_or_else(|| cwd.clone());
         let bringup_dir = if bringup_path.is_absolute() {
             bringup_path
         } else {
-            cwd.join(&bringup_path)
+            into.join(&bringup_path)
         };
         let pkg_name = bringup_dir
             .file_name()
@@ -137,14 +165,16 @@ pub fn run(args: Args) -> Result<()> {
         let out = scaffold_bringup(&BringupScaffold {
             bringup_dir: bringup_dir.clone(),
             pkg_name: pkg_name.clone(),
-            components: args.components.clone(),
+            components: components.clone(),
             workspace_root,
+            emit_config: !args.no_config,
+            emit_readme: !args.no_readme,
             force: args.force,
         })?;
         eprintln!(
             "nros new system: scaffolded bringup pkg {pkg_name} at {} ({} component(s))",
             out.bringup_dir.display(),
-            args.components.len()
+            components.len()
         );
         if let Some(ws) = out.workspace_cargo_toml.as_ref() {
             eprintln!("nros new system: updated [workspace] exclude in {}", ws.display());
