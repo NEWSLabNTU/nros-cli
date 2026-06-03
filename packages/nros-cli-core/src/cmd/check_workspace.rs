@@ -1,6 +1,6 @@
-//! Phase 212.L — workspace-walk lints for `nros check --workspace`.
+//! Phase 212.L / O — workspace-walk lints for `nros check --workspace`.
 //!
-//! Three lints land here:
+//! Lints land here:
 //!
 //! * **L.4 — `<pkg>::<Class>` enforcement.** Every `[[component]]` row in a
 //!   bringup `system.toml` carries `pkg = "<dir>"` + `class = "<dir>::<Type>"`.
@@ -15,6 +15,17 @@
 //!   warning.** Cargo reads `[patch.crates-io]` from both `Cargo.toml` AND
 //!   `.cargo/config.toml`; when both exist the config-file shadows the
 //!   manifest. Patches must live in the workspace-root `Cargo.toml` only.
+//!
+//! * **O.2 `entry-deploy-missing` (hard error).** A component pkg whose
+//!   `Cargo.toml` declares `[package.metadata.nros.entry]` MUST also set
+//!   `deploy = "<board>"` (per Phase 212.L.2 / N.7). A missing or empty
+//!   `deploy` field rejects with the `entry-deploy-missing` diagnostic.
+//!
+//! * **O.6 `application-rtos-deploy-forbidden` (hard error).** A component
+//!   pkg whose `Cargo.toml` declares `[package.metadata.nros.application]`
+//!   MUST only name `"native"` in its `deploy = […]` allow-list. Application
+//!   pkgs are native-only by definition (Phase 212.L.2 / M-F.1); naming an
+//!   RTOS rejects with the `application-rtos-deploy-forbidden` diagnostic.
 //!
 //! The walk is `nros check --workspace [<dir>]`. Each immediate child of the
 //! workspace root is classified as a bringup pkg (has `system.toml`, no
@@ -120,6 +131,11 @@ pub fn check_workspace(workspace_root: &Path) -> Result<WorkspaceLintReport> {
                     ));
                 }
             }
+            // O.2 + O.6 — peek inside Cargo.toml's `[package.metadata.nros]`
+            // for the Entry-pkg / Application-pkg shape lints.
+            if has_cargo {
+                lint_cargo_metadata_nros(&pkg_dir.join("Cargo.toml"), &name)?;
+            }
         }
 
         if is_bringup {
@@ -172,6 +188,86 @@ pub fn lint_class_pkg_prefix(bringup_dir: &Path, bringup_pkg_name: &str) -> Resu
             bad.join("; ")
         );
     }
+    Ok(())
+}
+
+/// Phase 212.O.2 + O.6 — peek inside a component pkg's `Cargo.toml`
+/// `[package.metadata.nros]` table and run the Entry / Application shape
+/// lints.
+///
+/// * **O.2 `entry-deploy-missing`** — `[package.metadata.nros.entry]` MUST
+///   carry `deploy = "<board>"` (non-empty string). Phase 212.L.2 / N.7.
+/// * **O.6 `application-rtos-deploy-forbidden`** — every entry in
+///   `[package.metadata.nros.application].deploy` MUST be `"native"`. Phase
+///   212.L.2 / M-F.1 — Application pkgs are native-only orchestration roots.
+///
+/// Both lints bail with an eyre error whose diagnostic id is embedded in the
+/// message body (`entry-deploy-missing` / `application-rtos-deploy-forbidden`).
+/// Diagnostic IDs are part of the stable contract used by `nros check`
+/// integration tests + downstream tooling.
+fn lint_cargo_metadata_nros(cargo_toml_path: &Path, pkg_name: &str) -> Result<()> {
+    let raw = match fs::read_to_string(cargo_toml_path) {
+        Ok(s) => s,
+        // Unreadable Cargo.toml is not this lint's problem — bail out silently
+        // (the rest of cargo / nros plan will surface a cleaner error).
+        Err(_) => return Ok(()),
+    };
+    let value: toml::Value = match toml::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // malformed manifest — not this lint's job
+    };
+
+    let nros = value
+        .get("package")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("nros"));
+    let Some(nros) = nros else {
+        return Ok(());
+    };
+
+    // ---- O.2 entry-deploy-missing -----------------------------------------
+    if let Some(entry) = nros.get("entry") {
+        // `deploy` must be present, a string, and non-empty.
+        let deploy_ok = entry
+            .get("deploy")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !deploy_ok {
+            bail!(
+                "{pkg_name}: [package.metadata.nros.entry] missing or empty \
+                 'deploy' field — Entry pkg must name a board target (e.g. \
+                 deploy = \"native\" or deploy = \"qemu-mps2-an385-freertos\") \
+                 [diagnostic: entry-deploy-missing]"
+            );
+        }
+    }
+
+    // ---- O.6 application-rtos-deploy-forbidden ----------------------------
+    if let Some(app) = nros.get("application") {
+        // `deploy` is optional; when present it must be a list of strings,
+        // and every entry must be exactly "native".
+        if let Some(deploy) = app.get("deploy") {
+            let Some(arr) = deploy.as_array() else {
+                // Wrong type — leave to the strict schema validator; this
+                // lint only flags the RTOS-name policy.
+                return Ok(());
+            };
+            for entry in arr {
+                let Some(s) = entry.as_str() else {
+                    continue;
+                };
+                if s != "native" {
+                    bail!(
+                        "{pkg_name}: Application pkg may not deploy to RTOS \
+                         target '{s}' (Applications are native-only; use \
+                         Component pkg + Entry pkg for RTOS deployment) \
+                         [diagnostic: application-rtos-deploy-forbidden]"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -385,6 +481,125 @@ mod tests {
         let err = check_workspace(&root).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("include/"), "diag: {msg}");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 212.O.2 — `entry-deploy-missing`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nros_check_workspace_rejects_entry_pkg_without_deploy_field() {
+        let root = temp_root("o2_entry_no_deploy");
+        let pkg = root.join("freertos_entry_pkg");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        // Empty [package.metadata.nros.entry] table — no `deploy =` key.
+        fs::write(
+            pkg.join("Cargo.toml"),
+            "[package]\nname=\"freertos_entry_pkg\"\nversion=\"0.1.0\"\n\
+             [package.metadata.nros.entry]\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("src/main.rs"), "fn main() {}").unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("entry-deploy-missing"), "diag: {msg}");
+        assert!(msg.contains("freertos_entry_pkg"), "diag: {msg}");
+        assert!(msg.contains("'deploy'"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_workspace_rejects_entry_pkg_with_empty_deploy() {
+        let root = temp_root("o2_entry_empty_deploy");
+        let pkg = root.join("native_entry_pkg");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(
+            pkg.join("Cargo.toml"),
+            "[package]\nname=\"native_entry_pkg\"\nversion=\"0.1.0\"\n\
+             [package.metadata.nros.entry]\ndeploy = \"\"\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("src/main.rs"), "fn main() {}").unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("entry-deploy-missing"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_workspace_accepts_entry_pkg_with_deploy() {
+        let root = temp_root("o2_entry_ok");
+        let pkg = root.join("native_entry_pkg");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(
+            pkg.join("Cargo.toml"),
+            "[package]\nname=\"native_entry_pkg\"\nversion=\"0.1.0\"\n\
+             [package.metadata.nros.entry]\ndeploy = \"native\"\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("src/main.rs"), "fn main() {}").unwrap();
+        let report = check_workspace(&root).expect("entry+deploy passes");
+        assert_eq!(report.pkgs_visited, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 212.O.6 — `application-rtos-deploy-forbidden`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nros_check_workspace_rejects_application_pkg_with_rtos_in_deploy() {
+        let root = temp_root("o6_app_rtos");
+        let pkg = root.join("demo_app");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(
+            pkg.join("Cargo.toml"),
+            "[package]\nname=\"demo_app\"\nversion=\"0.1.0\"\n\
+             [package.metadata.nros.application]\n\
+             deploy = [\"native\", \"freertos\"]\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("src/lib.rs"), "// stub\n").unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("application-rtos-deploy-forbidden"),
+            "diag: {msg}"
+        );
+        assert!(msg.contains("demo_app"), "diag: {msg}");
+        assert!(msg.contains("freertos"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_workspace_accepts_application_pkg_native_only() {
+        let root = temp_root("o6_app_native_only");
+        let pkg = root.join("demo_app");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(
+            pkg.join("Cargo.toml"),
+            "[package]\nname=\"demo_app\"\nversion=\"0.1.0\"\n\
+             [package.metadata.nros.application]\n\
+             deploy = [\"native\"]\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("src/lib.rs"), "// stub\n").unwrap();
+        let report = check_workspace(&root).expect("native-only application ok");
+        assert_eq!(report.pkgs_visited, 1);
+    }
+
+    #[test]
+    fn nros_check_workspace_accepts_application_pkg_without_deploy_list() {
+        // Empty / absent deploy list is allowed by the O.6 lint (the schema
+        // tolerates it; the lint only flags RTOS names when present).
+        let root = temp_root("o6_app_no_deploy");
+        let pkg = root.join("demo_app");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(
+            pkg.join("Cargo.toml"),
+            "[package]\nname=\"demo_app\"\nversion=\"0.1.0\"\n\
+             [package.metadata.nros.application]\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("src/lib.rs"), "// stub\n").unwrap();
+        let report = check_workspace(&root).expect("application w/o deploy ok");
+        assert_eq!(report.pkgs_visited, 1);
     }
 
     #[test]
