@@ -80,8 +80,9 @@ pub struct Args {
 
     /// Phase 212.L.6 — multi-launch disambiguation: pass `<file>` and
     /// the resolver picks `<bringup>/launch/<file>` (cwd / absolute as
-    /// fallbacks).
-    #[arg(long = "file")]
+    /// fallbacks). `--launch` is the canonical Phase 212.E flag name;
+    /// `--file` is kept as an alias for back-compat with the L.6 docs.
+    #[arg(long = "launch", visible_alias = "file")]
     pub file: Option<String>,
 
     /// Phase 212.L.6 — `<node exec="…">` override for synthesised
@@ -125,7 +126,26 @@ pub fn run(args: Args) -> Result<()> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| workspace.clone());
-    let launch_input = resolve_launch(&bringup_dir, args.file.as_deref(), args.exec.as_deref())?;
+
+    // 212.E.2 — when `--target <name>` is given and the bringup has a
+    // matching `[deploy.<target>]` block with `launch = "..."`, that
+    // override takes precedence over the bringup's
+    // `[system].default_launch` (per system-toml-schema-v0.1 §3.1 step 1).
+    // An explicit `--launch`/`--file` flag still beats both.
+    let effective_file: Option<String> = args.file.clone().or_else(|| {
+        args.target.as_deref().and_then(|t| {
+            bringup
+                .system
+                .deploy
+                .get(t)
+                .and_then(|d| d.launch.clone())
+        })
+    });
+    let launch_input = resolve_launch(
+        &bringup_dir,
+        effective_file.as_deref(),
+        args.exec.as_deref(),
+    )?;
     let resolved_launch = match &launch_input {
         LaunchInput::File(p) => Some(p.to_string_lossy().into_owned()),
         LaunchInput::Synth(_) => None, // not persisted; record nothing
@@ -141,6 +161,17 @@ pub fn run(args: Args) -> Result<()> {
 
     if let Some(mode) = args.ahead_of_vendor {
         emit_ahead_of_vendor(&out_dir, bringup, mode)?;
+        // Phase 212.E.3 — also drop a `vendor_hint.json` skeleton inside
+        // the bake tree describing the hookless-vendor intent. Downstream
+        // PIO `extra_script.py` (H.6) + the PX4 board overlay generator
+        // (H.7) read this to know which vendor-specific augment to apply
+        // — keeps the contract uniform across kinds even though the rich
+        // per-vendor artifacts (library.json / module dirs) live under
+        // `<out>/`.
+        write_if_changed(
+            &bake_dir.join("vendor_hint.json"),
+            &render_vendor_hint(bringup, mode),
+        )?;
     }
 
     eprintln!(
@@ -496,6 +527,60 @@ fn emit_ahead_of_vendor(
         AheadOfVendor::Pio => emit_pio(out_dir, bringup),
         AheadOfVendor::Px4 => emit_px4(out_dir, bringup),
     }
+}
+
+/// Phase 212.E.3 — render a `vendor_hint.json` skeleton documenting the
+/// ahead-of-vendor intent. The shape is intentionally minimal v1 — H.6 +
+/// H.7 will extend it as the PlatformIO `extra_script.py` and PX4 board
+/// overlay generators come online. Today's downstream consumers only key
+/// off `kind` + `bringup`.
+///
+/// TODO(E.3) — H.6 will need PIO-specific keys (transport, framework,
+/// monitor speed); H.7 will need the per-component module name list +
+/// the PX4 board-overlay path. Both are flat additions to this JSON;
+/// the existing keys stay stable.
+fn render_vendor_hint(bringup: &BringupPackageEntry, mode: AheadOfVendor) -> String {
+    let kind = match mode {
+        AheadOfVendor::Pio => "platformio",
+        AheadOfVendor::Px4 => "px4",
+    };
+    let mut components: Vec<String> = bringup
+        .system
+        .components
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    components.sort();
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!("  \"kind\": \"{}\",\n", json_escape(kind)));
+    out.push_str(&format!(
+        "  \"bringup\": \"{}\",\n",
+        json_escape(&bringup.name)
+    ));
+    out.push_str(&format!(
+        "  \"system\": \"{}\",\n",
+        json_escape(&bringup.system.system.name)
+    ));
+    out.push_str(&format!(
+        "  \"rmw\": \"{}\",\n",
+        json_escape(&bringup.system.system.rmw)
+    ));
+    out.push_str("  \"components\": [");
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{}\"", json_escape(c)));
+    }
+    out.push_str("],\n");
+    let todo_msg = match mode {
+        AheadOfVendor::Pio => "TODO(E.3): augment PlatformIO library.json with transport + framework",
+        AheadOfVendor::Px4 => "TODO(E.3): emit PX4 board overlay flipping CONFIG_MODULES_NROS_<NAME>=y",
+    };
+    out.push_str(&format!("  \"todo\": \"{}\"\n", json_escape(todo_msg)));
+    out.push_str("}\n");
+    out
 }
 
 fn emit_pio(out_dir: &Path, bringup: &BringupPackageEntry) -> Result<()> {
