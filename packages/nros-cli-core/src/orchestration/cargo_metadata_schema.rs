@@ -1132,6 +1132,59 @@ board = "esp32dev"
         assert_eq!(v, v2);
     }
 
+    /// Phase 212.M-F.17 — synthesis subset round-trip. The α-bridge in
+    /// `workspace.rs::synthetic_metadata_artifacts` reads `class` /
+    /// `name` / `default_namespace` out of `[component]` and the
+    /// `[components.<Name>]` table-of-tables, then mints fresh JSON for
+    /// the planner. Lock in the shape of those reads here so a future
+    /// schema tweak that drops one of them surfaces at the cargo
+    /// metadata schema boundary (closest to the user-facing TOML)
+    /// instead of as a planner-level mystery.
+    #[test]
+    fn synthesis_subset_round_trip_single_and_multi() {
+        // Single-shape `[component]` carrying every M-F.17 field.
+        let raw_single = r#"
+[component]
+class = "talker_pkg::Talker"
+name = "talker"
+default_namespace = "/demo"
+"#;
+        let v: PackageMetadataNros = toml::from_str(raw_single).expect("parse single");
+        v.validate().expect("single-shape valid");
+        let c = v.component.as_ref().expect("component present");
+        assert_eq!(c.class.as_deref(), Some("talker_pkg::Talker"));
+        assert_eq!(c.name.as_deref(), Some("talker"));
+        assert_eq!(c.default_namespace.as_deref(), Some("/demo"));
+
+        // Multi-shape `[components.<Name>]` — same subset on a per-entry
+        // basis. Bridge uses `<Name>` as the component-name fallback
+        // when `metadata.name` is absent on the entry.
+        let raw_multi = r#"
+[components.Talker]
+class = "talker_pkg::Talker"
+default_namespace = "/demo"
+
+[components.Listener]
+class = "listener_pkg::Listener"
+"#;
+        let v: PackageMetadataNros = toml::from_str(raw_multi).expect("parse multi");
+        v.validate().expect("multi-shape valid");
+        assert_eq!(v.components.len(), 2);
+        let talker = v.components.get("Talker").expect("Talker entry");
+        assert_eq!(talker.class.as_deref(), Some("talker_pkg::Talker"));
+        assert_eq!(talker.default_namespace.as_deref(), Some("/demo"));
+        // Multi-shape entries inherit their component name from the
+        // table key when `metadata.name` is absent — the bridge layer
+        // checks both, but the schema records only what's authored.
+        assert!(talker.name.is_none());
+
+        // Round-trip the multi-shape so a schema edit that breaks
+        // serialisation of one of the synth subset fields fails here.
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: PackageMetadataNros = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
+    }
+
     /// `deny_unknown_fields` on `[system]` catches typos at the bringup
     /// surface.
     #[test]

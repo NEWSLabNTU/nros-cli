@@ -67,7 +67,17 @@ pub fn plan_system(options: PlanOptions) -> Result<PlanningOutput> {
     fs::write(&record_path, serde_json::to_string_pretty(&record)?)?;
 
     let metadata_paths = metadata_paths(&options, &workspace, &metadata_dir);
-    let metadata = load_json_artifacts(&metadata_paths, "source metadata")?;
+    let mut metadata = load_json_artifacts(&metadata_paths, "source metadata")?;
+    // Phase 212.M-F.17 — α-bridge: synthesise minimal metadata artifacts from
+    // workspace-member `Cargo.toml` `[package.metadata.nros.{component,
+    // components,node,nodes}]` tables. Appended AFTER the sidecar JSON
+    // artifacts so the file artifacts win the `(package, component)` dedup
+    // in `schema_components` (back-compat: a package shipping both an
+    // authoritative metadata JSON and a stub component table keeps the
+    // file's richer data on the plan).
+    for (path, value) in workspace.synthetic_metadata_artifacts() {
+        metadata.push(JsonArtifact { path, value });
+    }
     preserve_metadata(&metadata, &metadata_dir)?;
 
     let manifest_paths = if options.manifest_files.is_empty() {
@@ -541,6 +551,20 @@ fn load_json_artifacts(paths: &[PathBuf], label: &str) -> Result<Vec<JsonArtifac
 
 fn preserve_metadata(metadata: &[JsonArtifact], metadata_dir: &Path) -> Result<()> {
     for artifact in metadata {
+        // Phase 212.M-F.17 — synthetic artifacts derived from cargo metadata
+        // carry a `Cargo.toml` source path; preserving them as `Cargo.toml`
+        // files inside the JSON metadata dir would (a) confuse downstream
+        // readers that expect `*.json`, and (b) collide across packages.
+        // Skip them: the planner consumes the live `metadata` slice, the
+        // preserved-to-disk view is for sidecar JSON only.
+        if artifact
+            .value
+            .get("synthetic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let Some(file_name) = artifact.path.file_name() else {
             continue;
         };

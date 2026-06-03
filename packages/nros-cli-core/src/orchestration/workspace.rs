@@ -3,6 +3,7 @@
 use cargo_nano_ros::package_xml::PackageXml;
 use eyre::{Context, Result};
 use serde::Deserialize;
+use serde_json::{Value as JsonValue, json};
 use std::{
     collections::BTreeSet,
     fs,
@@ -10,6 +11,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use super::cargo_metadata_schema::{ComponentMetadata, PackageMetadataNros};
 use super::config::ComponentConfig;
 
 /// Permissive envelope for extracting a `[component]` table out of a package's
@@ -82,6 +84,50 @@ pub struct Package {
     /// `nros/components/*.toml`. An `nros.toml` without a `[component]` table
     /// is filtered out at parse time (`load_component_config`).
     pub component_config_files: Vec<PathBuf>,
+    /// Phase 212.M-F.17 — summaries derived from the package's
+    /// `[package.metadata.nros.{component,components,node,nodes}]` tables
+    /// in `Cargo.toml`. Populated at discovery time; one entry per
+    /// declared component. Empty when the package has no `Cargo.toml`
+    /// or no nros component metadata table.
+    pub cargo_component_metadata: Vec<CargoComponentSummary>,
+}
+
+/// Phase 212.M-F.17 — α-bridge between the in-tree
+/// `[package.metadata.nros.component]` / `…components.<Name>` Cargo
+/// metadata and the planner's source-metadata pipeline.
+///
+/// The planner's `find_source_metadata` walk currently keys off the
+/// `(package, executable)` pair recorded in a `metadata/*.json` sidecar
+/// file. The Phase 212 in-tree fixtures dropped those sidecars in favor
+/// of `[package.metadata.nros.component]`, leaving `find_source_metadata`
+/// blind. `CargoComponentSummary` carries just enough information to
+/// synthesise a minimal `JsonArtifact` for the planner's `(package,
+/// executable)` match — full entity / param / remap synthesis is
+/// intentionally out of scope (runtime `Component::register(ctx)`
+/// carries those in the redesign).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoComponentSummary {
+    /// Cargo `[package].name` the component belongs to. Used by the
+    /// planner's `find_source_metadata` package match.
+    pub package: String,
+    /// Short component instance name. Derived per Phase 212.M-F.17:
+    /// `metadata.name` when present, else the multi-shape table key,
+    /// else the class basename (`talker_pkg::Talker` → `Talker`),
+    /// else the package name.
+    pub component: String,
+    /// Executable name. Defaults to the package name; overridden when a
+    /// `[[bin]] name = …` row matches the component name.
+    pub executable: String,
+    /// `metadata.class` when present (`<pkg-dir>::<UserClass>`). Threaded
+    /// through to the synthetic JSON so downstream readers that care
+    /// about the class can still find it.
+    pub class: Option<String>,
+    /// `metadata.default_namespace` when present.
+    pub default_namespace: Option<String>,
+    /// Absolute path to the `Cargo.toml` the summary was derived from.
+    /// Recorded so synthetic JSON artifacts can name a real on-disk path
+    /// for diagnostics (matches the file-artifact `path` field shape).
+    pub manifest_path: PathBuf,
 }
 
 impl Workspace {
@@ -103,6 +149,36 @@ impl Workspace {
         }
         packages.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Self { root, packages })
+    }
+
+    /// Phase 212.M-F.17 — synthesise `(manifest_path, json_value)` tuples
+    /// from every package's `[package.metadata.nros.{component,components,
+    /// node,nodes}]` table. The planner appends these to its `JsonArtifact`
+    /// list AFTER the sidecar file artifacts so sidecars win the dedup pass
+    /// in `schema_components` (back-compat: a package shipping both an
+    /// authoritative metadata JSON and a stub component table keeps the
+    /// file's richer data on the plan).
+    ///
+    /// The synthetic JSON carries the minimum keys the planner's
+    /// `find_source_metadata` `(package, executable)` walk needs plus
+    /// the downstream `schema_components` dedup id (`package` +
+    /// `component` + `language`). `class` / `default_namespace` flow
+    /// through when present.
+    ///
+    /// Each tuple's first element is the source `Cargo.toml`; downstream
+    /// callers that mint a `JsonArtifact` use it as the artifact `path`
+    /// so diagnostics name a real on-disk file.
+    pub fn synthetic_metadata_artifacts(&self) -> Vec<(PathBuf, JsonValue)> {
+        let mut out = Vec::new();
+        for pkg in &self.packages {
+            for summary in &pkg.cargo_component_metadata {
+                out.push((
+                    summary.manifest_path.clone(),
+                    summary_to_synthetic_json(summary),
+                ));
+            }
+        }
+        out
     }
 
     pub fn source_metadata_files(&self) -> Vec<PathBuf> {
@@ -197,6 +273,7 @@ fn discover_package(root: &Path) -> Result<Package> {
     let package_xml = root.join("package.xml");
     let parsed = PackageXml::parse(&package_xml)
         .wrap_err_with(|| format!("failed to parse {}", package_xml.display()))?;
+    let cargo_component_metadata = discover_cargo_component_metadata(root)?;
     Ok(Package {
         name: parsed.name,
         root: root.to_path_buf(),
@@ -217,7 +294,208 @@ fn discover_package(root: &Path) -> Result<Package> {
         )?,
         metadata_files: collect_files(root, &["metadata", "nros", "target/nros"], &["json"])?,
         component_config_files: discover_component_configs(root)?,
+        cargo_component_metadata,
     })
+}
+
+/// Phase 212.M-F.17 — read `<root>/Cargo.toml` and synthesise one
+/// [`CargoComponentSummary`] per `[package.metadata.nros.{component,
+/// components.<Name>}]` (and the post-N.12 `node` / `nodes` aliases)
+/// entry. Returns an empty vec when:
+///
+/// * the package has no `Cargo.toml` (every embedded / CMake-only
+///   package in the in-tree examples / fixtures), OR
+/// * the `Cargo.toml` has no `[package.metadata.nros]` table, OR
+/// * the table is present but declares only `application` / `entry` /
+///   `deploy` (not a component package).
+///
+/// Parse errors are propagated so a malformed `Cargo.toml` surfaces at
+/// discovery time rather than silently dropping the package.
+fn discover_cargo_component_metadata(root: &Path) -> Result<Vec<CargoComponentSummary>> {
+    let cargo_toml = root.join("Cargo.toml");
+    if !cargo_toml.is_file() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&cargo_toml)
+        .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+    let envelope: CargoManifestEnvelope = toml::from_str(&raw)
+        .with_context(|| format!("failed to parse {} for nros metadata", cargo_toml.display()))?;
+    let Some(package) = envelope.package else {
+        return Ok(Vec::new());
+    };
+    let pkg_name = package.name.clone();
+    let Some(metadata) = package.metadata else {
+        return Ok(Vec::new());
+    };
+    let Some(nros) = metadata.nros else {
+        return Ok(Vec::new());
+    };
+    // Mirrors `nros_config::normalise_node_alias`: `node` is the post-N.12
+    // canonical spelling, `component` is the deprecated alias. We accept
+    // both at discovery time without warning (warnings live in
+    // `parse_package_metadata_nros`).
+    let single = nros.node.as_ref().or(nros.component.as_ref());
+    let multi: Vec<(String, &ComponentMetadata)> = if !nros.nodes.is_empty() {
+        nros.nodes.iter().map(|(k, v)| (k.clone(), v)).collect()
+    } else {
+        nros.components
+            .iter()
+            .map(|(k, v)| (k.clone(), v))
+            .collect()
+    };
+
+    let bins: Vec<String> = envelope
+        .bin
+        .iter()
+        .flat_map(|b| b.iter())
+        .filter_map(|b| b.name.clone())
+        .collect();
+
+    let mut out = Vec::new();
+    if let Some(component) = single {
+        out.push(synthesise_summary(
+            &pkg_name,
+            None,
+            component,
+            &bins,
+            &cargo_toml,
+        ));
+    }
+    for (key, component) in multi {
+        out.push(synthesise_summary(
+            &pkg_name,
+            Some(&key),
+            component,
+            &bins,
+            &cargo_toml,
+        ));
+    }
+    Ok(out)
+}
+
+/// Build a [`CargoComponentSummary`] for one `[component]` / `[node]`
+/// (single) or `[components.<Name>]` / `[nodes.<Name>]` (multi) entry.
+///
+/// Per the Phase 212.M-F.17 task spec:
+///
+/// * `metadata.name` wins as the component name when present.
+/// * Otherwise the multi-shape key wins (`components.Talker` → `Talker`).
+/// * Otherwise the class basename wins (`talker_pkg::Talker` → `Talker`).
+/// * Otherwise the package name is used as a last-resort fallback.
+///
+/// `executable` defaults to the package name; if a `[[bin]] name = …`
+/// matches the chosen component name, that bin name wins instead.
+fn synthesise_summary(
+    pkg_name: &str,
+    multi_key: Option<&str>,
+    component: &ComponentMetadata,
+    bins: &[String],
+    manifest_path: &Path,
+) -> CargoComponentSummary {
+    let component_name = component
+        .name
+        .clone()
+        .or_else(|| multi_key.map(ToString::to_string))
+        .or_else(|| {
+            component
+                .class
+                .as_deref()
+                .and_then(class_basename)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| pkg_name.to_string());
+
+    // `[[bin]] name = …` override: when one of the workspace member
+    // `[[bin]]` rows happens to share the component name, prefer it
+    // (the planner expects `executable` to point at the actual binary
+    // a build tree drops on disk).
+    let executable = if bins.iter().any(|n| n == &component_name) {
+        component_name.clone()
+    } else {
+        pkg_name.to_string()
+    };
+
+    CargoComponentSummary {
+        package: pkg_name.to_string(),
+        component: component_name,
+        executable,
+        class: component.class.clone(),
+        default_namespace: component.default_namespace.clone(),
+        manifest_path: manifest_path.to_path_buf(),
+    }
+}
+
+/// `talker_pkg::Talker` → `Some("Talker")`. Returns `None` when the class
+/// string carries no `::` separator (a malformed value the lint catches
+/// elsewhere).
+fn class_basename(class: &str) -> Option<&str> {
+    class.rsplit_once("::").map(|(_, tail)| tail)
+}
+
+/// Permissive `Cargo.toml` envelope — only the keys M-F.17 cares about
+/// are typed; every sibling table (`[dependencies]`, `[lib]`, …) is
+/// ignored. Strictness on the nros tables themselves comes from
+/// [`PackageMetadataNros`]'s `deny_unknown_fields`.
+#[derive(Debug, Deserialize)]
+struct CargoManifestEnvelope {
+    #[serde(default)]
+    package: Option<CargoPackageEnvelope>,
+    #[serde(default)]
+    bin: Option<Vec<CargoBinEnvelope>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackageEnvelope {
+    name: String,
+    #[serde(default)]
+    metadata: Option<CargoPackageMetadataEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackageMetadataEnvelope {
+    #[serde(default)]
+    nros: Option<PackageMetadataNros>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoBinEnvelope {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Build the synthetic JSON object the planner consumes for one
+/// summary. Mirrors the keys [`super::planner::schema_components`]
+/// + [`super::planner::find_source_metadata`] read:
+///
+/// * `package` / `component` / `executable` — `(package, executable)`
+///   match + `package::component` dedup id.
+/// * `language` — every Cargo-resident component is Rust today; the
+///   field is required so `schema_components` doesn't fall through to
+///   the `"rust"` literal default.
+/// * `synthetic` / `synthetic_source` — provenance markers; downstream
+///   `nros check` lints distinguish synthesised entries from
+///   authoritative metadata.
+fn summary_to_synthetic_json(summary: &CargoComponentSummary) -> JsonValue {
+    let mut obj = json!({
+        "version": 1,
+        "package": summary.package,
+        "component": summary.component,
+        "executable": summary.executable,
+        "language": "rust",
+        "synthetic": true,
+        "synthetic_source": "cargo_metadata",
+    });
+    let map = obj.as_object_mut().expect("synthetic JSON is an object");
+    if let Some(class) = &summary.class {
+        map.insert("class".to_string(), JsonValue::String(class.clone()));
+    }
+    if let Some(namespace) = &summary.default_namespace {
+        map.insert(
+            "default_namespace".to_string(),
+            JsonValue::String(namespace.clone()),
+        );
+    }
+    obj
 }
 
 /// Locate component declaration candidates. Preference order (W.1 fold):
@@ -409,6 +687,239 @@ mod tests {
             "folded form wins: {}",
             decls[0].manifest_path.display()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 212.M-F.17 — synthetic metadata from Cargo.toml
+    // -----------------------------------------------------------------
+
+    /// `[package.metadata.nros.component]` single-shape → one summary.
+    /// Component name defaults to class basename when `metadata.name`
+    /// is absent; executable defaults to package name.
+    #[test]
+    fn synthetic_metadata_from_single_component_table() {
+        let s = Scratch::new("mf17-single");
+        s.write(
+            "src/talker_pkg/package.xml",
+            PKG_XML.replace("demo_pkg", "talker_pkg").as_str(),
+        );
+        s.write(
+            "src/talker_pkg/Cargo.toml",
+            r#"
+[package]
+name = "talker_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.nros.component]
+class = "talker_pkg::Talker"
+default_namespace = "/demo"
+"#,
+        );
+
+        let ws = Workspace::discover(&s.0).unwrap();
+        let pkg = ws
+            .packages
+            .iter()
+            .find(|p| p.name == "talker_pkg")
+            .expect("pkg");
+        assert_eq!(pkg.cargo_component_metadata.len(), 1, "one summary");
+        let summary = &pkg.cargo_component_metadata[0];
+        assert_eq!(summary.package, "talker_pkg");
+        // `metadata.name` absent → class basename wins.
+        assert_eq!(summary.component, "Talker");
+        // No `[[bin]]` row → executable is the package name.
+        assert_eq!(summary.executable, "talker_pkg");
+        assert_eq!(summary.class.as_deref(), Some("talker_pkg::Talker"));
+        assert_eq!(summary.default_namespace.as_deref(), Some("/demo"));
+        assert!(summary.manifest_path.ends_with("Cargo.toml"));
+
+        let synth = ws.synthetic_metadata_artifacts();
+        assert_eq!(synth.len(), 1);
+        let (path, value) = &synth[0];
+        assert!(path.ends_with("Cargo.toml"));
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["package"], "talker_pkg");
+        assert_eq!(value["component"], "Talker");
+        assert_eq!(value["executable"], "talker_pkg");
+        assert_eq!(value["language"], "rust");
+        assert_eq!(value["class"], "talker_pkg::Talker");
+        assert_eq!(value["default_namespace"], "/demo");
+        assert_eq!(value["synthetic"], true);
+        assert_eq!(value["synthetic_source"], "cargo_metadata");
+    }
+
+    /// `metadata.name` wins over class basename when both are present;
+    /// a `[[bin]] name = …` row matching the component name overrides
+    /// the package-name executable default.
+    #[test]
+    fn synthetic_metadata_name_and_bin_override() {
+        let s = Scratch::new("mf17-name-bin");
+        s.write(
+            "src/talker_pkg/package.xml",
+            PKG_XML.replace("demo_pkg", "talker_pkg").as_str(),
+        );
+        s.write(
+            "src/talker_pkg/Cargo.toml",
+            r#"
+[package]
+name = "talker_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "talker"
+path = "src/bin/talker.rs"
+
+[package.metadata.nros.component]
+class = "talker_pkg::Talker"
+name = "talker"
+"#,
+        );
+
+        let ws = Workspace::discover(&s.0).unwrap();
+        let pkg = ws
+            .packages
+            .iter()
+            .find(|p| p.name == "talker_pkg")
+            .expect("pkg");
+        let summary = &pkg.cargo_component_metadata[0];
+        // `metadata.name = "talker"` wins.
+        assert_eq!(summary.component, "talker");
+        // `[[bin]] name = "talker"` matches the component name → wins.
+        assert_eq!(summary.executable, "talker");
+    }
+
+    /// `[package.metadata.nros.components.<Name>]` multi-shape →
+    /// one summary per entry; the table key wins as the component
+    /// name when `metadata.name` is absent on the entry.
+    #[test]
+    fn synthetic_metadata_from_multi_components_table() {
+        let s = Scratch::new("mf17-multi");
+        s.write(
+            "src/multi_pkg/package.xml",
+            PKG_XML.replace("demo_pkg", "multi_pkg").as_str(),
+        );
+        s.write(
+            "src/multi_pkg/Cargo.toml",
+            r#"
+[package]
+name = "multi_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.nros.components.Talker]
+class = "multi_pkg::Talker"
+
+[package.metadata.nros.components.Listener]
+class = "multi_pkg::Listener"
+default_namespace = "/multi"
+"#,
+        );
+
+        let ws = Workspace::discover(&s.0).unwrap();
+        let pkg = ws
+            .packages
+            .iter()
+            .find(|p| p.name == "multi_pkg")
+            .expect("pkg");
+        assert_eq!(pkg.cargo_component_metadata.len(), 2);
+        // BTreeMap iteration order is key-sorted: Listener < Talker.
+        let listener = &pkg.cargo_component_metadata[0];
+        assert_eq!(listener.component, "Listener");
+        assert_eq!(listener.default_namespace.as_deref(), Some("/multi"));
+        let talker = &pkg.cargo_component_metadata[1];
+        assert_eq!(talker.component, "Talker");
+        assert!(talker.default_namespace.is_none());
+
+        let synth = ws.synthetic_metadata_artifacts();
+        assert_eq!(synth.len(), 2);
+    }
+
+    /// Package with no `Cargo.toml` (e.g. a CMake / Zephyr-only
+    /// component) → empty summary list, no error.
+    #[test]
+    fn synthetic_metadata_no_cargo_toml() {
+        let s = Scratch::new("mf17-no-cargo");
+        s.write(
+            "src/cmake_pkg/package.xml",
+            PKG_XML.replace("demo_pkg", "cmake_pkg").as_str(),
+        );
+        // No Cargo.toml.
+
+        let ws = Workspace::discover(&s.0).unwrap();
+        let pkg = ws
+            .packages
+            .iter()
+            .find(|p| p.name == "cmake_pkg")
+            .expect("pkg");
+        assert!(pkg.cargo_component_metadata.is_empty());
+        assert!(ws.synthetic_metadata_artifacts().is_empty());
+    }
+
+    /// Cargo.toml present but with no `[package.metadata.nros]` table →
+    /// empty summary list (e.g. a regular Rust library that happens to
+    /// sit next to a `package.xml`).
+    #[test]
+    fn synthetic_metadata_no_nros_table() {
+        let s = Scratch::new("mf17-no-nros");
+        s.write(
+            "src/plain_pkg/package.xml",
+            PKG_XML.replace("demo_pkg", "plain_pkg").as_str(),
+        );
+        s.write(
+            "src/plain_pkg/Cargo.toml",
+            r#"
+[package]
+name = "plain_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+"#,
+        );
+
+        let ws = Workspace::discover(&s.0).unwrap();
+        let pkg = ws
+            .packages
+            .iter()
+            .find(|p| p.name == "plain_pkg")
+            .expect("pkg");
+        assert!(pkg.cargo_component_metadata.is_empty());
+        assert!(ws.synthetic_metadata_artifacts().is_empty());
+    }
+
+    /// `node` (post-N.12 canonical key) is treated the same as
+    /// `component` (deprecated alias). The discovery path is
+    /// warning-free (the warning lives in `nros_config`).
+    #[test]
+    fn synthetic_metadata_accepts_node_alias() {
+        let s = Scratch::new("mf17-node");
+        s.write(
+            "src/node_pkg/package.xml",
+            PKG_XML.replace("demo_pkg", "node_pkg").as_str(),
+        );
+        s.write(
+            "src/node_pkg/Cargo.toml",
+            r#"
+[package]
+name = "node_pkg"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.nros.node]
+class = "node_pkg::Node"
+"#,
+        );
+
+        let ws = Workspace::discover(&s.0).unwrap();
+        let pkg = ws
+            .packages
+            .iter()
+            .find(|p| p.name == "node_pkg")
+            .expect("pkg");
+        assert_eq!(pkg.cargo_component_metadata.len(), 1);
+        assert_eq!(pkg.cargo_component_metadata[0].component, "Node");
     }
 
     #[test]
