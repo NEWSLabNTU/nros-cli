@@ -180,6 +180,7 @@ launch = "system.launch.xml"
 | `target` | string | yes      | Cargo target triple (`x86_64-unknown-linux-gnu`, `thumbv7m-none-eabi`, …) or a runner key whose semantics depend on `kind`. |
 | `launch` | string | no       | Per-target launch-file override (relative to `<bringup>/launch/`). Beats `[system].default_launch`. |
 | `board`  | string | no       | Board identifier (`mps2-an385`, `native_sim/native/64`, `qemu-armv7a-nsh`, …). Cross-refs the `nros-board-<id>` crate. |
+| `framework` | string | no    | PlatformIO-specific framework selector (`"espidf"`, `"arduino"`, …). Held verbatim and forwarded to the runner; ignored by non-PlatformIO targets. Added 2026-06-03 (F.4 §12 gap #3 resolution). |
 
 ---
 
@@ -348,26 +349,29 @@ landing v0.1. None block freezing the schema — each is a parser
 implementation gap to be fixed under a follow-up commit (NOT under
 F.4 itself per phase-doc scope).
 
-1. **`[system].default_launch` not accepted by `SystemHeader` yet.**
-   v0.1 documents the field per design-doc §11.3 + phase-212 F.4
-   revision note (2026-06-03). `SystemHeader` in
-   `cargo_metadata_schema.rs` still rejects it via
-   `deny_unknown_fields`. Follow-up: add
-   `pub default_launch: Option<String>` to `SystemHeader` with default
-   resolution `"system.launch.xml"`.
-2. **`[deploy.<target>]` `kind`/`target` are currently mandatory in the
-   parser, but in-tree fixtures (`multi_pkg_workspace_threadx`,
-   `multi_pkg_workspace_platformio`) carry deploy blocks with neither.**
-   Either tighten the fixtures, or relax the parser to make both
-   optional (the runner-stage interpretation is already free-form
-   enough to default). Recommend: make both optional + add a
-   `nros check` lint that requires them when `kind != "self"`.
-3. **`[deploy.platformio].framework` exists in the platformio
-   fixture but is not a schema field.** `deny_unknown_fields` rejects
-   it — fixture is stale or the schema needs a `framework` key under
-   the PlatformIO deploy kind. Follow-up: either drop the field from
-   the fixture or extend `DeployTarget` with an optional
-   `framework: Option<String>` (used by PlatformIO/ESP-IDF).
+1. **RESOLVED 2026-06-03** — *`[system].default_launch` not accepted by
+   `SystemHeader`.* Fixed in the phase-212-f4-parser-fixes branch
+   (commit `f1e42a9`). `SystemHeader` now carries
+   `pub default_launch: Option<String>` alongside `name` / `rmw` /
+   `domain_id` / `locator`. The §3.1 five-step resolution order is
+   unchanged; the parser just records the user's value (or `None` for
+   the §3.1 step-5 hard fallback).
+2. **RESOLVED 2026-06-03** — *`[deploy.<target>]` `kind`/`target`
+   mandatory.* Fixed in commit `a2b2098` via path (a) — relax parser.
+   Both fields are now `Option<String>`. Rationale: deploy is
+   configuration-by-TARGET (the map key already names the runner), and
+   the in-tree `multi_pkg_workspace_threadx` /
+   `multi_pkg_workspace_platformio` fixtures author the looser shape.
+   `deny_unknown_fields` is preserved. The companion `nros check` lint
+   (warn when `kind`/`target` is absent AND the runner can't
+   synthesise sensible defaults from the target name) is **deferred** —
+   it depends on the runner-side synthesis-defaults table that lives
+   in pkg_index / launch territory (concurrent N.* worker scope).
+3. **RESOLVED 2026-06-03** — *`[deploy.platformio].framework` not a
+   schema field.* Fixed in commit `83d99c9` by extending `DeployTarget`
+   with `pub framework: Option<String>` (§6 above lists it as an
+   optional PlatformIO-specific field). Round-trip-tested through the
+   `multi_pkg_workspace_platformio` fixture shape.
 4. **`[[component]]`/`[[domain]]`/`[[bridge]]` use the
    `#[serde(rename = "component"/"domain"/"bridge")]` singular form
    on the Rust side but Vec-of-rows TOML form on disk.** Documented
