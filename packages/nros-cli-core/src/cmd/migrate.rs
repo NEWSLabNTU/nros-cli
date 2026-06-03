@@ -4,9 +4,18 @@
 //! `component_nros.toml` / `nros/components/*.toml` + committed `metadata/*.json`
 //! + hand-maintained `package.xml`) to the post-212 shape (workspace-root
 //! `Cargo.toml` `[workspace.metadata.nros]`, per-package
-//! `Cargo.toml.[package.metadata.nros.component(s)]` +
+//! `Cargo.toml.[package.metadata.nros.node(s)]` +
 //! `[package.metadata.ament]`, regenerated `package.xml`, dedicated
 //! `<bringup>/system.toml` + `<bringup>/launch/system.launch.xml`).
+//!
+//! Post-N.12 (Component → Node rename, 2026-06-03): the migrator emits the
+//! **new** `node` / `nodes` spelling for `[package.metadata.nros]` entries —
+//! this verb's whole purpose is to land a current-shape workspace, so it
+//! writes the post-rename terminology even though the legacy input files we
+//! read still call the field `component` / `components`. Pre-212
+//! `component_nros.toml` inputs keep the legacy `component = "..."` field
+//! name (pre-rename); we accept `node = "..."` as a deserialize alias so a
+//! partially-edited pre-212 tree still migrates.
 //!
 //! See `docs/roadmap/phase-212-ux-cargo-native-and-file-consolidation.md` §212.I.
 
@@ -108,9 +117,16 @@ struct PreComponent {
 }
 
 /// Permissive — pre-212 manifests carry various extra fields we don't read.
+///
+/// Post-N.12 the canonical instance-name field is `node`, but pre-212 files
+/// were authored with `component`. We accept either spelling via a serde
+/// alias — pre-212 files that have already been hand-edited to the new
+/// `node = "..."` field name still parse, while untouched pre-212 files keep
+/// working.
 #[derive(Debug, Clone, Deserialize)]
 struct LegacyComponentConfig {
     package: String,
+    #[serde(alias = "node")]
     component: String,
     #[serde(default)]
     linkage: Option<toml::Value>,
@@ -368,7 +384,7 @@ fn print_plan(plan: &MigrationPlan) {
                 println!("  move    {} → {}", rel(from), rel(to))
             }
             Step::PatchPackageCargoToml { pkg_dir } => println!(
-                "  patch   {}/Cargo.toml [package.metadata.nros.component(s)] + \
+                "  patch   {}/Cargo.toml [package.metadata.nros.node(s)] + \
                  [package.metadata.ament]",
                 rel(pkg_dir)
             ),
@@ -563,18 +579,22 @@ fn patch_package_cargo_toml(pkg_dir: &Path, comps: &[PreComponent]) -> Result<()
 }
 
 fn render_nros_metadata_table(comps: &[PreComponent]) -> Table {
+    // Post-N.12 (2026-06-03): emit the new `node` / `nodes` spelling. The
+    // migrator's job is to land a current-shape workspace, so output uses the
+    // post-rename terminology even though the legacy input files we read
+    // still call the field `component` / `components`.
     let mut nros_tbl = Table::new();
     if comps.len() == 1 {
         let c = &comps[0];
-        nros_tbl["component"] = Item::Table(render_component_table(&c.cfg));
+        nros_tbl["node"] = Item::Table(render_component_table(&c.cfg));
     } else {
-        let mut components_tbl = Table::new();
-        components_tbl.set_implicit(true);
+        let mut nodes_tbl = Table::new();
+        nodes_tbl.set_implicit(true);
         for c in comps {
             let name = c.cfg.component.clone();
-            components_tbl[&name] = Item::Table(render_component_table(&c.cfg));
+            nodes_tbl[&name] = Item::Table(render_component_table(&c.cfg));
         }
-        nros_tbl["components"] = Item::Table(components_tbl);
+        nros_tbl["nodes"] = Item::Table(nodes_tbl);
     }
     nros_tbl
 }
@@ -893,9 +913,10 @@ mod tests {
         );
         let pkg = ws.join("src/demo_pkg");
         let cargo_toml = fs::read_to_string(pkg.join("Cargo.toml")).unwrap();
+        // Post-N.12 (2026-06-03) — migrator emits the new `node` spelling.
         assert!(
-            cargo_toml.contains("[package.metadata.nros.component]"),
-            "Cargo.toml missing nros.component table:\n{cargo_toml}"
+            cargo_toml.contains("[package.metadata.nros.node]"),
+            "Cargo.toml missing nros.node table:\n{cargo_toml}"
         );
         assert!(
             cargo_toml.contains("[package.metadata.ament]"),
@@ -937,11 +958,12 @@ mod tests {
         assert!(bringup.join("system.toml").is_file());
         let pkg = ws.join("src/demo_container");
         let cargo_toml = fs::read_to_string(pkg.join("Cargo.toml")).unwrap();
-        // Multi-component → use the table-of-tables shape.
+        // Multi-node → use the table-of-tables shape.
+        // Post-N.12 (2026-06-03) — migrator emits the new `nodes` spelling.
         assert!(
-            cargo_toml.contains("[package.metadata.nros.components.")
-                || cargo_toml.contains("metadata.nros.components"),
-            "Cargo.toml missing nros.components table:\n{cargo_toml}"
+            cargo_toml.contains("[package.metadata.nros.nodes.")
+                || cargo_toml.contains("metadata.nros.nodes"),
+            "Cargo.toml missing nros.nodes table:\n{cargo_toml}"
         );
         assert!(!pkg.join("nros/components").exists(), "nros/components not deleted");
         assert!(!pkg.join("metadata").exists(), "metadata/ not deleted");
