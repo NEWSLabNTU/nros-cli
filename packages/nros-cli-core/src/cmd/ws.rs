@@ -4,7 +4,7 @@
 //!
 //! * `env` — print shell export for `NROS_INTERFACE_SEARCH_PATH`.
 //! * `sync` — scan workspace, codegen msg pkgs into
-//!   `build/nros_generator_rs/<pkg>/`, write `[patch.crates-io]`
+//!   `generated/<pkg>/`, write `[patch.crates-io]`
 //!   block into the patch authority Cargo.toml so plain `cargo build`
 //!   resolves `local_msgs = "*"` to the generated crate.
 //!
@@ -57,7 +57,7 @@ pub enum Sub {
     /// one-line summary of `n up-to-date / n stale / n missing`.
     Status(StatusArgs),
 
-    /// Remove `build/nros_generator_rs/` + the auto-managed
+    /// Remove `generated/` + the auto-managed
     /// `[patch.crates-io]` block from each Rust consumer's patch authority
     /// Cargo.toml. Leaves user-written sections alone.
     Clean(CleanArgs),
@@ -92,8 +92,8 @@ pub struct SyncArgs {
     /// Workspace root (the dir containing `src/`). Defaults to cwd.
     pub workspace: Option<PathBuf>,
 
-    /// Build-dir for codegen output (colcon convention is `build/`).
-    #[arg(long, default_value = "build")]
+    /// Output dir for generated msg crates (Phase 212 convention is `generated/`).
+    #[arg(long, default_value = "generated")]
     pub build_dir: PathBuf,
 
     /// ROS 2 edition (`humble` | `iron`).
@@ -113,12 +113,13 @@ pub struct SyncArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Path to the nano-ros source tree (the dir containing `packages/core/
-    /// nros-core/`). When set, sync also writes `[patch.crates-io]` entries
-    /// for the nros-* runtime crates (nros, nros-core, nros-serdes,
-    /// nros-platform, …) into the same block so the generated msg crates'
-    /// `nros-core = "*"` etc. deps resolve. Falls back to the env var
-    /// `NROS_REPO_DIR` (cmake-side contract) when the flag is omitted.
+    /// Path to the nano-ros source tree. Accepted for back-compat but
+    /// currently a NO-OP since post-212 alignment: the canonical 212
+    /// shape carries nros-* runtime crates as path-deps in the user's
+    /// own `[dependencies]`, so duplicating them in the patch block
+    /// triggers cargo's "patch unused" warnings. Falls back to the env
+    /// var `NROS_REPO_DIR` (cmake-side contract) when the flag is
+    /// omitted.
     #[arg(long)]
     pub nano_ros_path: Option<PathBuf>,
 }
@@ -133,14 +134,14 @@ pub struct ListArgs {
 #[derive(Debug, ClapArgs)]
 pub struct StatusArgs {
     pub workspace: Option<PathBuf>,
-    #[arg(long, default_value = "build")]
+    #[arg(long, default_value = "generated")]
     pub build_dir: PathBuf,
 }
 
 #[derive(Debug, ClapArgs)]
 pub struct CleanArgs {
     pub workspace: Option<PathBuf>,
-    #[arg(long, default_value = "build")]
+    #[arg(long, default_value = "generated")]
     pub build_dir: PathBuf,
     /// Don't write — just print what would be removed.
     #[arg(long)]
@@ -150,7 +151,7 @@ pub struct CleanArgs {
 #[derive(Debug, ClapArgs)]
 pub struct DoctorArgs {
     pub workspace: Option<PathBuf>,
-    #[arg(long, default_value = "build")]
+    #[arg(long, default_value = "generated")]
     pub build_dir: PathBuf,
 }
 
@@ -306,7 +307,7 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     if args.dry_run {
         for name in &topo {
             let pkg = scan.iter().find(|p| &p.name == name).unwrap();
-            let out = build_root.join(name).join("nros_generator_rs");
+            let out = build_root.join(name);
             println!(
                 "ws sync: WOULD codegen {} from {} → {}",
                 name,
@@ -378,24 +379,6 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     Ok(())
 }
 
-// nano-ros runtime crates that generated msg-binding crates depend on. The
-// patch block lists each with a `path = "<nano-ros>/packages/core/<crate>"`
-// entry so cargo resolves `nros-core = "*"` etc. without a published
-// registry entry.
-const NROS_RUNTIME_CRATES: &[(&str, &str)] = &[
-    ("nros", "packages/core/nros"),
-    ("nros-core", "packages/core/nros-core"),
-    ("nros-serdes", "packages/core/nros-serdes"),
-    ("nros-platform", "packages/core/nros-platform"),
-    ("nros-platform-cffi", "packages/core/nros-platform-cffi"),
-    ("nros-node", "packages/core/nros-node"),
-    ("nros-rmw", "packages/core/nros-rmw"),
-    ("nros-rmw-cffi", "packages/core/nros-rmw-cffi"),
-    ("nros-log", "packages/core/nros-log"),
-    ("nros-macros", "packages/core/nros-macros"),
-    // RMW backend crates (zenoh-pico for now; cyclonedds + xrce later).
-    ("nros-rmw-zenoh", "packages/zpico/nros-rmw-zenoh"),
-];
 
 fn parse_edition(s: &str) -> Result<RosEdition> {
     match s.to_lowercase().as_str() {
@@ -413,7 +396,7 @@ fn codegen_workspace_pkg(
     edition: RosEdition,
     verbose: bool,
 ) -> Result<()> {
-    let out_dir = build_root.join("nros_generator_rs");
+    let out_dir = build_root;
     std::fs::create_dir_all(&out_dir)
         .wrap_err_with(|| format!("ws sync: mkdir {}", out_dir.display()))?;
     if verbose {
@@ -466,7 +449,7 @@ fn codegen_ament_deps_for(
             continue;
         };
         // Codegen the AMENT pkg.
-        let out_dir = build_root.join("nros_generator_rs");
+        let out_dir = build_root;
         std::fs::create_dir_all(&out_dir)?;
         if verbose {
             println!("ws sync: codegen AMENT pkg {} → {}", amented.name, out_dir.display());
@@ -698,34 +681,38 @@ fn render_patch_block(
     // No timestamp — deterministic output keeps the committed Cargo.toml
     // diff-stable across re-syncs (only path entries change when the user
     // adds/removes a msg pkg). For "when did sync last run" debugging,
-    // grep the build/nros_generator_rs/<pkg>/Cargo.toml mtime.
+    // grep the generated/<pkg>/Cargo.toml mtime.
     out.push_str("# Auto-generated by `nros ws sync`. Do not edit between\n");
     out.push_str("# the BEGIN/END markers — re-run sync instead.\n");
     out.push_str("[patch.crates-io]\n");
 
-    // 1) Generated msg crates (path = build/nros_generator_rs/<pkg>).
+    // 1) Generated msg crates (path = generated/<pkg>).
     for pkg in pkgs {
-        let crate_root = build_root.join("nros_generator_rs").join(pkg);
+        let crate_root = build_root.join(pkg);
         let rel = pathdiff::diff_paths(&crate_root, authority_dir).unwrap_or(crate_root);
         out.push_str(&format!("{pkg} = {{ path = \"{}\" }}\n", rel.display()));
     }
 
-    // 2) nros-* runtime crates (path = <nano-ros>/packages/core/<crate>).
-    //    Only emitted when --nano-ros-path / NROS_REPO_DIR is set.
+    // 2) Minimum runtime patches the GENERATED msg crates depend on.
+    //    Generated `<pkg>/Cargo.toml` carries `nros-core = "*"` +
+    //    `nros-serdes = "*"` (registry-style), so even when the user's
+    //    own Cargo.toml has direct path-deps for the larger nros-*
+    //    runtime (canonical 212 shape), the generated crates need
+    //    `[patch.crates-io]` entries for these two specific crates to
+    //    resolve. Larger nros-* runtime patches were dropped post-212
+    //    merge — they triggered cargo's "patch unused" warnings.
     if let Some(nrp) = nano_ros_path {
-        out.push_str("\n# nros-* runtime crates\n");
-        for (cname, sub) in NROS_RUNTIME_CRATES {
+        for (cname, sub) in &[
+            ("nros-core", "packages/core/nros-core"),
+            ("nros-serdes", "packages/core/nros-serdes"),
+        ] {
             let crate_root = nrp.join(sub);
             if !crate_root.join("Cargo.toml").is_file() {
-                continue; // skip crates not in this layout
+                continue;
             }
             let rel = pathdiff::diff_paths(&crate_root, authority_dir).unwrap_or(crate_root);
             out.push_str(&format!("{cname} = {{ path = \"{}\" }}\n", rel.display()));
         }
-    } else {
-        out.push_str("# (nros-* runtime crates not patched — pass --nano-ros-path or set\n");
-        out.push_str("#  NROS_REPO_DIR to add them; otherwise the generated crates' nros-core\n");
-        out.push_str("#  etc. deps must resolve via the user's own [patch.crates-io] entries.)\n");
     }
 
     out.push_str(&format!("{END}\n"));
@@ -763,7 +750,7 @@ fn check_freshness(
     for name in topo {
         let pkg = scan.iter().find(|p| &p.name == name).unwrap();
         let crate_root = build_root
-            .join("nros_generator_rs")
+            
             .join(name);
         let cargo = crate_root.join("Cargo.toml");
         if !cargo.is_file() {
@@ -902,7 +889,7 @@ fn run_status(args: StatusArgs) -> Result<()> {
     let mut stale = 0;
     let mut missing = 0;
     for pkg in &msg_pkgs {
-        let crate_root = build_root.join("nros_generator_rs").join(&pkg.name);
+        let crate_root = build_root.join(&pkg.name);
         let cargo = crate_root.join("Cargo.toml");
         if !cargo.is_file() {
             missing += 1;
@@ -955,7 +942,7 @@ fn run_status(args: StatusArgs) -> Result<()> {
 fn run_clean(args: CleanArgs) -> Result<()> {
     let (ws_root, scan, build_root) =
         scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
-    let gen_dir = build_root.join("nros_generator_rs");
+    let gen_dir = build_root;
     if gen_dir.is_dir() {
         if args.dry_run {
             println!("ws clean: WOULD rm -rf {}", gen_dir.display());
