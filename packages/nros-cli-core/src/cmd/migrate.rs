@@ -303,6 +303,10 @@ fn convert_deploy(
             target: Some(target),
             launch: tbl.get("launch").and_then(|v| v.as_str()).map(str::to_string),
             board: tbl.get("board").and_then(|v| v.as_str()).map(str::to_string),
+            framework: tbl
+                .get("framework")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         },
     )
 }

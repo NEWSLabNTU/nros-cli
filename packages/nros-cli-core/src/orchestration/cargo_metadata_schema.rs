@@ -325,6 +325,14 @@ pub struct DeployTarget {
     /// Optional board identifier (e.g. `mps2_an385`, `qemu_riscv64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<String>,
+    /// Optional framework identifier for runners that surface one — today
+    /// PlatformIO (`"espidf"`, `"arduino"`, …) and indirectly ESP-IDF. Held
+    /// verbatim and forwarded to the runner stage; no schema-level
+    /// validation. Resolves F.4 §12 known gap #3 (the platformio fixture
+    /// authored `framework = "espidf"` against a `DeployTarget` that
+    /// didn't know the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
 }
 
 /// `[[domain]]` row.
@@ -841,6 +849,43 @@ launch = "launch/system.launch.xml"
         assert!(dt.target.is_none(), "target absent when omitted");
         assert_eq!(dt.launch.as_deref(), Some("launch/system.launch.xml"));
         assert!(dt.board.is_none());
+    }
+
+    /// `[deploy.<target>].framework` is accepted (F.4 §12 known gap #3).
+    /// PlatformIO carries `framework = "espidf"` / `"arduino"` / … on its
+    /// deploy block; the field passes through verbatim for the runner.
+    /// Mirrors the `multi_pkg_workspace_platformio` fixture.
+    #[test]
+    fn accepts_platformio_framework_field() {
+        let raw = r#"
+[system]
+name = "demo"
+rmw = "zenoh"
+domain_id = 0
+
+[[component]]
+pkg = "talker_pkg"
+class = "talker_pkg::talker"
+name = "talker"
+
+[deploy.platformio]
+launch = "launch/system.launch.xml"
+framework = "espidf"
+board = "esp32dev"
+"#;
+        let v: SystemToml = toml::from_str(raw)
+            .expect("framework field must parse (F.4 §12 gap #3)");
+        let dt = v
+            .deploy
+            .get("platformio")
+            .expect("platformio deploy present");
+        assert_eq!(dt.framework.as_deref(), Some("espidf"));
+        assert_eq!(dt.board.as_deref(), Some("esp32dev"));
+        assert_eq!(dt.launch.as_deref(), Some("launch/system.launch.xml"));
+        // Round-trip: serialized form keeps the field.
+        let reser = toml::to_string(&v).expect("ser");
+        let v2: SystemToml = toml::from_str(&reser).expect("reparse");
+        assert_eq!(v, v2);
     }
 
     /// `deny_unknown_fields` on `[system]` catches typos at the bringup

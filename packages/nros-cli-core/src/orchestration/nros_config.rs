@@ -554,6 +554,7 @@ fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry 
                 target: Some(target_name.clone()),
                 launch: None,
                 board: dt.board.clone(),
+                framework: None,
             },
         );
     }
