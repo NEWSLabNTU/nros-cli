@@ -8,7 +8,12 @@
 //!
 //! Lets users `nros launch <bringup>` on a desktop / native_sim host
 //! without depending on the ament index — `ros2 launch` requires
-//! `colcon build && source install/setup.bash`, this doesn't.
+//! `colcon build && source install/setup.bash`, this doesn't. This is
+//! the **canonical desktop launcher** for development; `ros2 launch`
+//! remains available for ament-installed consumers (separate path, no
+//! overlap). See `docs/design/multi-node-workspace-layout.md` §11 for
+//! the role of bringup pkgs and how `nros launch` reads `launch/` from
+//! the source tree, not from an ament install share path.
 //!
 //! Scope: **hosted/native targets only**. A `[deploy.<target>]` whose
 //! `kind` is `"qemu"` / `"flash"` is a clear error — those need their own

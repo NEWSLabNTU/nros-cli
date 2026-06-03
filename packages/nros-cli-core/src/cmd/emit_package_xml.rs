@@ -178,6 +178,17 @@ fn render_component(cargo_toml: &Path) -> Result<String> {
 // Bringup pkg path
 // ---------------------------------------------------------------------------
 
+// Phase 212.J.5 policy — the generated bringup `package.xml` deliberately
+// does NOT emit `<buildtool_depend>ament_cmake</buildtool_depend>`. The
+// canonical desktop launcher (`nros launch`) reads `launch/*.launch.xml`
+// straight from the bringup pkg's source tree, not from an ament install
+// `share/<pkg>/launch/` path, so a colcon outer build is never required
+// to exercise a workspace. Users who want stock `ros2 launch <bringup>`
+// compatibility add `<buildtool_depend>ament_cmake</buildtool_depend>`
+// themselves (the emit is generator-owned; the drift checker only
+// rejects edits to the marker-bearing region). See
+// `docs/design/multi-node-workspace-layout.md` §11.1 in the nano-ros
+// tree for the policy + rationale.
 fn render_bringup(system_toml: &Path) -> Result<String> {
     let raw = std::fs::read_to_string(system_toml)
         .with_context(|| format!("read {}", system_toml.display()))?;

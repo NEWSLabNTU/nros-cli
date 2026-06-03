@@ -99,6 +99,15 @@ pub enum Cmd {
     /// Spawn a bringup pkg's components on the host (Phase 212.J — no ament
     /// install required; the desktop / native_sim alternative to
     /// `ros2 launch`).
+    ///
+    /// Canonical desktop launcher for development: reads
+    /// `<bringup>/launch/<file>.launch.xml` straight from source (no
+    /// `colcon build && source install/setup.bash`) and spawns one host
+    /// process per `[[component]]` with the env the runtime expects.
+    /// `ros2 launch` stays available for ament-installed consumers — the
+    /// two paths don't overlap. See the multi-node-workspace-layout
+    /// design doc §11 (`docs/design/multi-node-workspace-layout.md` in
+    /// the nano-ros tree) for the role of bringup pkgs.
     Launch(launch::Args),
 
     /// Resolve + fetch a board's toolchain/SDK packages (Phase 187)
