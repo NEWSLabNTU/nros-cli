@@ -113,6 +113,16 @@ pub struct SyncArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Bypass the per-pkg mtime guard and regenerate every pkg
+    /// unconditionally. By default `sync` skips a pkg's codegen when its
+    /// `*.msg`/`*.srv`/`*.action`/`package.xml` are all older than the
+    /// generated `Cargo.toml` AND no in-workspace dep was just regenerated
+    /// (transitive freshness). Use `--force` to drop both checks — useful
+    /// after a `rosidl_codegen` toolchain bump or when the generator
+    /// itself changed.
+    #[arg(long)]
+    pub force: bool,
+
     /// Path to the nano-ros source tree. Accepted for back-compat but
     /// currently a NO-OP since post-212 alignment: the canonical 212
     /// shape carries nros-* runtime crates as path-deps in the user's
@@ -241,7 +251,31 @@ struct WsPkg {
     deps: Vec<String>,
 }
 
+/// Result of a `sync` run — exposed for integration tests and
+/// future tooling that wants to assert on the codegen / skip
+/// decisions without parsing stdout.
+///
+/// Pre-Phase-210.D.2 callers don't need this — `run_sync` still
+/// prints the human-readable lines exactly as before.
+#[derive(Debug, Default, Clone)]
+pub struct SyncReport {
+    /// Workspace + AMENT pkg names that were actually re-emitted in
+    /// this run. Order matches the codegen order (topo for workspace
+    /// pkgs, depth-first for AMENT deps).
+    pub regenerated: Vec<String>,
+    /// Pkg names the mtime guard short-circuited. Empty when
+    /// `--force` was passed.
+    pub skipped_up_to_date: Vec<String>,
+}
+
 fn run_sync(args: SyncArgs) -> Result<()> {
+    sync(args).map(|_report| ())
+}
+
+/// Public entry point — like `run_sync` but returns a `SyncReport`
+/// for callers that want to introspect the decisions. Stdout still
+/// carries the same human-readable lines `run_sync` prints.
+pub fn sync(args: SyncArgs) -> Result<SyncReport> {
     let ws_root: PathBuf = match args.workspace {
         Some(p) => std::fs::canonicalize(&p)
             .wrap_err_with(|| format!("ws sync: {}", p.display()))?,
@@ -282,9 +316,10 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     } else {
         scan_workspace(&src_root, &mut scan)?;
     }
+    let mut report = SyncReport::default();
     if scan.is_empty() {
         println!("ws sync: no pkgs under {}", src_root.display());
-        return Ok(());
+        return Ok(report);
     }
     let msg_pkgs: Vec<&WsPkg> = scan.iter().filter(|p| p.is_msg_pkg).collect();
     let topo = topo_sort_msg_pkgs(&msg_pkgs)?;
@@ -301,7 +336,8 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     }
 
     if args.check {
-        return check_freshness(&ws_root, &build_root, &scan, &topo);
+        check_freshness(&ws_root, &build_root, &scan, &topo)?;
+        return Ok(report);
     }
 
     if args.dry_run {
@@ -315,7 +351,7 @@ fn run_sync(args: SyncArgs) -> Result<()> {
                 out.display()
             );
         }
-        return Ok(());
+        return Ok(report);
     }
 
     let edition = parse_edition(&args.ros_edition)?;
@@ -323,17 +359,56 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     // Track every pkg we generate so a later iteration (or AMENT-dep walk)
     // skips already-emitted ones. Keyed by pkg name.
     let mut emitted: HashSet<String> = HashSet::new();
+    // Phase 210.D.2 mtime guard: `regenerated` holds the names that were
+    // actually re-emitted (vs `emitted` which includes mtime-skipped
+    // pkgs). If a pkg's in-workspace dep was regenerated, that pkg is
+    // forcibly stale even when its own inputs didn't move — its
+    // generated `use <dep>::…` sites might now reference different
+    // symbols.
+    let mut regenerated: HashSet<String> = HashSet::new();
+    let in_workspace_names: HashSet<&str> =
+        scan.iter().map(|p| p.name.as_str()).collect();
 
     for name in &topo {
         let pkg = scan.iter().find(|p| &p.name == name).unwrap();
         // First materialize any AMENT-resolved cross-deps so the workspace
         // pkg's deps closure exists in build/ too. Skips workspace deps
         // (those are handled by topo order itself).
-        codegen_ament_deps_for(&pkg.deps, &scan, &build_root, edition, &mut emitted, args.verbose)?;
+        codegen_ament_deps_for(
+            &pkg.deps,
+            &scan,
+            &build_root,
+            edition,
+            &mut emitted,
+            &mut regenerated,
+            &mut report,
+            args.verbose,
+            args.force,
+        )?;
         // Now generate the workspace pkg itself directly from its dir.
         if !emitted.contains(name) {
-            codegen_workspace_pkg(pkg, &build_root, edition, args.verbose)?;
-            emitted.insert(name.clone());
+            // Up-to-date iff own inputs unchanged AND no in-workspace dep
+            // was regenerated in this run.
+            let any_ws_dep_regen = pkg
+                .deps
+                .iter()
+                .any(|d| in_workspace_names.contains(d.as_str()) && regenerated.contains(d));
+            let pkg_out_dir = build_root.join(&pkg.name);
+            let up_to_date = !args.force
+                && !any_ws_dep_regen
+                && pkg_is_up_to_date(&pkg.dir, &pkg_out_dir);
+            if up_to_date {
+                if args.verbose {
+                    println!("ws sync: {} up-to-date (mtime check)", pkg.name);
+                }
+                emitted.insert(name.clone());
+                report.skipped_up_to_date.push(name.clone());
+            } else {
+                codegen_workspace_pkg(pkg, &build_root, edition, args.verbose)?;
+                emitted.insert(name.clone());
+                regenerated.insert(name.clone());
+                report.regenerated.push(name.clone());
+            }
         }
     }
     // Also generate AMENT deps for every Rust consumer (pkg.xml deps).
@@ -342,12 +417,22 @@ fn run_sync(args: SyncArgs) -> Result<()> {
         .filter(|p| p.is_rust_pkg && !p.is_msg_pkg)
         .collect();
     for c in &rust_consumers {
-        codegen_ament_deps_for(&c.deps, &scan, &build_root, edition, &mut emitted, args.verbose)?;
+        codegen_ament_deps_for(
+            &c.deps,
+            &scan,
+            &build_root,
+            edition,
+            &mut emitted,
+            &mut regenerated,
+            &mut report,
+            args.verbose,
+            args.force,
+        )?;
     }
 
     if rust_consumers.is_empty() {
         println!("ws sync: no Rust consumer pkgs — patch tables not written.");
-        return Ok(());
+        return Ok(report);
     }
 
     // Group consumers by patch authority. Cargo workspace covers many
@@ -376,7 +461,7 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     }
 
     println!("ws sync: done.");
-    Ok(())
+    Ok(report)
 }
 
 
@@ -385,6 +470,87 @@ fn parse_edition(s: &str) -> Result<RosEdition> {
         "humble" => Ok(RosEdition::Humble),
         "iron" => Ok(RosEdition::Iron),
         other => bail!("ws sync: unknown ROS edition '{other}' (humble | iron)"),
+    }
+}
+
+// --- mtime guard (Phase 210.D.2) ---------------------------------------------
+//
+// The per-pkg codegen step is the heaviest piece of `nros ws sync` — for a
+// workspace with multiple AMENT-resolved deps (e.g. `std_msgs` +
+// `builtin_interfaces` + the local pkgs) a clean re-sync re-emits hundreds
+// of generated files for no reason. The guard below compares the newest
+// mtime of every interface input under a pkg's source dir against the
+// mtime of the previously-emitted `Cargo.toml` and skips codegen when
+// the latter is at least as new. A pkg is also forcibly stale when any
+// of its in-workspace deps was just regenerated in the current run —
+// captured via the `regenerated` set threaded through the loop.
+
+/// Newest mtime among interface inputs under `pkg_dir`:
+///   * every regular file under `msg/`, `srv/`, `action/` (recursive 1
+///     level — that's the colcon layout),
+///   * the pkg's own `package.xml`.
+/// Returns `None` if the dir has no inputs or all metadata reads fail.
+fn newest_input_mtime(pkg_dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut consider = |p: &Path| {
+        if let Ok(meta) = std::fs::metadata(p) {
+            if let Ok(mt) = meta.modified() {
+                newest = Some(match newest {
+                    Some(n) if n >= mt => n,
+                    _ => mt,
+                });
+            }
+        }
+    };
+    let pxml = pkg_dir.join("package.xml");
+    if pxml.is_file() {
+        consider(&pxml);
+    }
+    for subdir in &["msg", "srv", "action"] {
+        let d = pkg_dir.join(subdir);
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                consider(&e.path());
+            }
+        }
+    }
+    newest
+}
+
+/// True iff the pkg's generated crate at `<build_root>/<name>/Cargo.toml`
+/// exists AND its mtime is >= the newest interface-input mtime under
+/// `pkg_dir`. Returns false on any uncertainty (missing generated tree,
+/// metadata read failure, no inputs found) — that path falls through to
+/// codegen, preserving the pre-Phase-210.D.2 behaviour.
+fn pkg_is_up_to_date(pkg_dir: &Path, generated_dir: &Path) -> bool {
+    let cargo = generated_dir.join("Cargo.toml");
+    let Ok(gen_meta) = std::fs::metadata(&cargo) else {
+        return false;
+    };
+    let Ok(gen_mt) = gen_meta.modified() else {
+        return false;
+    };
+    let Some(src_mt) = newest_input_mtime(pkg_dir) else {
+        return false;
+    };
+    gen_mt >= src_mt
+}
+
+/// Bump the generated `Cargo.toml`'s mtime to "now" after a codegen
+/// run, regardless of whether `write_if_changed` actually touched the
+/// file. The generator skips writes when content is identical (so
+/// downstream cargo rebuilds don't fire spuriously), but the mtime
+/// guard above uses Cargo.toml as its freshness witness — without the
+/// bump, an edit to a `.msg` body that doesn't change the generated
+/// dep set leaves Cargo.toml unchanged, and the next sync's guard
+/// reads a stale (pre-edit) mtime and concludes "still stale" forever.
+fn touch_witness(generated_dir: &Path) {
+    let cargo = generated_dir.join("Cargo.toml");
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&cargo) {
+        let _ = f.set_modified(std::time::SystemTime::now());
     }
 }
 
@@ -415,18 +581,30 @@ fn codegen_workspace_pkg(
     // already namespaces by language — the extra `rust/` colcon adds is
     // there to coexist with `<pkg>/c/`, `<pkg>/cpp/`, etc. inside the
     // same generator's output, which we don't have.
+    touch_witness(&out_dir.join(&pkg.name));
     Ok(())
 }
 
 // Resolve AMENT-side deps (the per-pkg.xml `<depend>` tags not in workspace)
 // and codegen each via Package::from_share_dir over its AMENT share path.
+//
+// Phase 210.D.2: AMENT share dirs are read-only under
+// `$AMENT_PREFIX_PATH/share/<pkg>` and effectively immutable across sync
+// runs (a system upgrade is the only way they move). The mtime guard
+// applies here too: a regenerated AMENT pkg whose share-dir mtime is
+// older than its emitted Cargo.toml is skipped. This is the case that
+// makes a no-op re-sync of a workspace with std_msgs/builtin_interfaces
+// deps print zero `codegen <pkg>` lines on the second run.
 fn codegen_ament_deps_for(
     deps: &[String],
     scan: &[WsPkg],
     build_root: &Path,
     edition: RosEdition,
     emitted: &mut HashSet<String>,
+    regenerated: &mut HashSet<String>,
+    report: &mut SyncReport,
     verbose: bool,
+    force: bool,
 ) -> Result<()> {
     // Pre-load ament index once per invocation.
     static AMENT_INDEX: std::sync::OnceLock<Option<rosidl_bindgen::ament::AmentIndex>> =
@@ -451,13 +629,27 @@ fn codegen_ament_deps_for(
         // Codegen the AMENT pkg.
         let out_dir = build_root;
         std::fs::create_dir_all(&out_dir)?;
-        if verbose {
-            println!("ws sync: codegen AMENT pkg {} → {}", amented.name, out_dir.display());
+        // mtime guard: AMENT share dirs are read-only so this practically
+        // caches forever once first emitted (only ROS upgrades move them).
+        let pkg_out_dir = out_dir.join(&amented.name);
+        let up_to_date = !force && pkg_is_up_to_date(&amented.share_dir, &pkg_out_dir);
+        if up_to_date {
+            if verbose {
+                println!("ws sync: {} up-to-date (mtime check, AMENT)", amented.name);
+            }
+            report.skipped_up_to_date.push(amented.name.clone());
         } else {
-            println!("ws sync: codegen {}", amented.name);
+            if verbose {
+                println!("ws sync: codegen AMENT pkg {} → {}", amented.name, out_dir.display());
+            } else {
+                println!("ws sync: codegen {}", amented.name);
+            }
+            rosidl_bindgen::generator::generate_package(&amented, &out_dir, edition)
+                .wrap_err_with(|| format!("ws sync: generate_package failed for {}", amented.name))?;
+            touch_witness(&out_dir.join(&amented.name));
+            regenerated.insert(amented.name.clone());
+            report.regenerated.push(amented.name.clone());
         }
-        rosidl_bindgen::generator::generate_package(&amented, &out_dir, edition)
-            .wrap_err_with(|| format!("ws sync: generate_package failed for {}", amented.name))?;
         emitted.insert(amented.name.clone());
         // Queue this pkg's own deps (parse its package.xml).
         let pxml = amented.share_dir.join("package.xml");
