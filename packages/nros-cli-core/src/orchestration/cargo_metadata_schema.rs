@@ -76,43 +76,107 @@ pub struct WorkspaceMetadataNros {
 pub struct PackageMetadataNros {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<ComponentMetadata>,
+    /// Phase 212.N.12 (in-flight) — `node` is the forward-looking spelling of
+    /// the `component` shape. The reader accepts BOTH spellings during the
+    /// in-flight rename (Phase 212.B.2 task spec). Mutually exclusive with
+    /// `component` / `components` / `nodes` / `application` (validated below).
+    /// The shape is identical to [`ComponentMetadata`] so codegen can treat
+    /// the two interchangeably until N.12 retires the `component` spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<ComponentMetadata>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, ComponentMetadata>,
+    /// Phase 212.N.12 in-flight — `nodes` is the forward-looking spelling
+    /// of the `components` (multi-shape) table. Same shape, accepted as an
+    /// alias during the rename. Mutually exclusive with `components`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nodes: BTreeMap<String, ComponentMetadata>,
     /// Phase 212.L.2 — `[package.metadata.nros.application]`. Application
     /// pkgs are native-only orchestration roots; they MUST NOT name an RTOS
     /// in their `deploy = […]` allow-list. (The `nros check` lint enforces
     /// the no-RTOS rule; the schema only accepts the field.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application: Option<ApplicationMetadata>,
+    /// Phase 212.N.7 — `[package.metadata.nros.entry]`. Entry pkgs declare
+    /// which `[deploy.<target>]` block they run on (the firmware bin pulls
+    /// in the per-board shim + emits `run_plan(runtime)`). Strict schema —
+    /// `deploy = "<board>"` is the only field today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<EntryMetadata>,
     /// Phase 212.L.7 / L.8 — per-target deploy tables, keyed by target name
     /// (`native`, `qemu-mps2-an385`, …). Populates both application pkgs and
     /// self-bringup component pkgs (component pkg w/ `[deploy.*]` and no
     /// sibling bringup eats its own bringup role).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub deploy: BTreeMap<String, DeployTargetMetadata>,
+    /// Phase 212.B.2 stub (`[package.metadata.nros.domain]`) — opaque
+    /// pass-through during the schema in-flight window. The full typed shape
+    /// lands with system.toml's F.4 work. Captured as `toml::Value` so
+    /// `deny_unknown_fields` still surfaces typos elsewhere while letting
+    /// users author the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<toml::Value>,
+    /// Phase 212.B.2 stub (`[package.metadata.nros.bridge]`) — opaque
+    /// pass-through, same rationale as `domain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<toml::Value>,
+    /// Phase 212.B.2 stub (`[package.metadata.nros.embedded]`) — opaque
+    /// pass-through. Will eventually hold board-specific embedded knobs
+    /// (`linker_script` / `stack_size` / …); kept opaque so the reader
+    /// doesn't break the moment a board author authors the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<toml::Value>,
 }
 
 impl PackageMetadataNros {
     /// Reject manifests that combine more than one of `component` /
-    /// `components` / `application` — the three shapes are mutually
-    /// exclusive per the Phase 212.L design doc. A pkg is either a
-    /// component (single or multi) OR an application; bringup pkgs at the
-    /// Path A shape have neither (no Cargo.toml at all).
+    /// `node` / `components` / `nodes` / `application` — the shapes are
+    /// mutually exclusive per the Phase 212.L design doc plus the Phase
+    /// 212.N.12 rename (the `node` / `nodes` spellings are aliases of
+    /// `component` / `components`, not new categories).
     pub fn validate(&self) -> Result<(), String> {
         let has_component = self.component.is_some();
+        let has_node = self.node.is_some();
         let has_components = !self.components.is_empty();
+        let has_nodes = !self.nodes.is_empty();
         let has_application = self.application.is_some();
-        let count = [has_component, has_components, has_application]
-            .into_iter()
-            .filter(|b| *b)
-            .count();
+        let count = [
+            has_component,
+            has_node,
+            has_components,
+            has_nodes,
+            has_application,
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
         if count > 1 {
             return Err("`[package.metadata.nros]` carries more than one of \
-                 `component` / `components` / `application` — pick exactly \
-                 one shape (Phase 212.L.2 / L.7)"
+                 `component` / `node` / `components` / `nodes` / `application` — pick exactly \
+                 one shape (Phase 212.L.2 / L.7; N.12 rename in flight — `node` / \
+                 `nodes` are the forward-looking spellings of `component` / `components`)"
                 .to_string());
         }
         Ok(())
+    }
+
+    /// Phase 212.N.12 in-flight rename — `component` and `node` are aliases.
+    /// Returns the present shape, preferring `node` (the forward spelling)
+    /// over `component`. Callers reading the per-pkg shape go through this
+    /// accessor so the N.12 sweep can later flip the storage field without
+    /// touching every read site.
+    pub fn node_or_component(&self) -> Option<&ComponentMetadata> {
+        self.node.as_ref().or(self.component.as_ref())
+    }
+
+    /// Phase 212.N.12 in-flight rename — multi-shape accessor. Returns
+    /// `nodes` when present, else `components`. Empty if neither populated.
+    pub fn nodes_or_components(&self) -> &BTreeMap<String, ComponentMetadata> {
+        if !self.nodes.is_empty() {
+            &self.nodes
+        } else {
+            &self.components
+        }
     }
 
     /// True when this manifest is a *self-bringup-eligible* component or
@@ -122,10 +186,26 @@ impl PackageMetadataNros {
     /// degenerate 1-component bringup when no sibling bringup pkg points at
     /// it.
     pub fn is_self_bringup_eligible(&self) -> bool {
-        let has_role =
-            self.component.is_some() || !self.components.is_empty() || self.application.is_some();
+        let has_role = self.component.is_some()
+            || self.node.is_some()
+            || !self.components.is_empty()
+            || !self.nodes.is_empty()
+            || self.application.is_some();
         has_role && !self.deploy.is_empty()
     }
+}
+
+/// `[package.metadata.nros.entry]` — Phase 212.N.7.
+///
+/// Marks an Entry pkg (the firmware bin) so the planner can route it to the
+/// right `[deploy.<target>]` block. Today the only field is `deploy =
+/// "<board>"` (the deploy-target key in the workspace deploy map). The
+/// reader keeps this strict so a typo on `deploy =` surfaces immediately.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryMetadata {
+    /// Board / deploy-target key (e.g. `"freertos"`, `"zephyr"`).
+    pub deploy: String,
 }
 
 /// `[package.metadata.nros.node]` (single shape, canonical post Phase

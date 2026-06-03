@@ -509,9 +509,10 @@ fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry 
         default_launch: None,
     };
 
-    // Component rows.
+    // Component rows. The `node` spelling (Phase 212.N.12 rename) is
+    // accepted as an alias for `component` via `node_or_component()`.
     let mut components: Vec<SystemComponentEntry> = Vec::new();
-    if let Some(single) = nros.component.as_ref() {
+    if let Some(single) = nros.node_or_component() {
         let class = single
             .class
             .clone()
@@ -523,7 +524,11 @@ fn synthesise_self_bringup(comp: &ComponentPackageEntry) -> BringupPackageEntry 
             name: inst_name,
         });
     } else {
-        for (key, meta) in &nros.components {
+        // Phase 212.N.12 in-flight — read the multi-shape via the
+        // `nodes_or_components()` accessor so the synthesis works the same
+        // whether the manifest uses the legacy `components` spelling or
+        // the forward-looking `nodes` spelling.
+        for (key, meta) in nros.nodes_or_components() {
             let class = meta
                 .class
                 .clone()
