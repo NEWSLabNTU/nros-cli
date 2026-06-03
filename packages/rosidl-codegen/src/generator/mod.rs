@@ -424,6 +424,39 @@ mod tests {
         // + builtin_interfaces for the envelope nested types.
         assert!(pkg.cargo_toml.contains("unique_identifier_msgs"));
         assert!(pkg.cargo_toml.contains("builtin_interfaces"));
+
+        // ----------------------------------------------------------------
+        // K.7.1.d.b — RosAction impl binds each of the five envelope
+        // structs as an associated type so generic
+        // `register_type::<A::SendGoalRequest>()` calls in nano-ros's
+        // runtime can name them without knowing the action's concrete
+        // module path.
+        // ----------------------------------------------------------------
+        assert!(
+            pkg.action_rs
+                .contains("type SendGoalRequest = Fibonacci_SendGoal_Request"),
+            "missing associated type SendGoalRequest"
+        );
+        assert!(
+            pkg.action_rs
+                .contains("type SendGoalResponse = Fibonacci_SendGoal_Response"),
+            "missing associated type SendGoalResponse"
+        );
+        assert!(
+            pkg.action_rs
+                .contains("type GetResultRequest = Fibonacci_GetResult_Request"),
+            "missing associated type GetResultRequest"
+        );
+        assert!(
+            pkg.action_rs
+                .contains("type GetResultResponse = Fibonacci_GetResult_Response"),
+            "missing associated type GetResultResponse"
+        );
+        assert!(
+            pkg.action_rs
+                .contains("type FeedbackMessage = Fibonacci_FeedbackMessage"),
+            "missing associated type FeedbackMessage"
+        );
     }
 
     // ========================================================================

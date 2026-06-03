@@ -790,6 +790,12 @@ impl RosAction for {{ action_name }} {
     type Result = {{ action_name }}Result;
     type Feedback = {{ action_name }}Feedback;
 
+    type SendGoalRequest = {{ action_name }}_SendGoal_Request;
+    type SendGoalResponse = {{ action_name }}_SendGoal_Response;
+    type GetResultRequest = {{ action_name }}_GetResult_Request;
+    type GetResultResponse = {{ action_name }}_GetResult_Response;
+    type FeedbackMessage = {{ action_name }}_FeedbackMessage;
+
     const ACTION_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_";
     const ACTION_HASH: &'static str = "{{ type_hash }}";
 }
