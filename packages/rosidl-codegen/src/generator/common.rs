@@ -600,6 +600,32 @@ pub fn build_nros_schema_for_struct(
     const_prefix: &str,
     fields: &[rosidl_parser::Field],
 ) -> NrosMessageSchema {
+    build_nros_schema_for_struct_with_path(
+        package_name,
+        struct_name,
+        nros_type_name,
+        const_prefix,
+        fields,
+        &default_nested_type_path,
+    )
+}
+
+/// Like [`build_nros_schema_for_struct`] but lets the caller override how
+/// a `NamespacedType { package, name }` is rendered as a Rust path. The
+/// default ([`default_nested_type_path`]) follows the `.msg` convention
+/// (`crate::msg::<X>` / `<pkg>::msg::<X>`). The K.7.1.d action envelope
+/// emit path uses a custom resolver to reach the action-self structs
+/// (`<Action>Goal/Result/Feedback`, same module — bare ident) and the
+/// `unique_identifier_msgs::msg::UUID` / `builtin_interfaces::msg::Time`
+/// nested types (default path).
+pub fn build_nros_schema_for_struct_with_path(
+    package_name: &str,
+    struct_name: &str,
+    nros_type_name: &str,
+    const_prefix: &str,
+    fields: &[rosidl_parser::Field],
+    nested_path_resolver: &dyn Fn(Option<&str>, &str, &str) -> String,
+) -> NrosMessageSchema {
     let mut helper_consts = String::new();
     let mut fields_block = String::new();
 
@@ -615,6 +641,7 @@ pub fn build_nros_schema_for_struct(
             package_name,
             const_prefix,
             &mut helper_consts,
+            nested_path_resolver,
         );
         fields_block.push_str(&format!(
             "        ::nros_serdes::Field {{\n            \
@@ -647,6 +674,7 @@ fn render_field_type_expr(
     package_name: &str,
     const_prefix: &str,
     helper_consts: &mut String,
+    nested_path_resolver: &dyn Fn(Option<&str>, &str, &str) -> String,
 ) -> String {
     match field_type {
         FieldType::Primitive(prim) => primitive_field_type_expr(prim).to_string(),
@@ -663,7 +691,7 @@ fn render_field_type_expr(
             // from the nested type's own Message impl so we never duplicate
             // the package/type-name string.
             let nested_const = format!("{}NESTED_{}", const_prefix, upper_ident(field_name));
-            let nested_path = nested_type_path(package.as_deref(), name, package_name);
+            let nested_path = nested_path_resolver(package.as_deref(), name, package_name);
             helper_consts.push_str(&format!(
                 "#[allow(non_upper_case_globals)]\n\
                  pub const {nested_const}: ::nros_serdes::NestedType = ::nros_serdes::NestedType {{\n    \
@@ -681,6 +709,7 @@ fn render_field_type_expr(
                 package_name,
                 const_prefix,
                 helper_consts,
+                nested_path_resolver,
             );
             format!("::nros_serdes::FieldType::Array({}, &{})", size, elem_const)
         }
@@ -693,6 +722,7 @@ fn render_field_type_expr(
                 package_name,
                 const_prefix,
                 helper_consts,
+                nested_path_resolver,
             );
             format!("::nros_serdes::FieldType::Sequence(&{})", elem_const)
         }
@@ -708,6 +738,7 @@ fn render_field_type_expr(
                 package_name,
                 const_prefix,
                 helper_consts,
+                nested_path_resolver,
             );
             format!(
                 "::nros_serdes::FieldType::BoundedSequence({}, &{})",
@@ -726,6 +757,7 @@ fn emit_element_const(
     package_name: &str,
     const_prefix: &str,
     helper_consts: &mut String,
+    nested_path_resolver: &dyn Fn(Option<&str>, &str, &str) -> String,
 ) {
     // The inner expression is rendered with the *parent* field name so any
     // further-nested helpers stay scoped under the same FT_<FIELD>_ prefix.
@@ -735,6 +767,7 @@ fn emit_element_const(
         package_name,
         const_prefix,
         helper_consts,
+        nested_path_resolver,
     );
     helper_consts.push_str(&format!(
         "#[allow(non_upper_case_globals)]\n\
@@ -768,11 +801,170 @@ fn primitive_field_type_expr(prim: &PrimitiveType) -> &'static str {
 /// Render the Rust path to a nested message type. Mirrors the
 /// crate-mode rules in `nros_type_for_field_with_mode` for
 /// `NamespacedType` so we can hand the type as `<Path as Message>`.
-fn nested_type_path(pkg: Option<&str>, name: &str, current_package: &str) -> String {
+///
+/// Default resolver passed to
+/// [`build_nros_schema_for_struct_with_path`] — assumes the nested
+/// type lives under `<pkg>::msg::<X>` (the `.msg` shape).
+pub fn default_nested_type_path(pkg: Option<&str>, name: &str, current_package: &str) -> String {
     match pkg {
         Some(p) if p == current_package => format!("crate::msg::{}", name),
         Some(p) => format!("{}::msg::{}", p, name),
         None => format!("crate::msg::{}", name),
+    }
+}
+
+// ============================================================================
+// Action envelope schemas (Phase 212.K.7.1.d)
+// ============================================================================
+
+/// Schemas for the five rosidl action wire-envelope structs of a single
+/// action package. Mirrors the upstream `rosidl_generator_cpp` shape:
+///
+/// - `<A>_SendGoal_Request`   { goal_id: UUID, goal: <A>Goal }
+/// - `<A>_SendGoal_Response`  { accepted: bool, stamp: Time }
+/// - `<A>_GetResult_Request`  { goal_id: UUID }
+/// - `<A>_GetResult_Response` { status: int8, result: <A>Result }
+/// - `<A>_FeedbackMessage`    { goal_id: UUID, feedback: <A>Feedback }
+///
+/// Field order, names, and types match
+/// `rosidl_generator_cpp`'s `<action>__struct.hpp` exactly (verified
+/// against `example_interfaces/action/Fibonacci`).
+#[derive(Debug, Clone)]
+pub struct ActionEnvelopeSchemas {
+    pub send_goal_request: NrosMessageSchema,
+    pub send_goal_response: NrosMessageSchema,
+    pub get_result_request: NrosMessageSchema,
+    pub get_result_response: NrosMessageSchema,
+    pub feedback_message: NrosMessageSchema,
+}
+
+/// Build the [`ActionEnvelopeSchemas`] for an action, given the action's
+/// host package + name. The five schemas reference both external types
+/// (`unique_identifier_msgs::msg::UUID`, `builtin_interfaces::msg::Time`)
+/// and action-self types (`<A>Goal/Result/Feedback`, same module — bare
+/// idents). The custom path resolver fans them out.
+pub fn build_action_envelope_schemas(
+    package_name: &str,
+    action_name: &str,
+) -> ActionEnvelopeSchemas {
+    use rosidl_parser::{Field, PrimitiveType};
+
+    let goal_struct = format!("{}Goal", action_name);
+    let result_struct = format!("{}Result", action_name);
+    let feedback_struct = format!("{}Feedback", action_name);
+
+    // Action-self struct path resolver: when the nested package matches
+    // this action's host package AND the struct name matches one of the
+    // three user-facing structs, reach it as a bare ident (same module).
+    // Everything else falls through to the default `.msg` shape.
+    let goal_clone = goal_struct.clone();
+    let result_clone = result_struct.clone();
+    let feedback_clone = feedback_struct.clone();
+    let pkg_clone = package_name.to_string();
+    let resolver = move |pkg: Option<&str>, name: &str, current_package: &str| -> String {
+        if pkg == Some(pkg_clone.as_str())
+            && (name == goal_clone || name == result_clone || name == feedback_clone)
+        {
+            name.to_string()
+        } else {
+            default_nested_type_path(pkg, name, current_package)
+        }
+    };
+
+    let uuid_field = || Field {
+        name: "goal_id".to_string(),
+        field_type: FieldType::NamespacedType {
+            package: Some("unique_identifier_msgs".to_string()),
+            name: "UUID".to_string(),
+        },
+        default_value: None,
+    };
+    let self_field = |name: &str, struct_name: &str| Field {
+        name: name.to_string(),
+        field_type: FieldType::NamespacedType {
+            package: Some(package_name.to_string()),
+            name: struct_name.to_string(),
+        },
+        default_value: None,
+    };
+
+    // SendGoal_Request: goal_id (UUID), goal (<A>Goal)
+    let send_goal_request = build_nros_schema_for_struct_with_path(
+        package_name,
+        &format!("{}_SendGoal_Request", action_name),
+        &format!("{}/action/{}_SendGoal_Request", package_name, action_name),
+        "SG_REQ_",
+        &[uuid_field(), self_field("goal", &goal_struct)],
+        &resolver,
+    );
+
+    // SendGoal_Response: accepted (bool), stamp (Time)
+    let send_goal_response = build_nros_schema_for_struct_with_path(
+        package_name,
+        &format!("{}_SendGoal_Response", action_name),
+        &format!("{}/action/{}_SendGoal_Response", package_name, action_name),
+        "SG_RESP_",
+        &[
+            Field {
+                name: "accepted".to_string(),
+                field_type: FieldType::Primitive(PrimitiveType::Bool),
+                default_value: None,
+            },
+            Field {
+                name: "stamp".to_string(),
+                field_type: FieldType::NamespacedType {
+                    package: Some("builtin_interfaces".to_string()),
+                    name: "Time".to_string(),
+                },
+                default_value: None,
+            },
+        ],
+        &resolver,
+    );
+
+    // GetResult_Request: goal_id (UUID)
+    let get_result_request = build_nros_schema_for_struct_with_path(
+        package_name,
+        &format!("{}_GetResult_Request", action_name),
+        &format!("{}/action/{}_GetResult_Request", package_name, action_name),
+        "GR_REQ_",
+        &[uuid_field()],
+        &resolver,
+    );
+
+    // GetResult_Response: status (int8), result (<A>Result)
+    let get_result_response = build_nros_schema_for_struct_with_path(
+        package_name,
+        &format!("{}_GetResult_Response", action_name),
+        &format!("{}/action/{}_GetResult_Response", package_name, action_name),
+        "GR_RESP_",
+        &[
+            Field {
+                name: "status".to_string(),
+                field_type: FieldType::Primitive(PrimitiveType::Int8),
+                default_value: None,
+            },
+            self_field("result", &result_struct),
+        ],
+        &resolver,
+    );
+
+    // FeedbackMessage: goal_id (UUID), feedback (<A>Feedback)
+    let feedback_message = build_nros_schema_for_struct_with_path(
+        package_name,
+        &format!("{}_FeedbackMessage", action_name),
+        &format!("{}/action/{}_FeedbackMessage", package_name, action_name),
+        "FB_",
+        &[uuid_field(), self_field("feedback", &feedback_struct)],
+        &resolver,
+    );
+
+    ActionEnvelopeSchemas {
+        send_goal_request,
+        send_goal_response,
+        get_result_request,
+        get_result_response,
+        feedback_message,
     }
 }
 
@@ -1137,6 +1329,155 @@ mod schema_tests {
                 .fields_block
                 .contains("offset: ::core::mem::offset_of!(FibonacciFeedback, sequence)")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // K.7.1.d — action envelope schemas
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn action_envelope_send_goal_request_shape() {
+        let envs = build_action_envelope_schemas("example_interfaces", "Fibonacci");
+        let s = &envs.send_goal_request;
+        assert_eq!(
+            s.nros_type_name,
+            "example_interfaces/action/Fibonacci_SendGoal_Request"
+        );
+        // goal_id resolves to the cross-package UUID type.
+        assert!(
+            s.helper_consts.contains("pub const SG_REQ_NESTED_GOAL_ID:"),
+            "helper_consts = {}",
+            s.helper_consts
+        );
+        assert!(
+            s.helper_consts.contains(
+                "<unique_identifier_msgs::msg::UUID as ::nros_serdes::Message>::TYPE_NAME"
+            )
+        );
+        // goal resolves to the action-self struct (bare ident — same module).
+        assert!(s.helper_consts.contains("pub const SG_REQ_NESTED_GOAL:"));
+        assert!(
+            s.helper_consts
+                .contains("<FibonacciGoal as ::nros_serdes::Message>::TYPE_NAME")
+        );
+        // Offsets reference the envelope struct name (raw rosidl form).
+        assert!(
+            s.fields_block
+                .contains("offset: ::core::mem::offset_of!(Fibonacci_SendGoal_Request, goal_id)")
+        );
+        assert!(
+            s.fields_block
+                .contains("offset: ::core::mem::offset_of!(Fibonacci_SendGoal_Request, goal)")
+        );
+        // Field order matches upstream: goal_id then goal.
+        let goal_id_pos = s.fields_block.find("\"goal_id\"").unwrap();
+        let goal_pos = s.fields_block.find("\"goal\"").unwrap();
+        assert!(goal_id_pos < goal_pos);
+    }
+
+    #[test]
+    fn action_envelope_send_goal_response_shape() {
+        let envs = build_action_envelope_schemas("example_interfaces", "Fibonacci");
+        let s = &envs.send_goal_response;
+        assert_eq!(
+            s.nros_type_name,
+            "example_interfaces/action/Fibonacci_SendGoal_Response"
+        );
+        // stamp resolves to builtin_interfaces::msg::Time.
+        assert!(s.helper_consts.contains("pub const SG_RESP_NESTED_STAMP:"));
+        assert!(
+            s.helper_consts
+                .contains("<builtin_interfaces::msg::Time as ::nros_serdes::Message>::TYPE_NAME")
+        );
+        // accepted is a primitive (no helper const for that one).
+        assert!(s.fields_block.contains("\"accepted\""));
+        assert!(s.fields_block.contains("::nros_serdes::FieldType::Bool"));
+        assert!(
+            s.fields_block
+                .contains("ty: ::nros_serdes::FieldType::Nested(&SG_RESP_NESTED_STAMP),")
+        );
+        // Field order: accepted then stamp (matches upstream Fibonacci_SendGoal_Response_).
+        let acc_pos = s.fields_block.find("\"accepted\"").unwrap();
+        let stamp_pos = s.fields_block.find("\"stamp\"").unwrap();
+        assert!(acc_pos < stamp_pos);
+    }
+
+    #[test]
+    fn action_envelope_get_result_request_shape() {
+        let envs = build_action_envelope_schemas("example_interfaces", "Fibonacci");
+        let s = &envs.get_result_request;
+        assert_eq!(
+            s.nros_type_name,
+            "example_interfaces/action/Fibonacci_GetResult_Request"
+        );
+        // Single field: goal_id.
+        assert!(s.helper_consts.contains("pub const GR_REQ_NESTED_GOAL_ID:"));
+        assert!(s.fields_block.contains("\"goal_id\""));
+        assert!(
+            s.fields_block
+                .contains("ty: ::nros_serdes::FieldType::Nested(&GR_REQ_NESTED_GOAL_ID),")
+        );
+        // No second field.
+        assert_eq!(s.fields_block.matches("name: ").count(), 1);
+    }
+
+    #[test]
+    fn action_envelope_get_result_response_shape() {
+        let envs = build_action_envelope_schemas("example_interfaces", "Fibonacci");
+        let s = &envs.get_result_response;
+        assert_eq!(
+            s.nros_type_name,
+            "example_interfaces/action/Fibonacci_GetResult_Response"
+        );
+        // Field order: status (Int8) then result (Nested<FibonacciResult>).
+        assert!(s.fields_block.contains("\"status\""));
+        assert!(s.fields_block.contains("::nros_serdes::FieldType::Int8"));
+        assert!(s.helper_consts.contains("pub const GR_RESP_NESTED_RESULT:"));
+        assert!(
+            s.helper_consts
+                .contains("<FibonacciResult as ::nros_serdes::Message>::TYPE_NAME")
+        );
+        let status_pos = s.fields_block.find("\"status\"").unwrap();
+        let result_pos = s.fields_block.find("\"result\"").unwrap();
+        assert!(status_pos < result_pos);
+    }
+
+    #[test]
+    fn action_envelope_feedback_message_shape() {
+        let envs = build_action_envelope_schemas("example_interfaces", "Fibonacci");
+        let s = &envs.feedback_message;
+        assert_eq!(
+            s.nros_type_name,
+            "example_interfaces/action/Fibonacci_FeedbackMessage"
+        );
+        assert!(s.helper_consts.contains("pub const FB_NESTED_GOAL_ID:"));
+        assert!(s.helper_consts.contains("pub const FB_NESTED_FEEDBACK:"));
+        assert!(
+            s.helper_consts
+                .contains("<FibonacciFeedback as ::nros_serdes::Message>::TYPE_NAME")
+        );
+        let goal_id_pos = s.fields_block.find("\"goal_id\"").unwrap();
+        let feedback_pos = s.fields_block.find("\"feedback\"").unwrap();
+        assert!(goal_id_pos < feedback_pos);
+    }
+
+    #[test]
+    fn action_envelope_prefixes_are_distinct_across_halves() {
+        // Every envelope must use its own SG_REQ_ / SG_RESP_ / GR_REQ_
+        // / GR_RESP_ / FB_ prefix so the module-scope `pub const`
+        // idents don't collide. Shared field name `goal_id` lives on
+        // SendGoal_Request, GetResult_Request, and FeedbackMessage —
+        // the three matching NESTED_GOAL_ID consts must not clash.
+        let envs = build_action_envelope_schemas("example_interfaces", "Fibonacci");
+        assert!(envs.send_goal_request.helper_consts.contains("SG_REQ_"));
+        assert!(envs.send_goal_response.helper_consts.contains("SG_RESP_"));
+        assert!(envs.get_result_request.helper_consts.contains("GR_REQ_"));
+        assert!(envs.get_result_response.helper_consts.contains("GR_RESP_"));
+        assert!(envs.feedback_message.helper_consts.contains("FB_"));
+        // Per-half: the OTHER half's prefix must not leak in.
+        assert!(!envs.send_goal_request.helper_consts.contains("GR_REQ_"));
+        assert!(!envs.feedback_message.helper_consts.contains("SG_REQ_"));
+        assert!(!envs.get_result_request.helper_consts.contains("FB_NESTED"));
     }
 
     #[test]

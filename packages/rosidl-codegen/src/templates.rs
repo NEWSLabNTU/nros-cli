@@ -296,6 +296,32 @@ pub struct ActionNrosTemplate<'a> {
     pub feedback_schema_helper_consts: String,
     pub feedback_schema_fields_block: String,
     pub feedback_schema_type_name: String,
+    // ---- Action envelope structs (Phase 212.K.7.1.d) ----
+    //
+    // The five rosidl-convention wire structs that wrap the user-facing
+    // Goal/Result/Feedback for the action service-shape protocol. Each
+    // ships its own `Serialize` / `Deserialize` / `RosMessage` /
+    // `::nros_serdes::Message` impl just like the user-facing structs.
+    /// `<A>_SendGoal_Request { goal_id: UUID, goal: <A>Goal }`
+    pub send_goal_request_schema_helper_consts: String,
+    pub send_goal_request_schema_fields_block: String,
+    pub send_goal_request_schema_type_name: String,
+    /// `<A>_SendGoal_Response { accepted: bool, stamp: Time }`
+    pub send_goal_response_schema_helper_consts: String,
+    pub send_goal_response_schema_fields_block: String,
+    pub send_goal_response_schema_type_name: String,
+    /// `<A>_GetResult_Request { goal_id: UUID }`
+    pub get_result_request_schema_helper_consts: String,
+    pub get_result_request_schema_fields_block: String,
+    pub get_result_request_schema_type_name: String,
+    /// `<A>_GetResult_Response { status: i8, result: <A>Result }`
+    pub get_result_response_schema_helper_consts: String,
+    pub get_result_response_schema_fields_block: String,
+    pub get_result_response_schema_type_name: String,
+    /// `<A>_FeedbackMessage { goal_id: UUID, feedback: <A>Feedback }`
+    pub feedback_message_schema_helper_consts: String,
+    pub feedback_message_schema_fields_block: String,
+    pub feedback_message_schema_type_name: String,
 }
 
 // ============================================================================

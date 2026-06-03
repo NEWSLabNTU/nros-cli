@@ -338,6 +338,92 @@ mod tests {
         // to avoid module-scope collisions.
         assert!(pkg.action_rs.contains("RESULT_FT_SEQUENCE_ELEM"));
         assert!(pkg.action_rs.contains("FEEDBACK_FT_PARTIAL_SEQUENCE_ELEM"));
+
+        // ----------------------------------------------------------------
+        // K.7.1.d — five rosidl envelope structs each with
+        // Serialize / Deserialize / RosMessage / ::nros_serdes::Message.
+        // ----------------------------------------------------------------
+        for envelope in &[
+            "Fibonacci_SendGoal_Request",
+            "Fibonacci_SendGoal_Response",
+            "Fibonacci_GetResult_Request",
+            "Fibonacci_GetResult_Response",
+            "Fibonacci_FeedbackMessage",
+        ] {
+            assert!(
+                pkg.action_rs.contains(&format!("pub struct {}", envelope)),
+                "missing struct {}",
+                envelope
+            );
+            assert!(
+                pkg.action_rs
+                    .contains(&format!("impl Serialize for {}", envelope)),
+                "missing Serialize for {}",
+                envelope
+            );
+            assert!(
+                pkg.action_rs
+                    .contains(&format!("impl Deserialize for {}", envelope)),
+                "missing Deserialize for {}",
+                envelope
+            );
+            assert!(
+                pkg.action_rs
+                    .contains(&format!("impl RosMessage for {}", envelope)),
+                "missing RosMessage for {}",
+                envelope
+            );
+            assert!(
+                pkg.action_rs
+                    .contains(&format!("impl ::nros_serdes::Message for {}", envelope)),
+                "missing nros_serdes::Message for {}",
+                envelope
+            );
+        }
+        // Envelope field layout: goal_id is the nested UUID, NOT a flat [u8;16].
+        assert!(
+            pkg.action_rs
+                .contains("pub goal_id: unique_identifier_msgs::msg::UUID")
+        );
+        assert!(pkg.action_rs.contains("pub goal: FibonacciGoal"));
+        assert!(pkg.action_rs.contains("pub accepted: bool"));
+        assert!(
+            pkg.action_rs
+                .contains("pub stamp: builtin_interfaces::msg::Time")
+        );
+        assert!(pkg.action_rs.contains("pub status: i8"));
+        assert!(pkg.action_rs.contains("pub result: FibonacciResult"));
+        assert!(pkg.action_rs.contains("pub feedback: FibonacciFeedback"));
+        // ROS-form Message::TYPE_NAME on each envelope.
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_SendGoal_Request\"")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_SendGoal_Response\"")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_GetResult_Request\"")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_GetResult_Response\"")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_FeedbackMessage\"")
+        );
+        // DDS-mangled RosMessage::TYPE_NAME (one spot-check).
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces::action::dds_::Fibonacci_SendGoal_Request_\"")
+        );
+        // K.7.1.d: action Cargo.toml depends on unique_identifier_msgs
+        // + builtin_interfaces for the envelope nested types.
+        assert!(pkg.cargo_toml.contains("unique_identifier_msgs"));
+        assert!(pkg.cargo_toml.contains("builtin_interfaces"));
     }
 
     // ========================================================================

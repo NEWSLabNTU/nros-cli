@@ -1,6 +1,6 @@
 use super::common::{
-    GeneratorError, build_c_field, build_nros_schema_for_struct, determine_field_kind,
-    field_to_nros_field, field_to_nros_field_with_mode,
+    GeneratorError, build_action_envelope_schemas, build_c_field, build_nros_schema_for_struct,
+    determine_field_kind, field_to_nros_field, field_to_nros_field_with_mode,
 };
 use crate::{
     templates::{
@@ -176,6 +176,19 @@ pub fn generate_nros_action_package(
     // Combine with externally provided dependencies
     let mut all_deps: Vec<String> = all_dependencies.iter().cloned().collect();
     all_deps.extend(goal_deps);
+
+    // Phase 212.K.7.1.d: action envelope structs reference
+    // `unique_identifier_msgs::msg::UUID` (every envelope with a
+    // `goal_id`) + `builtin_interfaces::msg::Time` (SendGoal_Response
+    // `stamp`). Inject the deps unconditionally so the generated
+    // `Cargo.toml` resolves the nested-type `<Pkg::msg::T as Message>`
+    // expansions.
+    if package_name != "unique_identifier_msgs" {
+        all_deps.push("unique_identifier_msgs".to_string());
+    }
+    if package_name != "builtin_interfaces" {
+        all_deps.push("builtin_interfaces".to_string());
+    }
     all_deps.sort();
     all_deps.dedup();
 
@@ -292,6 +305,8 @@ pub fn generate_nros_action_package(
         &action.spec.feedback.fields,
     );
 
+    let envelopes = build_action_envelope_schemas(package_name, action_name);
+
     let action_template = ActionNrosTemplate {
         package_name,
         action_name,
@@ -318,6 +333,21 @@ pub fn generate_nros_action_package(
         feedback_schema_helper_consts: feedback_schema.helper_consts,
         feedback_schema_fields_block: feedback_schema.fields_block,
         feedback_schema_type_name: feedback_schema.nros_type_name,
+        send_goal_request_schema_helper_consts: envelopes.send_goal_request.helper_consts,
+        send_goal_request_schema_fields_block: envelopes.send_goal_request.fields_block,
+        send_goal_request_schema_type_name: envelopes.send_goal_request.nros_type_name,
+        send_goal_response_schema_helper_consts: envelopes.send_goal_response.helper_consts,
+        send_goal_response_schema_fields_block: envelopes.send_goal_response.fields_block,
+        send_goal_response_schema_type_name: envelopes.send_goal_response.nros_type_name,
+        get_result_request_schema_helper_consts: envelopes.get_result_request.helper_consts,
+        get_result_request_schema_fields_block: envelopes.get_result_request.fields_block,
+        get_result_request_schema_type_name: envelopes.get_result_request.nros_type_name,
+        get_result_response_schema_helper_consts: envelopes.get_result_response.helper_consts,
+        get_result_response_schema_fields_block: envelopes.get_result_response.fields_block,
+        get_result_response_schema_type_name: envelopes.get_result_response.nros_type_name,
+        feedback_message_schema_helper_consts: envelopes.feedback_message.helper_consts,
+        feedback_message_schema_fields_block: envelopes.feedback_message.fields_block,
+        feedback_message_schema_type_name: envelopes.feedback_message.nros_type_name,
     };
     let action_rs = action_template.render()?;
 
@@ -430,6 +460,8 @@ pub fn generate_nros_inline_action(
         &action.spec.feedback.fields,
     );
 
+    let envelopes = build_action_envelope_schemas(package_name, action_name);
+
     let template = ActionNrosTemplate {
         package_name,
         action_name,
@@ -456,6 +488,21 @@ pub fn generate_nros_inline_action(
         feedback_schema_helper_consts: feedback_schema.helper_consts,
         feedback_schema_fields_block: feedback_schema.fields_block,
         feedback_schema_type_name: feedback_schema.nros_type_name,
+        send_goal_request_schema_helper_consts: envelopes.send_goal_request.helper_consts,
+        send_goal_request_schema_fields_block: envelopes.send_goal_request.fields_block,
+        send_goal_request_schema_type_name: envelopes.send_goal_request.nros_type_name,
+        send_goal_response_schema_helper_consts: envelopes.send_goal_response.helper_consts,
+        send_goal_response_schema_fields_block: envelopes.send_goal_response.fields_block,
+        send_goal_response_schema_type_name: envelopes.send_goal_response.nros_type_name,
+        get_result_request_schema_helper_consts: envelopes.get_result_request.helper_consts,
+        get_result_request_schema_fields_block: envelopes.get_result_request.fields_block,
+        get_result_request_schema_type_name: envelopes.get_result_request.nros_type_name,
+        get_result_response_schema_helper_consts: envelopes.get_result_response.helper_consts,
+        get_result_response_schema_fields_block: envelopes.get_result_response.fields_block,
+        get_result_response_schema_type_name: envelopes.get_result_response.nros_type_name,
+        feedback_message_schema_helper_consts: envelopes.feedback_message.helper_consts,
+        feedback_message_schema_fields_block: envelopes.feedback_message.fields_block,
+        feedback_message_schema_type_name: envelopes.feedback_message.nros_type_name,
     };
 
     Ok(template.render()?)

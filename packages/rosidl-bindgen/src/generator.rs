@@ -150,6 +150,19 @@ pub fn generate_package(
         let action_dir = src_dir.join("action");
         std::fs::create_dir_all(&action_dir)?;
 
+        // Phase 212.K.7.1.d: action envelope structs reference
+        // `unique_identifier_msgs::msg::UUID` (every envelope with a
+        // `goal_id`) + `builtin_interfaces::msg::Time` (SendGoal_Response
+        // `stamp`). Mirror the dep injection in
+        // `generate_nros_action_package` so the generated Cargo.toml
+        // resolves these `<Pkg::msg::T as Message>::FIELDS` references.
+        if package.name != "unique_identifier_msgs" {
+            all_dependencies.insert("unique_identifier_msgs".to_string());
+        }
+        if package.name != "builtin_interfaces" {
+            all_dependencies.insert("builtin_interfaces".to_string());
+        }
+
         // Generate actions
         for action_name in &package.interfaces.actions {
             let action_path = package.get_action_path(action_name);

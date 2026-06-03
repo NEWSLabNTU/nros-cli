@@ -530,6 +530,255 @@ impl ::nros_serdes::Message for {{ action_name }}Feedback {
 }
 
 // ============================================================================
+// Action Envelope Structs (rosidl wire convention — Phase 212.K.7.1.d)
+// ============================================================================
+//
+// These five structs wrap the user-facing Goal / Result / Feedback for the
+// action service-shape protocol. They mirror upstream `rosidl_generator_cpp`
+// — `<A>__struct.hpp` exposes the same five names with the same field
+// layout. Users normally interact with `<A>Goal/Result/Feedback`; the
+// envelopes are used by the action plumbing layer (server-side
+// `SendGoal_Request` decode, client-side `GetResult_Response` decode,
+// feedback topic deliveries, …).
+//
+// `goal_id` is `unique_identifier_msgs::msg::UUID`, NOT a flat `[u8;16]`
+// — `rosidl` always wraps the 16-byte UUID in a one-field struct so the
+// CDR layout (sequence-of-uint8 fixed length 16) matches upstream's
+// `unique_identifier_msgs/UUID.msg`.
+
+// ── <A>_SendGoal_Request { goal_id: UUID, goal: <A>Goal } ───────────────────
+
+/// Wire envelope for the `send_goal` request half of the action service.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct {{ action_name }}_SendGoal_Request {
+    pub goal_id: unique_identifier_msgs::msg::UUID,
+    pub goal: {{ action_name }}Goal,
+}
+
+impl Serialize for {{ action_name }}_SendGoal_Request {
+    fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+        self.goal_id.serialize(writer)?;
+        self.goal.serialize(writer)?;
+        Ok(())
+    }
+}
+
+impl Deserialize for {{ action_name }}_SendGoal_Request {
+    fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+        Ok(Self {
+            goal_id: Deserialize::deserialize(reader)?,
+            goal: Deserialize::deserialize(reader)?,
+        })
+    }
+}
+
+impl RosMessage for {{ action_name }}_SendGoal_Request {
+    const TYPE_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_SendGoal_Request_";
+    const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+{{ send_goal_request_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}_SendGoal_Request {
+    const TYPE_NAME: &'static str = "{{ send_goal_request_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ send_goal_request_schema_fields_block -}}
+    ];
+}
+
+// ── <A>_SendGoal_Response { accepted: bool, stamp: Time } ───────────────────
+
+/// Wire envelope for the `send_goal` response half of the action service.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct {{ action_name }}_SendGoal_Response {
+    pub accepted: bool,
+    pub stamp: builtin_interfaces::msg::Time,
+}
+
+impl Serialize for {{ action_name }}_SendGoal_Response {
+    fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+        writer.write_bool(self.accepted)?;
+        self.stamp.serialize(writer)?;
+        Ok(())
+    }
+}
+
+impl Deserialize for {{ action_name }}_SendGoal_Response {
+    fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+        Ok(Self {
+            accepted: reader.read_bool()?,
+            stamp: Deserialize::deserialize(reader)?,
+        })
+    }
+}
+
+impl RosMessage for {{ action_name }}_SendGoal_Response {
+    const TYPE_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_SendGoal_Response_";
+    const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+{{ send_goal_response_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}_SendGoal_Response {
+    const TYPE_NAME: &'static str = "{{ send_goal_response_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ send_goal_response_schema_fields_block -}}
+    ];
+}
+
+// ── <A>_GetResult_Request { goal_id: UUID } ─────────────────────────────────
+
+/// Wire envelope for the `get_result` request half of the action service.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct {{ action_name }}_GetResult_Request {
+    pub goal_id: unique_identifier_msgs::msg::UUID,
+}
+
+impl Serialize for {{ action_name }}_GetResult_Request {
+    fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+        self.goal_id.serialize(writer)?;
+        Ok(())
+    }
+}
+
+impl Deserialize for {{ action_name }}_GetResult_Request {
+    fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+        Ok(Self {
+            goal_id: Deserialize::deserialize(reader)?,
+        })
+    }
+}
+
+impl RosMessage for {{ action_name }}_GetResult_Request {
+    const TYPE_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_GetResult_Request_";
+    const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+{{ get_result_request_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}_GetResult_Request {
+    const TYPE_NAME: &'static str = "{{ get_result_request_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ get_result_request_schema_fields_block -}}
+    ];
+}
+
+// ── <A>_GetResult_Response { status: i8, result: <A>Result } ────────────────
+
+/// Wire envelope for the `get_result` response half of the action service.
+#[allow(non_camel_case_types)]
+{%- if has_result_large_array %}
+#[derive(Debug, Clone, PartialEq)]
+{%- else %}
+#[derive(Debug, Clone, Default, PartialEq)]
+{%- endif %}
+pub struct {{ action_name }}_GetResult_Response {
+    pub status: i8,
+    pub result: {{ action_name }}Result,
+}
+{%- if has_result_large_array %}
+
+impl Default for {{ action_name }}_GetResult_Response {
+    fn default() -> Self {
+        Self {
+            status: 0,
+            result: Default::default(),
+        }
+    }
+}
+{%- endif %}
+
+impl Serialize for {{ action_name }}_GetResult_Response {
+    fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+        writer.write_i8(self.status)?;
+        self.result.serialize(writer)?;
+        Ok(())
+    }
+}
+
+impl Deserialize for {{ action_name }}_GetResult_Response {
+    fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+        Ok(Self {
+            status: reader.read_i8()?,
+            result: Deserialize::deserialize(reader)?,
+        })
+    }
+}
+
+impl RosMessage for {{ action_name }}_GetResult_Response {
+    const TYPE_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_GetResult_Response_";
+    const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+{{ get_result_response_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}_GetResult_Response {
+    const TYPE_NAME: &'static str = "{{ get_result_response_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ get_result_response_schema_fields_block -}}
+    ];
+}
+
+// ── <A>_FeedbackMessage { goal_id: UUID, feedback: <A>Feedback } ────────────
+
+/// Wire envelope for the action feedback topic.
+#[allow(non_camel_case_types)]
+{%- if has_feedback_large_array %}
+#[derive(Debug, Clone, PartialEq)]
+{%- else %}
+#[derive(Debug, Clone, Default, PartialEq)]
+{%- endif %}
+pub struct {{ action_name }}_FeedbackMessage {
+    pub goal_id: unique_identifier_msgs::msg::UUID,
+    pub feedback: {{ action_name }}Feedback,
+}
+{%- if has_feedback_large_array %}
+
+impl Default for {{ action_name }}_FeedbackMessage {
+    fn default() -> Self {
+        Self {
+            goal_id: Default::default(),
+            feedback: Default::default(),
+        }
+    }
+}
+{%- endif %}
+
+impl Serialize for {{ action_name }}_FeedbackMessage {
+    fn serialize(&self, writer: &mut CdrWriter) -> Result<(), SerError> {
+        self.goal_id.serialize(writer)?;
+        self.feedback.serialize(writer)?;
+        Ok(())
+    }
+}
+
+impl Deserialize for {{ action_name }}_FeedbackMessage {
+    fn deserialize(reader: &mut CdrReader) -> Result<Self, DeserError> {
+        Ok(Self {
+            goal_id: Deserialize::deserialize(reader)?,
+            feedback: Deserialize::deserialize(reader)?,
+        })
+    }
+}
+
+impl RosMessage for {{ action_name }}_FeedbackMessage {
+    const TYPE_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_FeedbackMessage_";
+    const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+{{ feedback_message_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}_FeedbackMessage {
+    const TYPE_NAME: &'static str = "{{ feedback_message_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ feedback_message_schema_fields_block -}}
+    ];
+}
+
+// ============================================================================
 // Action Definition
 // ============================================================================
 
