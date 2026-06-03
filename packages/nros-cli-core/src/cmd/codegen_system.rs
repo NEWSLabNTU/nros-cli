@@ -133,13 +133,9 @@ pub fn run(args: Args) -> Result<()> {
     // `[system].default_launch` (per system-toml-schema-v0.1 §3.1 step 1).
     // An explicit `--launch`/`--file` flag still beats both.
     let effective_file: Option<String> = args.file.clone().or_else(|| {
-        args.target.as_deref().and_then(|t| {
-            bringup
-                .system
-                .deploy
-                .get(t)
-                .and_then(|d| d.launch.clone())
-        })
+        args.target
+            .as_deref()
+            .and_then(|t| bringup.system.deploy.get(t).and_then(|d| d.launch.clone()))
     });
     let launch_input = resolve_launch(
         &bringup_dir,
@@ -575,8 +571,12 @@ fn render_vendor_hint(bringup: &BringupPackageEntry, mode: AheadOfVendor) -> Str
     }
     out.push_str("],\n");
     let todo_msg = match mode {
-        AheadOfVendor::Pio => "TODO(E.3): augment PlatformIO library.json with transport + framework",
-        AheadOfVendor::Px4 => "TODO(E.3): emit PX4 board overlay flipping CONFIG_MODULES_NROS_<NAME>=y",
+        AheadOfVendor::Pio => {
+            "TODO(E.3): augment PlatformIO library.json with transport + framework"
+        }
+        AheadOfVendor::Px4 => {
+            "TODO(E.3): emit PX4 board overlay flipping CONFIG_MODULES_NROS_<NAME>=y"
+        }
     };
     out.push_str(&format!("  \"todo\": \"{}\"\n", json_escape(todo_msg)));
     out.push_str("}\n");

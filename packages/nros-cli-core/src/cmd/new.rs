@@ -127,10 +127,9 @@ pub fn run(args: Args) -> Result<()> {
         .map(|s| s == "system")
         .unwrap_or(false)
     {
-        let bringup_path = args
-            .system_name
-            .clone()
-            .ok_or_else(|| eyre::eyre!("`nros new system <name>_bringup` requires a bringup pkg name"))?;
+        let bringup_path = args.system_name.clone().ok_or_else(|| {
+            eyre::eyre!("`nros new system <name>_bringup` requires a bringup pkg name")
+        })?;
         // Phase 212.F: validate the user-supplied name early so
         // `foo/bar`, `..`, absolute paths surface a clean diagnostic
         // before we touch the filesystem.
@@ -177,7 +176,10 @@ pub fn run(args: Args) -> Result<()> {
             components.len()
         );
         if let Some(ws) = out.workspace_cargo_toml.as_ref() {
-            eprintln!("nros new system: updated [workspace] exclude in {}", ws.display());
+            eprintln!(
+                "nros new system: updated [workspace] exclude in {}",
+                ws.display()
+            );
         }
         let _ = out; // silence unused warning under future changes
         return Ok(());

@@ -1191,8 +1191,7 @@ name = "b"
         .unwrap();
         fs::write(dir.join("ambig_pkg/src/lib.rs"), "").unwrap();
 
-        let err = NrosConfig::from_cargo_metadata(&dir)
-            .expect_err("both keys must be rejected");
+        let err = NrosConfig::from_cargo_metadata(&dir).expect_err("both keys must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("node") && msg.contains("component"),

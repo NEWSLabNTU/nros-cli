@@ -193,10 +193,10 @@ fn build_plan(ws: &Path, bringup_override: Option<&str>) -> Result<MigrationPlan
             nros_toml.display()
         );
     }
-    let raw = fs::read_to_string(&nros_toml)
-        .with_context(|| format!("read {}", nros_toml.display()))?;
-    let legacy: LegacyWorkspaceNrosToml = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", nros_toml.display()))?;
+    let raw =
+        fs::read_to_string(&nros_toml).with_context(|| format!("read {}", nros_toml.display()))?;
+    let legacy: LegacyWorkspaceNrosToml =
+        toml::from_str(&raw).with_context(|| format!("parse {}", nros_toml.display()))?;
 
     // System name derivation: the spec says default = `<system_name_from_nros_toml>_bringup`.
     // The pre-212 schema has no `[system].name`, so we prefer the first
@@ -279,16 +279,22 @@ fn build_plan(ws: &Path, bringup_override: Option<&str>) -> Result<MigrationPlan
         });
     }
     for pkg_dir in &pkg_dirs {
-        steps.push(Step::PatchPackageCargoToml { pkg_dir: pkg_dir.clone() });
+        steps.push(Step::PatchPackageCargoToml {
+            pkg_dir: pkg_dir.clone(),
+        });
         // Delete component manifests for this pkg.
         for comp in &components_by_pkg[pkg_dir] {
-            steps.push(Step::DeleteComponentManifest { path: comp.src.clone() });
+            steps.push(Step::DeleteComponentManifest {
+                path: comp.src.clone(),
+            });
         }
         let metadata_dir = pkg_dir.join("metadata");
         if metadata_dir.is_dir() {
             steps.push(Step::DeleteMetadataDir { path: metadata_dir });
         }
-        steps.push(Step::RegeneratePackageXml { pkg_dir: pkg_dir.clone() });
+        steps.push(Step::RegeneratePackageXml {
+            pkg_dir: pkg_dir.clone(),
+        });
     }
     steps.push(Step::DeleteNrosToml);
     steps.push(Step::PatchWorkspaceCargoToml);
@@ -314,18 +320,22 @@ fn convert_deploy(
     let tbl = raw.as_table()?;
     let kind = tbl.get("kind")?.as_str()?.to_string();
     let target = tbl.get("target")?.as_str()?.to_string();
-    Some(
-        crate::orchestration::cargo_metadata_schema::DeployTarget {
-            kind: Some(kind),
-            target: Some(target),
-            launch: tbl.get("launch").and_then(|v| v.as_str()).map(str::to_string),
-            board: tbl.get("board").and_then(|v| v.as_str()).map(str::to_string),
-            framework: tbl
-                .get("framework")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        },
-    )
+    Some(crate::orchestration::cargo_metadata_schema::DeployTarget {
+        kind: Some(kind),
+        target: Some(target),
+        launch: tbl
+            .get("launch")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        board: tbl
+            .get("board")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        framework: tbl
+            .get("framework")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
 }
 
 fn discover_components_for_pkg(pkg_dir: &Path) -> Result<Vec<PreComponent>> {
@@ -333,10 +343,10 @@ fn discover_components_for_pkg(pkg_dir: &Path) -> Result<Vec<PreComponent>> {
     // Single-component form.
     let folded = pkg_dir.join("component_nros.toml");
     if folded.is_file() {
-        let raw = fs::read_to_string(&folded)
-            .with_context(|| format!("read {}", folded.display()))?;
-        let cfg: LegacyComponentConfig = toml::from_str(&raw)
-            .with_context(|| format!("parse {}", folded.display()))?;
+        let raw =
+            fs::read_to_string(&folded).with_context(|| format!("read {}", folded.display()))?;
+        let cfg: LegacyComponentConfig =
+            toml::from_str(&raw).with_context(|| format!("parse {}", folded.display()))?;
         out.push(PreComponent { src: folded, cfg });
     }
     // Multi-component form.
@@ -348,10 +358,10 @@ fn discover_components_for_pkg(pkg_dir: &Path) -> Result<Vec<PreComponent>> {
             .collect();
         entries.sort();
         for path in entries {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let cfg: LegacyComponentConfig = toml::from_str(&raw)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let raw =
+                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            let cfg: LegacyComponentConfig =
+                toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
             out.push(PreComponent { src: path, cfg });
         }
     }
@@ -364,12 +374,7 @@ fn discover_components_for_pkg(pkg_dir: &Path) -> Result<Vec<PreComponent>> {
 
 fn print_plan(plan: &MigrationPlan) {
     let ws = &plan.ws;
-    let rel = |p: &Path| -> String {
-        p.strip_prefix(ws)
-            .unwrap_or(p)
-            .display()
-            .to_string()
-    };
+    let rel = |p: &Path| -> String { p.strip_prefix(ws).unwrap_or(p).display().to_string() };
     println!("nros migrate workspace plan:");
     for step in &plan.steps {
         match step {
@@ -418,8 +423,7 @@ fn apply_plan(plan: &MigrationPlan) -> Result<()> {
     fs::create_dir_all(plan.bringup_dir.join("launch"))
         .with_context(|| format!("create {}", plan.bringup_dir.display()))?;
     let system = build_system_toml(plan);
-    let toml_str = toml::to_string_pretty(&system)
-        .wrap_err("serialize generated system.toml")?;
+    let toml_str = toml::to_string_pretty(&system).wrap_err("serialize generated system.toml")?;
     let header = "# generated by nros migrate workspace — Phase 212.I\n\n";
     fs::write(
         plan.bringup_dir.join("system.toml"),
@@ -432,8 +436,7 @@ fn apply_plan(plan: &MigrationPlan) -> Result<()> {
         if src != &dst {
             fs::copy(src, &dst)
                 .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
-            fs::remove_file(src)
-                .with_context(|| format!("remove old launch {}", src.display()))?;
+            fs::remove_file(src).with_context(|| format!("remove old launch {}", src.display()))?;
         }
     }
 
@@ -472,8 +475,7 @@ fn apply_plan(plan: &MigrationPlan) -> Result<()> {
     // Step 5: delete root nros.toml.
     let root_nros = plan.ws.join("nros.toml");
     if root_nros.is_file() {
-        fs::remove_file(&root_nros)
-            .with_context(|| format!("remove {}", root_nros.display()))?;
+        fs::remove_file(&root_nros).with_context(|| format!("remove {}", root_nros.display()))?;
     }
 
     // Step 6: patch (or create) workspace-root Cargo.toml.
@@ -544,11 +546,9 @@ fn patch_package_cargo_toml(pkg_dir: &Path, comps: &[PreComponent]) -> Result<()
                     .unwrap_or("pkg")
                     .to_string()
             });
-        format!(
-            "[package]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .parse()
-        .expect("stub Cargo.toml parses")
+        format!("[package]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",)
+            .parse()
+            .expect("stub Cargo.toml parses")
     };
 
     // Ensure [package] table.
@@ -629,7 +629,8 @@ fn render_component_table(cfg: &LegacyComponentConfig) -> Table {
 
 fn toml_value_to_item(v: &toml::Value) -> Item {
     // Round-trip through string: keeps the conversion simple + correct.
-    let raw = toml::to_string(&BTreeMap::from([(String::from("v"), v.clone())])).unwrap_or_default();
+    let raw =
+        toml::to_string(&BTreeMap::from([(String::from("v"), v.clone())])).unwrap_or_default();
     if let Ok(doc) = raw.parse::<DocumentMut>() {
         if let Some(item) = doc.get("v") {
             return item.clone();
@@ -672,8 +673,7 @@ fn render_ament_metadata_table(ament: &PackageMetadataAment) -> Table {
 /// collapses every dep type into one set, so for the migration we need the
 /// per-tag breakdown.
 fn extract_ament_from_package_xml(path: &Path) -> Result<PackageMetadataAment> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut out = PackageMetadataAment::default();
     out.build_depend = extract_tag(&raw, "build_depend");
     out.exec_depend = extract_tag(&raw, "exec_depend");
@@ -722,7 +722,9 @@ fn patch_workspace_cargo_toml(ws: &Path, bringup_name: &str, pkg_dirs: &[PathBuf
         raw.parse()
             .with_context(|| format!("parse {}", cargo_toml.display()))?
     } else {
-        "[workspace]\nresolver = \"2\"\n".parse().expect("stub parses")
+        "[workspace]\nresolver = \"2\"\n"
+            .parse()
+            .expect("stub parses")
     };
 
     let workspace = doc
@@ -745,11 +747,7 @@ fn patch_workspace_cargo_toml(ws: &Path, bringup_name: &str, pkg_dirs: &[PathBuf
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     for pkg in pkg_dirs {
-        let rel = pkg
-            .strip_prefix(ws)
-            .unwrap_or(pkg)
-            .display()
-            .to_string();
+        let rel = pkg.strip_prefix(ws).unwrap_or(pkg).display().to_string();
         if !existing.contains(&rel) {
             members_arr.push(rel);
         }
@@ -966,7 +964,10 @@ mod tests {
                 || cargo_toml.contains("metadata.nros.nodes"),
             "Cargo.toml missing nros.nodes table:\n{cargo_toml}"
         );
-        assert!(!pkg.join("nros/components").exists(), "nros/components not deleted");
+        assert!(
+            !pkg.join("nros/components").exists(),
+            "nros/components not deleted"
+        );
         assert!(!pkg.join("metadata").exists(), "metadata/ not deleted");
 
         let sys: SystemToml =
@@ -1041,11 +1042,7 @@ mod tests {
     #[test]
     fn render_nros_metadata_table_emits_node_spelling() {
         use toml_edit::DocumentMut;
-        fn legacy_with_override(
-            pkg: &str,
-            comp: &str,
-            ns: &str,
-        ) -> PreComponent {
+        fn legacy_with_override(pkg: &str, comp: &str, ns: &str) -> PreComponent {
             PreComponent {
                 src: PathBuf::from("ignored"),
                 cfg: LegacyComponentConfig {
@@ -1088,11 +1085,10 @@ mod tests {
             .unwrap()
             .entry("metadata")
             .or_insert_with(|| Item::Table(Table::new()));
-        doc["package"]["metadata"]["nros"] =
-            Item::Table(render_nros_metadata_table(&[
-                legacy_with_override("demo_container", "Talker", "/talker"),
-                legacy_with_override("demo_container", "Listener", "/listener"),
-            ]));
+        doc["package"]["metadata"]["nros"] = Item::Table(render_nros_metadata_table(&[
+            legacy_with_override("demo_container", "Talker", "/talker"),
+            legacy_with_override("demo_container", "Listener", "/listener"),
+        ]));
         let rendered = doc.to_string();
         assert!(
             rendered.contains("[package.metadata.nros.nodes.Talker]"),

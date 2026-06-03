@@ -1068,7 +1068,10 @@ fn schema_remaps(value: Option<&Value>) -> Vec<Value> {
 /// in their public shape; we only reshape `env` (pairs → `{name, value}`)
 /// and append the `trace` block.
 fn schema_executable(entry: &Value) -> Value {
-    let id = entry.get("id").and_then(Value::as_str).unwrap_or("executable");
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("executable");
     let name = entry
         .get("name")
         .and_then(Value::as_str)
@@ -3506,10 +3509,12 @@ topics:
             .iter()
             .find(|i| i["kind"] == "container")
             .expect("container instance");
-        assert_eq!(container["component"], "rclcpp_components::component_container");
+        assert_eq!(
+            container["component"],
+            "rclcpp_components::component_container"
+        );
         assert!(
-            container.get("container_id").is_none()
-                || container["container_id"].is_null(),
+            container.get("container_id").is_none() || container["container_id"].is_null(),
             "container must NOT carry its own container_id: {container:#?}"
         );
         let container_id = container["id"].as_str().expect("container id");

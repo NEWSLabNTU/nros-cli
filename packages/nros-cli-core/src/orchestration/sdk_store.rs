@@ -362,15 +362,12 @@ pub fn provision_source(
                 // gitdir + worktree (only its checkout of the lagging pin failed),
                 // so fetch the exact gitlink SHA at depth 1 and check it out, then
                 // descend if recursive.
-                let sha = sh_capture(
-                    &["git", "-C", &workspace_s, "ls-tree", "HEAD", path],
-                    None,
-                )
-                .wrap_err_with(|| format!("read gitlink sha for {path} (source {name})"))?
-                .split_whitespace()
-                .nth(2)
-                .map(str::to_owned)
-                .ok_or_else(|| eyre!("no gitlink sha for {path} (source {name})"))?;
+                let sha = sh_capture(&["git", "-C", &workspace_s, "ls-tree", "HEAD", path], None)
+                    .wrap_err_with(|| format!("read gitlink sha for {path} (source {name})"))?
+                    .split_whitespace()
+                    .nth(2)
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre!("no gitlink sha for {path} (source {name})"))?;
                 let subdir = workspace.join(path);
                 let subdir_s = subdir.to_string_lossy();
                 sh(

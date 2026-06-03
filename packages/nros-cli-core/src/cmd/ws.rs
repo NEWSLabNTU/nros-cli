@@ -175,7 +175,9 @@ fn run_env(args: EnvArgs) -> Result<()> {
     let abs_s = abs.display().to_string();
     match args.shell {
         Shell::Posix => {
-            println!("export NROS_INTERFACE_SEARCH_PATH=\"{abs_s}:${{NROS_INTERFACE_SEARCH_PATH:-}}\"");
+            println!(
+                "export NROS_INTERFACE_SEARCH_PATH=\"{abs_s}:${{NROS_INTERFACE_SEARCH_PATH:-}}\""
+            );
         }
         Shell::Fish => {
             println!("set -gx NROS_INTERFACE_SEARCH_PATH \"{abs_s}\" $NROS_INTERFACE_SEARCH_PATH");
@@ -197,29 +199,33 @@ fn run_env(args: EnvArgs) -> Result<()> {
 ///   4. Fallback → `<cwd>/src` (legacy default; may not exist).
 fn resolve_env_root(arg: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = arg {
-        return std::fs::canonicalize(p)
-            .map_err(|e| eyre!("ws env: {}: {e}", p.display()));
+        return std::fs::canonicalize(p).map_err(|e| eyre!("ws env: {}: {e}", p.display()));
     }
     let cwd = std::env::current_dir()?;
     let src = cwd.join("src");
     if src.is_dir() && has_pkg_subdir(&src) {
-        return std::fs::canonicalize(&src)
-            .map_err(|e| eyre!("ws env: {}: {e}", src.display()));
+        return std::fs::canonicalize(&src).map_err(|e| eyre!("ws env: {}: {e}", src.display()));
     }
     if cwd.join("package.xml").is_file() {
         let parent = cwd.parent().ok_or_else(|| {
-            eyre!("ws env: cwd {} is a standalone pkg but has no parent", cwd.display())
+            eyre!(
+                "ws env: cwd {} is a standalone pkg but has no parent",
+                cwd.display()
+            )
         })?;
         return std::fs::canonicalize(parent)
             .map_err(|e| eyre!("ws env: {}: {e}", parent.display()));
     }
     // Fallback — caller might not be in a pkg/workspace dir. Use ./src
     // and surface the error from canonicalize if it doesn't exist.
-    std::fs::canonicalize(&src)
-        .map_err(|e| eyre!("ws env: {}: {e}\n\
+    std::fs::canonicalize(&src).map_err(|e| {
+        eyre!(
+            "ws env: {}: {e}\n\
                             (no `src/<pkg>/package.xml` colcon layout and no `package.xml` \
                             at cwd — pass an explicit path arg)",
-                           src.display()))
+            src.display()
+        )
+    })
 }
 
 // =============================================================================
@@ -243,8 +249,9 @@ struct WsPkg {
 
 fn run_sync(args: SyncArgs) -> Result<()> {
     let ws_root: PathBuf = match args.workspace {
-        Some(p) => std::fs::canonicalize(&p)
-            .wrap_err_with(|| format!("ws sync: {}", p.display()))?,
+        Some(p) => {
+            std::fs::canonicalize(&p).wrap_err_with(|| format!("ws sync: {}", p.display()))?
+        }
         None => std::env::current_dir()?,
     };
     // Two layouts supported:
@@ -256,8 +263,7 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     // immediate subdir with `package.xml`. Falls through to single-pkg mode
     // when the workspace root itself carries `package.xml` (the standalone
     // example shape; `src/` may exist as the cargo source dir).
-    let colcon_layout = ws_root.join("src").is_dir()
-        && has_pkg_subdir(&ws_root.join("src"));
+    let colcon_layout = ws_root.join("src").is_dir() && has_pkg_subdir(&ws_root.join("src"));
     let single_pkg_mode = !colcon_layout && ws_root.join("package.xml").is_file();
     let src_root = if colcon_layout {
         ws_root.join("src")
@@ -329,7 +335,14 @@ fn run_sync(args: SyncArgs) -> Result<()> {
         // First materialize any AMENT-resolved cross-deps so the workspace
         // pkg's deps closure exists in build/ too. Skips workspace deps
         // (those are handled by topo order itself).
-        codegen_ament_deps_for(&pkg.deps, &scan, &build_root, edition, &mut emitted, args.verbose)?;
+        codegen_ament_deps_for(
+            &pkg.deps,
+            &scan,
+            &build_root,
+            edition,
+            &mut emitted,
+            args.verbose,
+        )?;
         // Now generate the workspace pkg itself directly from its dir.
         if !emitted.contains(name) {
             codegen_workspace_pkg(pkg, &build_root, edition, args.verbose)?;
@@ -342,7 +355,14 @@ fn run_sync(args: SyncArgs) -> Result<()> {
         .filter(|p| p.is_rust_pkg && !p.is_msg_pkg)
         .collect();
     for c in &rust_consumers {
-        codegen_ament_deps_for(&c.deps, &scan, &build_root, edition, &mut emitted, args.verbose)?;
+        codegen_ament_deps_for(
+            &c.deps,
+            &scan,
+            &build_root,
+            edition,
+            &mut emitted,
+            args.verbose,
+        )?;
     }
 
     if rust_consumers.is_empty() {
@@ -379,7 +399,6 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     Ok(())
 }
 
-
 fn parse_edition(s: &str) -> Result<RosEdition> {
     match s.to_lowercase().as_str() {
         "humble" => Ok(RosEdition::Humble),
@@ -400,7 +419,11 @@ fn codegen_workspace_pkg(
     std::fs::create_dir_all(&out_dir)
         .wrap_err_with(|| format!("ws sync: mkdir {}", out_dir.display()))?;
     if verbose {
-        println!("ws sync: codegen workspace pkg {} → {}", pkg.name, out_dir.display());
+        println!(
+            "ws sync: codegen workspace pkg {} → {}",
+            pkg.name,
+            out_dir.display()
+        );
     } else {
         println!("ws sync: codegen {}", pkg.name);
     }
@@ -431,14 +454,15 @@ fn codegen_ament_deps_for(
     // Pre-load ament index once per invocation.
     static AMENT_INDEX: std::sync::OnceLock<Option<rosidl_bindgen::ament::AmentIndex>> =
         std::sync::OnceLock::new();
-    let idx = AMENT_INDEX.get_or_init(|| {
-        rosidl_bindgen::ament::AmentIndex::from_env().ok()
-    });
+    let idx = AMENT_INDEX.get_or_init(|| rosidl_bindgen::ament::AmentIndex::from_env().ok());
     let Some(idx) = idx else { return Ok(()) };
 
     let in_workspace: HashSet<&str> = scan.iter().map(|p| p.name.as_str()).collect();
-    let mut to_resolve: Vec<String> =
-        deps.iter().filter(|d| !in_workspace.contains(d.as_str())).cloned().collect();
+    let mut to_resolve: Vec<String> = deps
+        .iter()
+        .filter(|d| !in_workspace.contains(d.as_str()))
+        .cloned()
+        .collect();
 
     while let Some(dep) = to_resolve.pop() {
         if emitted.contains(&dep) {
@@ -452,7 +476,11 @@ fn codegen_ament_deps_for(
         let out_dir = build_root;
         std::fs::create_dir_all(&out_dir)?;
         if verbose {
-            println!("ws sync: codegen AMENT pkg {} → {}", amented.name, out_dir.display());
+            println!(
+                "ws sync: codegen AMENT pkg {} → {}",
+                amented.name,
+                out_dir.display()
+            );
         } else {
             println!("ws sync: codegen {}", amented.name);
         }
@@ -472,7 +500,6 @@ fn codegen_ament_deps_for(
     }
     Ok(())
 }
-
 
 // --- Scan ----------------------------------------------------------------------
 
@@ -494,8 +521,10 @@ fn scan_one_pkg_dir(pkg_dir: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
     let manifest = pkg_dir.join("package.xml");
     let body = std::fs::read_to_string(&manifest)?;
     let Some(name) = extract_pkg_name(&body) else {
-        bail!("ws sync: single-pkg mode: package.xml at {} has no <name>",
-              manifest.display());
+        bail!(
+            "ws sync: single-pkg mode: package.xml at {} has no <name>",
+            manifest.display()
+        );
     };
     let is_msg_pkg = body.contains("rosidl_interface_packages")
         || pkg_dir.join("msg").is_dir()
@@ -594,8 +623,7 @@ fn is_ros_meta_pkg(name: &str) -> bool {
 }
 
 fn topo_sort_msg_pkgs(pkgs: &[&WsPkg]) -> Result<Vec<String>> {
-    let names: std::collections::HashSet<&str> =
-        pkgs.iter().map(|p| p.name.as_str()).collect();
+    let names: std::collections::HashSet<&str> = pkgs.iter().map(|p| p.name.as_str()).collect();
     let mut remaining: Vec<&&WsPkg> = pkgs.iter().collect();
     let mut emitted: Vec<String> = Vec::new();
     while !remaining.is_empty() {
@@ -835,10 +863,7 @@ fn strip_managed_block(body: &str) -> String {
 /// rows — because users may have annotated their entries. Comment lines are
 /// kept attached to the next non-comment row when possible; standalone
 /// trailing comments are preserved as-is.
-fn extract_patch_table(
-    body: &str,
-    managed_names: &[String],
-) -> (String, Vec<String>, bool) {
+fn extract_patch_table(body: &str, managed_names: &[String]) -> (String, Vec<String>, bool) {
     // Locate header line. Match any line whose trimmed text begins with
     // `[patch.crates-io]` — TOML allows whitespace before headers but we
     // emit them flush-left, so a leading-whitespace match is sufficient.
@@ -963,9 +988,7 @@ fn check_freshness(
     let mut stale = false;
     for name in topo {
         let pkg = scan.iter().find(|p| &p.name == name).unwrap();
-        let crate_root = build_root
-            
-            .join(name);
+        let crate_root = build_root.join(name);
         let cargo = crate_root.join("Cargo.toml");
         if !cargo.is_file() {
             eprintln!(
@@ -1021,12 +1044,10 @@ fn scan_for_query(
     build_dir: &Path,
 ) -> Result<(PathBuf, Vec<WsPkg>, PathBuf)> {
     let ws_root: PathBuf = match workspace {
-        Some(p) => std::fs::canonicalize(p)
-            .wrap_err_with(|| format!("ws: {}", p.display()))?,
+        Some(p) => std::fs::canonicalize(p).wrap_err_with(|| format!("ws: {}", p.display()))?,
         None => std::env::current_dir()?,
     };
-    let colcon_layout = ws_root.join("src").is_dir()
-        && has_pkg_subdir(&ws_root.join("src"));
+    let colcon_layout = ws_root.join("src").is_dir() && has_pkg_subdir(&ws_root.join("src"));
     let single_pkg_mode = !colcon_layout && ws_root.join("package.xml").is_file();
     let src_root = if colcon_layout {
         ws_root.join("src")
@@ -1092,8 +1113,7 @@ fn run_list(args: ListArgs) -> Result<()> {
 // --- status -------------------------------------------------------------------
 
 fn run_status(args: StatusArgs) -> Result<()> {
-    let (ws_root, scan, build_root) =
-        scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
+    let (ws_root, scan, build_root) = scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
     let msg_pkgs: Vec<&WsPkg> = scan.iter().filter(|p| p.is_msg_pkg).collect();
     if msg_pkgs.is_empty() {
         println!("ws status: no msg pkgs.");
@@ -1154,8 +1174,7 @@ fn run_status(args: StatusArgs) -> Result<()> {
 // --- clean --------------------------------------------------------------------
 
 fn run_clean(args: CleanArgs) -> Result<()> {
-    let (ws_root, scan, build_root) =
-        scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
+    let (ws_root, scan, build_root) = scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
     let gen_dir = build_root;
     if gen_dir.is_dir() {
         if args.dry_run {
@@ -1170,10 +1189,8 @@ fn run_clean(args: CleanArgs) -> Result<()> {
     }
     // Strip the auto-managed patch block from every Rust consumer's patch
     // authority Cargo.toml.
-    let rust_consumers: Vec<&WsPkg> =
-        scan.iter().filter(|p| p.is_rust_pkg).collect();
-    let mut authorities: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    let rust_consumers: Vec<&WsPkg> = scan.iter().filter(|p| p.is_rust_pkg).collect();
+    let mut authorities: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for c in &rust_consumers {
         if let Ok(a) = find_patch_authority(&c.dir, &ws_root) {
             authorities.insert(a);
@@ -1188,7 +1205,10 @@ fn run_clean(args: CleanArgs) -> Result<()> {
             continue;
         };
         if args.dry_run {
-            println!("ws clean: WOULD strip patch block from {}", authority.display());
+            println!(
+                "ws clean: WOULD strip patch block from {}",
+                authority.display()
+            );
             continue;
         }
         let end_line_end = e + END.len();
@@ -1201,7 +1221,10 @@ fn run_clean(args: CleanArgs) -> Result<()> {
         out.push_str(&body[end_line_end..]);
         std::fs::write(&authority, out)
             .wrap_err_with(|| format!("ws clean: write {}", authority.display()))?;
-        println!("ws clean: stripped patch block from {}", authority.display());
+        println!(
+            "ws clean: stripped patch block from {}",
+            authority.display()
+        );
     }
     Ok(())
 }
@@ -1209,8 +1232,7 @@ fn run_clean(args: CleanArgs) -> Result<()> {
 // --- doctor -------------------------------------------------------------------
 
 fn run_doctor(args: DoctorArgs) -> Result<()> {
-    let (ws_root, scan, build_root) =
-        scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
+    let (ws_root, scan, build_root) = scan_for_query(args.workspace.as_deref(), &args.build_dir)?;
     let mut warnings = 0;
     println!("ws doctor ({})", ws_root.display());
     for pkg in &scan {
@@ -1246,7 +1268,8 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
                         eprintln!(
                             "  ⚠ {}: no nros-managed [patch.crates-io] block in \
                              patch authority ({}). Run `nros ws sync`.",
-                            pkg.name, a.display()
+                            pkg.name,
+                            a.display()
                         );
                         warnings += 1;
                     }
@@ -1341,8 +1364,13 @@ nros-serdes = { path = \"../packages/core/nros-serdes\" }
             "user-preserved entry missing: {out}"
         );
         // Managed entry now only appears once, inside the block.
-        let managed_occurrences = out.matches("nros-core = { path = \"managed/nros-core\" }").count();
-        assert_eq!(managed_occurrences, 1, "managed row should appear once: {out}");
+        let managed_occurrences = out
+            .matches("nros-core = { path = \"managed/nros-core\" }")
+            .count();
+        assert_eq!(
+            managed_occurrences, 1,
+            "managed row should appear once: {out}"
+        );
         // The user's hand-authored `nros-core` row above the block was
         // evicted (it's in the managed set), preventing TOML's
         // "duplicate key in [patch.crates-io]" error.
@@ -1368,7 +1396,10 @@ builtin_interfaces = { path = \"generated/builtin_interfaces\" }
         let r = rendered(&["nros-core", "nros-serdes"]);
         let first = splice_patch_block(body, &r);
         let second = splice_patch_block(&first, &r);
-        assert_eq!(first, second, "writer is not idempotent:\nfirst:\n{first}\nsecond:\n{second}");
+        assert_eq!(
+            first, second,
+            "writer is not idempotent:\nfirst:\n{first}\nsecond:\n{second}"
+        );
         assert_eq!(count_patch_headers(&first), 1);
     }
 
@@ -1494,7 +1525,10 @@ cyclonedds-sys = { path = \"../../../../packages/dds/cyclonedds-sys\" }
         let body = "[patch.crates-io]\n\"nros-core\" = { path = \"x\" }\nfoo = { path = \"y\" }\n";
         let (out, preserved, had) = extract_patch_table(body, &["nros-core".to_string()]);
         assert!(had);
-        assert!(!out.contains("nros-core"), "managed quoted key not evicted: {out}");
+        assert!(
+            !out.contains("nros-core"),
+            "managed quoted key not evicted: {out}"
+        );
         assert_eq!(preserved.len(), 1, "{:?}", preserved);
         assert!(preserved[0].contains("foo"));
     }

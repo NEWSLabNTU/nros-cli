@@ -18,10 +18,8 @@ fn temp_root(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "phase-212-f-{tag}-{}-{stamp}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("phase-212-f-{tag}-{}-{stamp}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -35,7 +33,11 @@ fn write_workspace(root: &Path) {
     .unwrap();
 }
 
-fn default_new_args(name: PathBuf, system_name: Option<PathBuf>, components: Vec<String>) -> NewArgs {
+fn default_new_args(
+    name: PathBuf,
+    system_name: Option<PathBuf>,
+    components: Vec<String>,
+) -> NewArgs {
     NewArgs {
         name: Some(name),
         system_name,

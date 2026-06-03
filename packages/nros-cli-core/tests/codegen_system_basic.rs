@@ -179,8 +179,8 @@ fn codegen_system_emits_nros_plan_json() {
     let out = dir.join("build/demo_bringup");
     codegen_system::run(args(&dir, &out)).expect("codegen runs");
 
-    let plan = fs::read_to_string(out.join("nros-system/nros-plan.json"))
-        .expect("nros-plan.json exists");
+    let plan =
+        fs::read_to_string(out.join("nros-system/nros-plan.json")).expect("nros-plan.json exists");
     // Parse the JSON to confirm it's well-formed + has the expected keys.
     let parsed: serde_json::Value = serde_json::from_str(&plan).expect("plan parses as JSON");
     assert_eq!(parsed["bringup"], "demo_bringup");
@@ -210,7 +210,11 @@ fn codegen_system_ahead_of_vendor_emits_hint_file() {
     codegen_system::run(a).expect("codegen runs");
 
     let hint_path = out.join("nros-system/vendor_hint.json");
-    assert!(hint_path.exists(), "vendor_hint.json at {}", hint_path.display());
+    assert!(
+        hint_path.exists(),
+        "vendor_hint.json at {}",
+        hint_path.display()
+    );
     let body = fs::read_to_string(&hint_path).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("hint parses as JSON");
     assert_eq!(parsed["kind"], "platformio");
@@ -241,10 +245,15 @@ fn codegen_system_idempotent_on_unchanged_input() {
     codegen_system::run(args(&dir, &out)).expect("first run");
 
     let bake = out.join("nros-system");
-    let snap: Vec<(String, Vec<u8>)> = ["system_config.h", "system_main.c", "Cargo.toml", "nros-plan.json"]
-        .iter()
-        .map(|f| (f.to_string(), fs::read(bake.join(f)).expect("read")))
-        .collect();
+    let snap: Vec<(String, Vec<u8>)> = [
+        "system_config.h",
+        "system_main.c",
+        "Cargo.toml",
+        "nros-plan.json",
+    ]
+    .iter()
+    .map(|f| (f.to_string(), fs::read(bake.join(f)).expect("read")))
+    .collect();
 
     codegen_system::run(args(&dir, &out)).expect("second run");
 

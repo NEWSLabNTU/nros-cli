@@ -191,7 +191,11 @@ fn resolves_find_substitution() {
     );
     let desc = parse_launch_file(&parent, &index, &[]).expect("parse");
     assert_eq!(desc.includes.len(), 1);
-    assert!(desc.includes[0].file.ends_with("demo_bringup/launch/sub.xml"));
+    assert!(
+        desc.includes[0]
+            .file
+            .ends_with("demo_bringup/launch/sub.xml")
+    );
     assert_eq!(desc.nodes.len(), 1);
     assert_eq!(desc.nodes[0].pkg, "demo_bringup");
     assert_eq!(desc.nodes[0].exec, "sub_node");
@@ -205,18 +209,12 @@ fn errors_on_include_cycle() {
     let b = root.join("b.launch.xml");
     fs::write(
         &a,
-        format!(
-            r#"<launch><include file="{}"/></launch>"#,
-            b.display()
-        ),
+        format!(r#"<launch><include file="{}"/></launch>"#, b.display()),
     )
     .unwrap();
     fs::write(
         &b,
-        format!(
-            r#"<launch><include file="{}"/></launch>"#,
-            a.display()
-        ),
+        format!(r#"<launch><include file="{}"/></launch>"#, a.display()),
     )
     .unwrap();
     let err = parse_launch_file(&a, &index, &[]).expect_err("cycle must error");

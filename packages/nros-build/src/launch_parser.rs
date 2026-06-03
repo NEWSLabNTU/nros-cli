@@ -147,7 +147,9 @@ impl ArgScope {
         if let Some(v) = &arg.value {
             self.values.insert(arg.name.clone(), v.clone());
         } else if let Some(d) = &arg.default {
-            self.values.entry(arg.name.clone()).or_insert_with(|| d.clone());
+            self.values
+                .entry(arg.name.clone())
+                .or_insert_with(|| d.clone());
         }
     }
     /// Snapshot — pushed across `<include>` boundaries; the include
@@ -210,23 +212,13 @@ fn parse_file(
         match event {
             Event::Start(e) => {
                 handle_start(
-                    &e,
-                    &mut stack,
-                    &mut desc,
-                    scope,
-                    pkg_index,
-                    &canonical,
+                    &e, &mut stack, &mut desc, scope, pkg_index, &canonical,
                     /* self_closing = */ false,
                 )?;
             }
             Event::Empty(e) => {
                 handle_start(
-                    &e,
-                    &mut stack,
-                    &mut desc,
-                    scope,
-                    pkg_index,
-                    &canonical,
+                    &e, &mut stack, &mut desc, scope, pkg_index, &canonical,
                     /* self_closing = */ true,
                 )?;
             }
@@ -322,12 +314,7 @@ fn handle_start(
             let top = stack.last_mut();
             match top {
                 Some(Frame::Include(inc)) => {
-                    if let Some(v) = arg
-                        .value
-                        .as_ref()
-                        .or(arg.default.as_ref())
-                        .cloned()
-                    {
+                    if let Some(v) = arg.value.as_ref().or(arg.default.as_ref()).cloned() {
                         inc.args.push((arg.name, v));
                     } else {
                         bail!(
@@ -373,10 +360,7 @@ fn handle_start(
                 .ok_or_else(|| eyre!("<param> missing `value=` in `{}`", here.display()))?;
             match stack.last_mut() {
                 Some(Frame::Node(n)) => n.params.push(ParamSpec { name, value }),
-                _ => bail!(
-                    "<param> must be a child of <node> in `{}`",
-                    here.display()
-                ),
+                _ => bail!("<param> must be a child of <node> in `{}`", here.display()),
             }
         }
         "remap" => {
@@ -472,7 +456,10 @@ fn handle_end(
             attach_include(i, stack, desc);
             Ok(())
         }
-        (other, _) => bail!("</{other}> closed an unexpected frame in `{}`", here.display()),
+        (other, _) => bail!(
+            "</{other}> closed an unexpected frame in `{}`",
+            here.display()
+        ),
     }
 }
 
@@ -529,7 +516,11 @@ fn collect_attrs(
     let mut out = BTreeMap::new();
     for attr_res in e.attributes() {
         let attr = attr_res.with_context(|| {
-            format!("read XML attribute on `<{}>` in `{}`", to_string(e.name()), here.display())
+            format!(
+                "read XML attribute on `<{}>` in `{}`",
+                to_string(e.name()),
+                here.display()
+            )
         })?;
         let key = std::str::from_utf8(attr.key.local_name().as_ref())
             .map_err(|_| eyre!("non-UTF-8 attribute name in `{}`", here.display()))?

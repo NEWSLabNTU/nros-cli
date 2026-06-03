@@ -158,7 +158,9 @@ pub fn build_pkg_index(workspace_root: &Path) -> Result<PkgIndex> {
         .with_context(|| format!("canonicalize workspace root `{}`", workspace_root.display()))?;
 
     let mut package_xml_paths: Vec<PathBuf> = Vec::new();
-    let walker = WalkDir::new(&workspace_root).follow_links(false).into_iter();
+    let walker = WalkDir::new(&workspace_root)
+        .follow_links(false)
+        .into_iter();
     let filter = |entry: &walkdir::DirEntry| -> bool {
         if entry.depth() == 0 {
             return true;
@@ -180,9 +182,8 @@ pub fn build_pkg_index(workspace_root: &Path) -> Result<PkgIndex> {
     };
 
     for entry in walker.filter_entry(filter) {
-        let entry = entry.with_context(|| {
-            format!("walk workspace root `{}`", workspace_root.display())
-        })?;
+        let entry =
+            entry.with_context(|| format!("walk workspace root `{}`", workspace_root.display()))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -198,8 +199,7 @@ pub fn build_pkg_index(workspace_root: &Path) -> Result<PkgIndex> {
         .map(PathBuf::from)
         .map(|d| d.join(".nros-pkg-index.json"));
     if let Some(cache_path) = cache_path.as_ref()
-        && let Some(cached) =
-            load_cache_if_fresh(cache_path, &workspace_root, &package_xml_paths)?
+        && let Some(cached) = load_cache_if_fresh(cache_path, &workspace_root, &package_xml_paths)?
     {
         return Ok(cached);
     }
@@ -258,8 +258,7 @@ pub fn build_pkg_index(workspace_root: &Path) -> Result<PkgIndex> {
         if let Some(parent) = cache_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let json = serde_json::to_string_pretty(&cached)
-            .context("serialise pkg-index cache")?;
+        let json = serde_json::to_string_pretty(&cached).context("serialise pkg-index cache")?;
         let _ = fs::write(&cache_path, json);
     }
 

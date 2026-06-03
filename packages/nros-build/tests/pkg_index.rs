@@ -170,7 +170,10 @@ fn resolve_find_substitution_basic() {
     let resolved = index
         .resolve_find_substitution("$(find demo_bringup)/launch/x.xml")
         .expect("resolve");
-    let expected = root.canonicalize().unwrap().join("demo_bringup/launch/x.xml");
+    let expected = root
+        .canonicalize()
+        .unwrap()
+        .join("demo_bringup/launch/x.xml");
     assert_eq!(resolved, expected.to_string_lossy());
 
     // No trailing path → just the pkg dir.

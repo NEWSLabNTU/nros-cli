@@ -29,12 +29,7 @@
 //! (std_msgs/Int32 + rmw_dds_common_graph) stay as universal fallbacks —
 //! this verb is purely additive (per-example descriptors layered on top).
 
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::PathBuf,
-    process::Command,
-};
+use std::{collections::BTreeSet, fs, path::PathBuf, process::Command};
 
 use clap::Args as ClapArgs;
 use eyre::{Context, Result, bail};
@@ -226,18 +221,13 @@ fn emit(args: &ResolvedArgs) -> Result<()> {
             bail!("duplicate --msg stem `{stem}` (pkg=`{pkg}` msg=`{msg}`)");
         }
 
-        let msg_source = fs::read_to_string(source).with_context(|| {
-            format!(
-                "read .msg source for {pkg}/{msg} at {}",
-                source.display()
-            )
-        })?;
+        let msg_source = fs::read_to_string(source)
+            .with_context(|| format!("read .msg source for {pkg}/{msg} at {}", source.display()))?;
         let idl_text = nros_msg_to_idl::msg_to_idl(&msg_source, pkg, msg)
             .map_err(|e| eyre::eyre!("nros-msg-to-idl({pkg}/{msg}): {e}"))?;
 
         let idl_path = args.out.join(format!("{stem}.idl"));
-        fs::write(&idl_path, &idl_text)
-            .with_context(|| format!("write {}", idl_path.display()))?;
+        fs::write(&idl_path, &idl_text).with_context(|| format!("write {}", idl_path.display()))?;
 
         // Shell idlc -t -l c -o <out> <idl-file>. Matches the helper
         // in nros-rmw-cyclonedds-sys/build.rs (Phase 212.K.2).
@@ -248,10 +238,7 @@ fn emit(args: &ResolvedArgs) -> Result<()> {
             .status()
             .with_context(|| format!("spawn idlc at {}", args.idlc.display()))?;
         if !status.success() {
-            bail!(
-                "idlc failed on {} (status: {status})",
-                idl_path.display()
-            );
+            bail!("idlc failed on {} (status: {status})", idl_path.display());
         }
 
         // idlc names outputs after the IDL stem.
@@ -295,8 +282,8 @@ fn emit(args: &ResolvedArgs) -> Result<()> {
         descriptors: entries,
     };
     let manifest_path = args.out.join("cyclonedds-descriptors.json");
-    let body = serde_json::to_string_pretty(&manifest)
-        .context("serialize cyclonedds-descriptors.json")?;
+    let body =
+        serde_json::to_string_pretty(&manifest).context("serialize cyclonedds-descriptors.json")?;
     fs::write(&manifest_path, body)
         .with_context(|| format!("write {}", manifest_path.display()))?;
 
@@ -507,7 +494,10 @@ EOF
         );
 
         let reg_c = fs::read_to_string(out.join("register.c")).unwrap();
-        assert!(reg_c.contains("#include \"std_msgs_Int32.h\""), "reg_c: {reg_c}");
+        assert!(
+            reg_c.contains("#include \"std_msgs_Int32.h\""),
+            "reg_c: {reg_c}"
+        );
         assert!(
             reg_c.contains("void my_app_register_descriptors(void) {"),
             "reg_c: {reg_c}"
@@ -562,8 +552,7 @@ EOF
         })
         .expect("verb runs from args-file");
 
-        let manifest_body =
-            fs::read_to_string(out.join("cyclonedds-descriptors.json")).unwrap();
+        let manifest_body = fs::read_to_string(out.join("cyclonedds-descriptors.json")).unwrap();
         let manifest: Manifest = serde_json::from_str(&manifest_body).unwrap();
         assert_eq!(manifest.crate_name, "from_args_file");
         assert_eq!(
@@ -595,6 +584,9 @@ EOF
         })
         .unwrap_err();
         let s = format!("{err:#}");
-        assert!(s.contains("duplicate"), "expected duplicate-stem error, got: {s}");
+        assert!(
+            s.contains("duplicate"),
+            "expected duplicate-stem error, got: {s}"
+        );
     }
 }
