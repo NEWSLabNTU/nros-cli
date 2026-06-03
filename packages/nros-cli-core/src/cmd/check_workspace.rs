@@ -69,12 +69,20 @@ pub fn check_workspace(workspace_root: &Path) -> Result<WorkspaceLintReport> {
         let has_cargo = pkg_dir.join("Cargo.toml").is_file();
         let has_cmake = pkg_dir.join("CMakeLists.txt").is_file();
         let has_system = pkg_dir.join("system.toml").is_file();
+        let has_package_xml = pkg_dir.join("package.xml").is_file();
         let has_src = pkg_dir.join("src").is_dir();
 
-        // Component pkg shape: Cargo.toml or CMakeLists.txt sits at the root.
-        // Bringup pkg shape: only system.toml + package.xml (no source).
-        let is_component = has_cargo || has_cmake;
-        let is_bringup = has_system && !is_component && !has_src;
+        // Phase 212.F.2 — bringup detection is `package.xml + system.toml`
+        // presence, regardless of forbidden surfaces. A dir that LOOKS like
+        // a bringup but carries Cargo.toml / CMakeLists.txt / src/ must
+        // still be classified as a bringup so the pure-declarative lint can
+        // surface the offence (rather than mis-classifying it as a
+        // component and treating the system.toml as "stray").
+        let is_bringup = has_system && has_package_xml;
+        // Component shape: has Cargo.toml or CMakeLists.txt AND is NOT a
+        // bringup (the bringup classification wins when both are present so
+        // the F.2 forbidden-file lint catches the contamination).
+        let is_component = (has_cargo || has_cmake) && !is_bringup;
 
         if !is_component && !is_bringup {
             continue; // Not an nros-managed pkg dir — skip.
@@ -115,6 +123,16 @@ pub fn check_workspace(workspace_root: &Path) -> Result<WorkspaceLintReport> {
         }
 
         if is_bringup {
+            // Phase 212.F.2 — run the pure-declarative surface lint on
+            // every bringup pkg discovered by the workspace walk. Catches
+            // Cargo.toml / CMakeLists.txt / src/ / include/ / lib/ +
+            // nested `add_executable(`. The L.4 `<pkg>::<Class>` lint runs
+            // unconditionally below; `<exec_depend>` drift is intentionally
+            // NOT in the workspace-walk pass (only on `--bringup <dir>`)
+            // because pre-spec fixtures stamp shells without the
+            // `<exec_depend>` rows and we don't want to regress them.
+            let _ = has_src;
+            crate::cmd::bringup::lint_bringup_forbidden_surfaces(&pkg_dir)?;
             // L.4 — class prefix matches pkg.
             lint_class_pkg_prefix(&pkg_dir, &name)?;
         }
@@ -321,6 +339,52 @@ mod tests {
             "warnings: {:?}",
             report.warnings
         );
+    }
+
+    /// Phase 212.F.2 — workspace walk must catch bringup pkgs carrying
+    /// forbidden code-bearing files. The bringup classification wins over
+    /// the component classification when both `package.xml + system.toml`
+    /// and `Cargo.toml` coexist, so the offence surfaces (rather than the
+    /// dir being mis-classified as a component with a "stray" system.toml).
+    #[test]
+    fn nros_check_workspace_rejects_cargo_toml_in_bringup() {
+        let root = temp_root("ws_reject_cargo_in_bringup");
+        let bringup = root.join("demo_bringup");
+        write_bringup_with_components(&bringup, &[]);
+        // Sneak a Cargo.toml into the bringup — F.2 must surface this.
+        fs::write(
+            bringup.join("Cargo.toml"),
+            "[package]\nname=\"demo_bringup\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Cargo.toml"), "diag: {msg}");
+        assert!(msg.contains("pure declarative"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_workspace_rejects_src_in_bringup() {
+        let root = temp_root("ws_reject_src_in_bringup");
+        let bringup = root.join("demo_bringup");
+        write_bringup_with_components(&bringup, &[]);
+        fs::create_dir_all(bringup.join("src")).unwrap();
+        fs::write(bringup.join("src/main.rs"), "fn main() {}").unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("src/"), "diag: {msg}");
+    }
+
+    #[test]
+    fn nros_check_workspace_rejects_include_dir_in_bringup() {
+        let root = temp_root("ws_reject_include_in_bringup");
+        let bringup = root.join("demo_bringup");
+        write_bringup_with_components(&bringup, &[]);
+        fs::create_dir_all(bringup.join("include")).unwrap();
+        fs::write(bringup.join("include/demo.h"), "// hdr").unwrap();
+        let err = check_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("include/"), "diag: {msg}");
     }
 
     #[test]

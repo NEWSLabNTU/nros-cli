@@ -20,8 +20,13 @@ use std::{
 use eyre::{Result, WrapErr, bail};
 
 /// Files / dirs that must NOT live inside a bringup package. Path A.
+/// The list comes from the Phase 212.F.2 task brief — every entry here is a
+/// code-bearing surface that means "the bringup pkg has a build target",
+/// which is the very thing Path A disallows. `[[bin]]` / `[lib]` text
+/// patterns inside `Cargo.toml` are covered transitively (the `Cargo.toml`
+/// file itself is rejected).
 const FORBIDDEN_FILES: &[&str] = &["Cargo.toml", "CMakeLists.txt"];
-const FORBIDDEN_DIRS: &[&str] = &["src"];
+const FORBIDDEN_DIRS: &[&str] = &["src", "include", "lib"];
 
 /// Run the bringup lint against a single directory. Emits a clean error
 /// containing every offence the directory carries.
@@ -52,7 +57,36 @@ pub fn lint_bringup(bringup_dir: &Path) -> Result<()> {
         );
     }
 
-    // 2. Forbidden-surface checks.
+    // 2. Forbidden-surface checks (Phase 212.F.2). Factored out so the
+    //    workspace-walk lint can reuse only this slice without also
+    //    forcing the exec_depend drift / class-prefix lints on every dir.
+    lint_bringup_forbidden_surfaces(bringup_dir)?;
+
+    // 3. Cross-validate `package.xml` `<exec_depend>` rows against
+    //    `[[component]].pkg` rows in `system.toml`. The bringup's
+    //    `<exec_depend>` block IS a derived view of the system's component
+    //    list; any drift means a stale package.xml after a component
+    //    rename or add/remove. This replaces the retired
+    //    `nros emit package-xml` auto-regeneration path (Phase 212.G).
+    check_exec_depend_drift(bringup_dir, pkg_name)?;
+
+    // 4. Phase 212.L.4 — `[[component]].class` must be `<pkg>::<Type>`.
+    crate::cmd::check_workspace::lint_class_pkg_prefix(bringup_dir, pkg_name)?;
+
+    Ok(())
+}
+
+/// Phase 212.F.2 — pure-declarative surface lint, without the
+/// `<exec_depend>` drift / class-prefix checks. The workspace-walk path
+/// calls this on every dir with `package.xml + system.toml`, even when the
+/// dir also carries forbidden files (a misconfigured bringup): the goal of
+/// F.2 is precisely to surface those code-bearing files.
+pub fn lint_bringup_forbidden_surfaces(bringup_dir: &Path) -> Result<()> {
+    let pkg_name = bringup_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+
     let mut found: Vec<String> = Vec::new();
     for name in FORBIDDEN_FILES {
         if bringup_dir.join(name).exists() {
@@ -80,28 +114,23 @@ pub fn lint_bringup(bringup_dir: &Path) -> Result<()> {
             ));
         }
     }
-
     if !found.is_empty() {
-        bail!(
-            "bringup pkg {pkg_name} must be pure declarative — found {}; code \
-             belongs in a sibling component pkg (see \
-             docs/design/multi-node-workspace-layout.md §4)",
-            found.join(", ")
-        );
+        return Err(forbidden_surface_error(pkg_name, &found));
     }
-
-    // 3. Cross-validate `package.xml` `<exec_depend>` rows against
-    //    `[[component]].pkg` rows in `system.toml`. The bringup's
-    //    `<exec_depend>` block IS a derived view of the system's component
-    //    list; any drift means a stale package.xml after a component
-    //    rename or add/remove. This replaces the retired
-    //    `nros emit package-xml` auto-regeneration path (Phase 212.G).
-    check_exec_depend_drift(bringup_dir, pkg_name)?;
-
-    // 4. Phase 212.L.4 — `[[component]].class` must be `<pkg>::<Type>`.
-    crate::cmd::check_workspace::lint_class_pkg_prefix(bringup_dir, pkg_name)?;
-
     Ok(())
+}
+
+/// Construct the canonical Phase 212.F.2 diagnostic for a bringup pkg
+/// carrying code-bearing surfaces. Centralised so the wording stays in
+/// sync between the single-dir `lint_bringup` path and the workspace-walk
+/// `lint_bringup_forbidden_surfaces` path.
+fn forbidden_surface_error(pkg_name: &str, found: &[String]) -> eyre::Report {
+    eyre::eyre!(
+        "bringup pkg {pkg_name} must be pure declarative — found {}; code \
+         belongs in a sibling component pkg (see \
+         docs/design/multi-node-workspace-layout.md §4)",
+        found.join(", ")
+    )
 }
 
 /// Compare `<exec_depend>…</exec_depend>` rows in `<bringup>/package.xml`
@@ -383,6 +412,74 @@ mod tests {
         let err = lint_bringup(&bringup).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("add_executable"), "diagnostic: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 212.F.2 spec-named regression tests. The spec brief lists four
+    // tests by exact name; three (`rejects_cargo_toml_in_bringup`,
+    // `rejects_cmakelists_in_bringup`, `rejects_src_dir_in_bringup`) match
+    // the pre-existing names above 1:1. The fourth one
+    // (`accepts_clean_bringup`) maps onto `accepts_pure_declarative_bringup`,
+    // which we keep, plus add the spec-named alias below + coverage for the
+    // broadened forbidden-dir list (`include/`, `lib/`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nros_check_accepts_clean_bringup() {
+        let root = temp_root("accepts_clean_bringup");
+        let bringup = root.join("demo_bringup");
+        write_pure_bringup(&bringup);
+        lint_bringup(&bringup).expect("clean bringup passes F.2 lint");
+    }
+
+    #[test]
+    fn nros_check_rejects_include_dir_in_bringup() {
+        let root = temp_root("reject_include");
+        let bringup = root.join("demo_bringup");
+        write_pure_bringup(&bringup);
+        fs::create_dir_all(bringup.join("include")).unwrap();
+        fs::write(bringup.join("include/demo.h"), "// no").unwrap();
+        let err = lint_bringup(&bringup).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("include/"), "diagnostic: {msg}");
+        assert!(msg.contains("pure declarative"), "diagnostic: {msg}");
+    }
+
+    #[test]
+    fn nros_check_rejects_lib_dir_in_bringup() {
+        let root = temp_root("reject_lib");
+        let bringup = root.join("demo_bringup");
+        write_pure_bringup(&bringup);
+        fs::create_dir_all(bringup.join("lib")).unwrap();
+        fs::write(bringup.join("lib/x.a"), "// no").unwrap();
+        let err = lint_bringup(&bringup).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("lib/"), "diagnostic: {msg}");
+        assert!(msg.contains("pure declarative"), "diagnostic: {msg}");
+    }
+
+    #[test]
+    fn nros_check_lint_bringup_forbidden_surfaces_only_skips_drift() {
+        // The surface-only helper used by the workspace walk must NOT call
+        // `check_exec_depend_drift` — otherwise pre-existing tests that
+        // stamp a stub package.xml without `<exec_depend>` rows would
+        // regress when `[[component]]` entries are present in system.toml.
+        let root = temp_root("surface_only");
+        let bringup = root.join("demo_bringup");
+        write_pure_bringup(&bringup);
+        // Append a [[component]] row that the stub package.xml lacks.
+        let sys = format!(
+            "{}\n\n[[component]]\npkg = \"talker_pkg\"\nclass = \"talker_pkg::T\"\nname = \"t\"\n",
+            fs::read_to_string(bringup.join("system.toml")).unwrap()
+        );
+        fs::write(bringup.join("system.toml"), sys).unwrap();
+        // Surface-only lint: no Cargo.toml etc. → must pass.
+        lint_bringup_forbidden_surfaces(&bringup)
+            .expect("surface-only lint ignores <exec_depend> drift");
+        // Now add a forbidden surface; it MUST surface.
+        fs::write(bringup.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let err = lint_bringup_forbidden_surfaces(&bringup).unwrap_err();
+        assert!(err.to_string().contains("Cargo.toml"));
     }
 
     #[test]

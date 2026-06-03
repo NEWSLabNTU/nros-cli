@@ -40,7 +40,11 @@ fn default_new_args(name: PathBuf, system_name: Option<PathBuf>, components: Vec
         name: Some(name),
         system_name,
         components,
+        component_name: Vec::new(),
         workspace_root: None,
+        into: None,
+        no_config: false,
+        no_readme: false,
         platform: None,
         rmw: "zenoh".to_string(),
         lang: "rust".to_string(),
@@ -123,6 +127,7 @@ fn cli_nros_check_rejects_cargo_toml_in_bringup() {
         plan: bringup.clone(),
         package_xml_drift: vec![],
         bringup: true,
+        workspace: None,
     })
     .unwrap_err();
     let msg = err.to_string();

@@ -66,6 +66,26 @@ pub fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    // Phase 212.F.2 — cwd-bringup auto-detection. When the user runs a bare
+    // `nros check` from inside a bringup pkg (default `plan` arg, no
+    // `--bringup` flag) AND the cwd carries `package.xml + system.toml`,
+    // auto-route into the bringup lint so the manual smoke-test from the
+    // F.2 task brief — `cd demo_bringup && nros check` — exits 0 / 1
+    // without the user spelling out `--bringup .`.
+    let plan_arg_is_default = args.plan == PathBuf::from("build/nros/nros-plan.json");
+    if plan_arg_is_default && !args.plan.exists() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join("package.xml").is_file() && cwd.join("system.toml").is_file() {
+                lint_bringup(&cwd)?;
+                eprintln!(
+                    "nros check: ok (bringup pkg {} is pure declarative)",
+                    cwd.display()
+                );
+                return Ok(());
+            }
+        }
+    }
+
     // Phase 212.G.2 — drift sweep over any explicitly named pkg dirs runs
     // first so warnings surface even when the plan check exits early.
     for pkg_dir in &args.package_xml_drift {
