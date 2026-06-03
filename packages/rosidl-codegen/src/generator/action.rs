@@ -1,6 +1,6 @@
 use super::common::{
-    GeneratorError, build_c_field, determine_field_kind, field_to_nros_field,
-    field_to_nros_field_with_mode,
+    GeneratorError, build_c_field, build_nros_schema_for_struct, determine_field_kind,
+    field_to_nros_field, field_to_nros_field_with_mode,
 };
 use crate::{
     templates::{
@@ -267,6 +267,31 @@ pub fn generate_nros_action_package(
     let has_result_large_array = result_fields.iter().any(|f| f.is_large_array);
     let has_feedback_large_array = feedback_fields.iter().any(|f| f.is_large_array);
 
+    let goal_struct = format!("{}Goal", action_name);
+    let result_struct = format!("{}Result", action_name);
+    let feedback_struct = format!("{}Feedback", action_name);
+    let goal_schema = build_nros_schema_for_struct(
+        package_name,
+        &goal_struct,
+        &format!("{}/action/{}_Goal", package_name, action_name),
+        "GOAL_",
+        &action.spec.goal.fields,
+    );
+    let result_schema = build_nros_schema_for_struct(
+        package_name,
+        &result_struct,
+        &format!("{}/action/{}_Result", package_name, action_name),
+        "RESULT_",
+        &action.spec.result.fields,
+    );
+    let feedback_schema = build_nros_schema_for_struct(
+        package_name,
+        &feedback_struct,
+        &format!("{}/action/{}_Feedback", package_name, action_name),
+        "FEEDBACK_",
+        &action.spec.feedback.fields,
+    );
+
     let action_template = ActionNrosTemplate {
         package_name,
         action_name,
@@ -284,6 +309,15 @@ pub fn generate_nros_action_package(
         has_result_large_array,
         has_feedback_large_array,
         inline_mode: false,
+        goal_schema_helper_consts: goal_schema.helper_consts,
+        goal_schema_fields_block: goal_schema.fields_block,
+        goal_schema_type_name: goal_schema.nros_type_name,
+        result_schema_helper_consts: result_schema.helper_consts,
+        result_schema_fields_block: result_schema.fields_block,
+        result_schema_type_name: result_schema.nros_type_name,
+        feedback_schema_helper_consts: feedback_schema.helper_consts,
+        feedback_schema_fields_block: feedback_schema.fields_block,
+        feedback_schema_type_name: feedback_schema.nros_type_name,
     };
     let action_rs = action_template.render()?;
 
@@ -371,6 +405,31 @@ pub fn generate_nros_inline_action(
     let has_result_large_array = result_fields.iter().any(|f| f.is_large_array);
     let has_feedback_large_array = feedback_fields.iter().any(|f| f.is_large_array);
 
+    let goal_struct = format!("{}Goal", action_name);
+    let result_struct = format!("{}Result", action_name);
+    let feedback_struct = format!("{}Feedback", action_name);
+    let goal_schema = build_nros_schema_for_struct(
+        package_name,
+        &goal_struct,
+        &format!("{}/action/{}_Goal", package_name, action_name),
+        "GOAL_",
+        &action.spec.goal.fields,
+    );
+    let result_schema = build_nros_schema_for_struct(
+        package_name,
+        &result_struct,
+        &format!("{}/action/{}_Result", package_name, action_name),
+        "RESULT_",
+        &action.spec.result.fields,
+    );
+    let feedback_schema = build_nros_schema_for_struct(
+        package_name,
+        &feedback_struct,
+        &format!("{}/action/{}_Feedback", package_name, action_name),
+        "FEEDBACK_",
+        &action.spec.feedback.fields,
+    );
+
     let template = ActionNrosTemplate {
         package_name,
         action_name,
@@ -388,6 +447,15 @@ pub fn generate_nros_inline_action(
         has_result_large_array,
         has_feedback_large_array,
         inline_mode: true,
+        goal_schema_helper_consts: goal_schema.helper_consts,
+        goal_schema_fields_block: goal_schema.fields_block,
+        goal_schema_type_name: goal_schema.nros_type_name,
+        result_schema_helper_consts: result_schema.helper_consts,
+        result_schema_fields_block: result_schema.fields_block,
+        result_schema_type_name: result_schema.nros_type_name,
+        feedback_schema_helper_consts: feedback_schema.helper_consts,
+        feedback_schema_fields_block: feedback_schema.fields_block,
+        feedback_schema_type_name: feedback_schema.nros_type_name,
     };
 
     Ok(template.render()?)

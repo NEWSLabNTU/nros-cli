@@ -172,6 +172,19 @@ impl RosMessage for {{ action_name }}Goal {
     const TYPE_HASH: &'static str = "{{ type_hash }}";
 }
 
+// ── nros_serdes::Message — runtime field schema (Goal) ──────────────────────
+// Consumed by RMW backends that build wire-type descriptors at runtime
+// (Cyclone DDS dynamic types, …) without per-RMW codegen at compile time.
+
+{{ goal_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}Goal {
+    const TYPE_NAME: &'static str = "{{ goal_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ goal_schema_fields_block -}}
+    ];
+}
+
 // ============================================================================
 // Result Message
 // ============================================================================
@@ -333,6 +346,17 @@ impl RosMessage for {{ action_name }}Result {
     const TYPE_HASH: &'static str = "{{ type_hash }}";
 }
 
+// ── nros_serdes::Message — runtime field schema (Result) ────────────────────
+
+{{ result_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}Result {
+    const TYPE_NAME: &'static str = "{{ result_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ result_schema_fields_block -}}
+    ];
+}
+
 // ============================================================================
 // Feedback Message
 // ============================================================================
@@ -492,6 +516,17 @@ impl Deserialize for {{ action_name }}Feedback {
 impl RosMessage for {{ action_name }}Feedback {
     const TYPE_NAME: &'static str = "{{ package_name }}::action::dds_::{{ action_name }}_Feedback_";
     const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+// ── nros_serdes::Message — runtime field schema (Feedback) ──────────────────
+
+{{ feedback_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ action_name }}Feedback {
+    const TYPE_NAME: &'static str = "{{ feedback_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ feedback_schema_fields_block -}}
+    ];
 }
 
 // ============================================================================

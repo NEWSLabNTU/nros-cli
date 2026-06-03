@@ -250,6 +250,25 @@ mod tests {
 
         // Check RosService impl
         assert!(pkg.service_rs.contains("impl RosService for AddTwoInts"));
+
+        // K.7.1.c: nros_serdes::Message impl on both halves with the
+        // rosidl `<pkg>/srv/<Svc>_Request|Response` TYPE_NAME convention.
+        assert!(
+            pkg.service_rs
+                .contains("impl ::nros_serdes::Message for AddTwoIntsRequest")
+        );
+        assert!(
+            pkg.service_rs
+                .contains("impl ::nros_serdes::Message for AddTwoIntsResponse")
+        );
+        assert!(
+            pkg.service_rs
+                .contains("\"test_srvs/srv/AddTwoInts_Request\"")
+        );
+        assert!(
+            pkg.service_rs
+                .contains("\"test_srvs/srv/AddTwoInts_Response\"")
+        );
     }
 
     #[test]
@@ -288,6 +307,37 @@ mod tests {
         assert!(pkg.action_rs.contains("type Goal = FibonacciGoal"));
         assert!(pkg.action_rs.contains("type Result = FibonacciResult"));
         assert!(pkg.action_rs.contains("type Feedback = FibonacciFeedback"));
+
+        // K.7.1.c: nros_serdes::Message impl on all three halves with
+        // the rosidl `<pkg>/action/<Action>_<Half>` TYPE_NAME convention.
+        assert!(
+            pkg.action_rs
+                .contains("impl ::nros_serdes::Message for FibonacciGoal")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("impl ::nros_serdes::Message for FibonacciResult")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("impl ::nros_serdes::Message for FibonacciFeedback")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_Goal\"")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_Result\"")
+        );
+        assert!(
+            pkg.action_rs
+                .contains("\"example_interfaces/action/Fibonacci_Feedback\"")
+        );
+        // Sequence-of-int32 for Result + Feedback emits prefixed FT_ idents
+        // to avoid module-scope collisions.
+        assert!(pkg.action_rs.contains("RESULT_FT_SEQUENCE_ELEM"));
+        assert!(pkg.action_rs.contains("FEEDBACK_FT_PARTIAL_SEQUENCE_ELEM"));
     }
 
     // ========================================================================

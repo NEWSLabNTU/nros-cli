@@ -1,6 +1,6 @@
 use super::common::{
-    GeneratorError, build_c_field, determine_field_kind, field_to_nros_field,
-    field_to_nros_field_with_mode,
+    GeneratorError, build_c_field, build_nros_schema_for_struct, determine_field_kind,
+    field_to_nros_field, field_to_nros_field_with_mode,
 };
 use crate::{
     templates::{
@@ -230,6 +230,23 @@ pub fn generate_nros_service_package(
     let has_response_fields = !response_fields.is_empty();
     let has_request_large_array = request_fields.iter().any(|f| f.is_large_array);
     let has_response_large_array = response_fields.iter().any(|f| f.is_large_array);
+    let req_struct = format!("{}Request", service_name);
+    let resp_struct = format!("{}Response", service_name);
+    let req_schema = build_nros_schema_for_struct(
+        package_name,
+        &req_struct,
+        &format!("{}/srv/{}_Request", package_name, service_name),
+        "REQ_",
+        &service.request.fields,
+    );
+    let resp_schema = build_nros_schema_for_struct(
+        package_name,
+        &resp_struct,
+        &format!("{}/srv/{}_Response", package_name, service_name),
+        "RESP_",
+        &service.response.fields,
+    );
+
     let service_template = ServiceNrosTemplate {
         package_name,
         service_name,
@@ -243,6 +260,12 @@ pub fn generate_nros_service_package(
         has_request_large_array,
         has_response_large_array,
         inline_mode: false,
+        req_schema_helper_consts: req_schema.helper_consts,
+        req_schema_fields_block: req_schema.fields_block,
+        req_schema_type_name: req_schema.nros_type_name,
+        resp_schema_helper_consts: resp_schema.helper_consts,
+        resp_schema_fields_block: resp_schema.fields_block,
+        resp_schema_type_name: resp_schema.nros_type_name,
     };
     let service_rs = service_template.render()?;
 
@@ -304,6 +327,23 @@ pub fn generate_nros_inline_service(
     let has_request_large_array = request_fields.iter().any(|f| f.is_large_array);
     let has_response_large_array = response_fields.iter().any(|f| f.is_large_array);
 
+    let req_struct = format!("{}Request", service_name);
+    let resp_struct = format!("{}Response", service_name);
+    let req_schema = build_nros_schema_for_struct(
+        package_name,
+        &req_struct,
+        &format!("{}/srv/{}_Request", package_name, service_name),
+        "REQ_",
+        &service.request.fields,
+    );
+    let resp_schema = build_nros_schema_for_struct(
+        package_name,
+        &resp_struct,
+        &format!("{}/srv/{}_Response", package_name, service_name),
+        "RESP_",
+        &service.response.fields,
+    );
+
     let template = ServiceNrosTemplate {
         package_name,
         service_name,
@@ -317,6 +357,12 @@ pub fn generate_nros_inline_service(
         has_request_large_array,
         has_response_large_array,
         inline_mode: true,
+        req_schema_helper_consts: req_schema.helper_consts,
+        req_schema_fields_block: req_schema.fields_block,
+        req_schema_type_name: req_schema.nros_type_name,
+        resp_schema_helper_consts: resp_schema.helper_consts,
+        resp_schema_fields_block: resp_schema.fields_block,
+        resp_schema_type_name: resp_schema.nros_type_name,
     };
 
     Ok(template.render()?)

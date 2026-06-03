@@ -168,6 +168,19 @@ impl RosMessage for {{ service_name }}Request {
     const TYPE_HASH: &'static str = "{{ type_hash }}";
 }
 
+// ── nros_serdes::Message — runtime field schema (Request) ───────────────────
+// Consumed by RMW backends that build wire-type descriptors at runtime
+// (Cyclone DDS dynamic types, …) without per-RMW codegen at compile time.
+
+{{ req_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ service_name }}Request {
+    const TYPE_NAME: &'static str = "{{ req_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ req_schema_fields_block -}}
+    ];
+}
+
 {%- for constant in response_constants %}
 pub const {{ constant.name }}: {{ constant.rust_type }} = {{ constant.value }};
 {%- endfor %}
@@ -323,6 +336,17 @@ impl Deserialize for {{ service_name }}Response {
 impl RosMessage for {{ service_name }}Response {
     const TYPE_NAME: &'static str = "{{ package_name }}::srv::dds_::{{ service_name }}_Response_";
     const TYPE_HASH: &'static str = "{{ type_hash }}";
+}
+
+// ── nros_serdes::Message — runtime field schema (Response) ──────────────────
+
+{{ resp_schema_helper_consts -}}
+
+impl ::nros_serdes::Message for {{ service_name }}Response {
+    const TYPE_NAME: &'static str = "{{ resp_schema_type_name }}";
+    const FIELDS: &'static [::nros_serdes::Field] = &[
+{{ resp_schema_fields_block -}}
+    ];
 }
 
 /// {{ service_name }} service definition

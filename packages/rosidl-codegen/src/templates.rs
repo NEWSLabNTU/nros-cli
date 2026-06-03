@@ -226,6 +226,18 @@ pub struct ServiceNrosTemplate<'a> {
     pub has_response_large_array: bool,
     /// When true, uses nros_core:: prefixed imports instead of direct use statements
     pub inline_mode: bool,
+    // ---- nros_serdes::Message schema (Phase 212.K.7.1.c) ----
+    /// Per-half helper `pub const` blocks (NESTED_*, FT_*_ELEM) hoisted
+    /// into module scope. Prefixed `REQ_…` / `RESP_…` to avoid collision
+    /// on common field names (e.g. both halves owning a `header` field).
+    pub req_schema_helper_consts: String,
+    /// `Field { … },` list rendered for the Request struct.
+    pub req_schema_fields_block: String,
+    /// `<pkg>/srv/<Svc>_Request` per rosidl convention.
+    pub req_schema_type_name: String,
+    pub resp_schema_helper_consts: String,
+    pub resp_schema_fields_block: String,
+    pub resp_schema_type_name: String,
 }
 
 #[derive(Template)]
@@ -270,6 +282,20 @@ pub struct ActionNrosTemplate<'a> {
     pub has_feedback_large_array: bool,
     /// When true, uses nros_core:: prefixed imports instead of direct use statements
     pub inline_mode: bool,
+    // ---- nros_serdes::Message schema (Phase 212.K.7.1.c) ----
+    /// Per-half helper `pub const` blocks (NESTED_*, FT_*_ELEM) hoisted
+    /// into module scope. Prefixed `GOAL_…` / `RESULT_…` / `FEEDBACK_…`
+    /// to avoid collision on shared field names across halves.
+    pub goal_schema_helper_consts: String,
+    pub goal_schema_fields_block: String,
+    /// `<pkg>/action/<Action>_Goal` per rosidl convention.
+    pub goal_schema_type_name: String,
+    pub result_schema_helper_consts: String,
+    pub result_schema_fields_block: String,
+    pub result_schema_type_name: String,
+    pub feedback_schema_helper_consts: String,
+    pub feedback_schema_fields_block: String,
+    pub feedback_schema_type_name: String,
 }
 
 // ============================================================================

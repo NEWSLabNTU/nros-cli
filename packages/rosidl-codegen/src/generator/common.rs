@@ -564,13 +564,42 @@ pub struct NrosMessageSchema {
 }
 
 /// Build the [`NrosMessageSchema`] for a parsed `.msg` body.
+///
+/// Uses the standard message convention: struct identifier matches
+/// `message_name`, and `TYPE_NAME` is `<pkg>/msg/<MessageName>`.
+/// Helper consts are emitted unprefixed (`NESTED_<X>`, `FT_<X>_ELEM`)
+/// since a `.msg` package emits a single Message impl per file.
 pub fn build_nros_message_schema(
     package_name: &str,
     message_name: &str,
     fields: &[rosidl_parser::Field],
 ) -> NrosMessageSchema {
     let nros_type_name = format!("{}/msg/{}", package_name, message_name);
+    build_nros_schema_for_struct(package_name, message_name, &nros_type_name, "", fields)
+}
 
+/// Build the [`NrosMessageSchema`] for a Rust struct whose identifier
+/// differs from its `Message::TYPE_NAME` payload.
+///
+/// Used by the service / action emit paths (K.7.1.c) where the Rust
+/// struct name is e.g. `AddTwoIntsRequest` but the wire type-name
+/// follows rosidl convention (`example_interfaces/srv/AddTwoInts_Request`).
+///
+/// `struct_name` is the Rust ident referenced by `offset_of!` macros.
+/// `nros_type_name` is the ROS-side type name string written into
+/// `Message::TYPE_NAME`.
+/// `const_prefix` namespaces helper consts (`<prefix>NESTED_<X>`,
+/// `<prefix>FT_<X>_ELEM`) so multiple schemas emitted in the same
+/// module (service Request + Response, action Goal/Result/Feedback)
+/// don't collide on shared field names. Pass `""` for the single-schema
+/// `.msg` case.
+pub fn build_nros_schema_for_struct(
+    package_name: &str,
+    struct_name: &str,
+    nros_type_name: &str,
+    const_prefix: &str,
+    fields: &[rosidl_parser::Field],
+) -> NrosMessageSchema {
     let mut helper_consts = String::new();
     let mut fields_block = String::new();
 
@@ -584,6 +613,7 @@ pub fn build_nros_message_schema(
             raw_name,
             &field.field_type,
             package_name,
+            const_prefix,
             &mut helper_consts,
         );
         fields_block.push_str(&format!(
@@ -593,13 +623,13 @@ pub fn build_nros_message_schema(
              offset: ::core::mem::offset_of!({msg}, {access}),\n        }},\n",
             name = raw_name,
             ty_expr = ty_expr,
-            msg = message_name,
+            msg = struct_name,
             access = access_name,
         ));
     }
 
     NrosMessageSchema {
-        nros_type_name,
+        nros_type_name: nros_type_name.to_string(),
         helper_consts,
         fields_block,
     }
@@ -608,10 +638,14 @@ pub fn build_nros_message_schema(
 /// Emit the FieldType expression for a single field. Recursive variants
 /// hoist their inner FieldType / NestedType into a module-scoped
 /// `pub const`, appended to `helper_consts`, and reference it by name.
+///
+/// `const_prefix` namespaces the emitted helper-const idents so multiple
+/// schemas in the same module don't collide on shared field names.
 fn render_field_type_expr(
     field_name: &str,
     field_type: &FieldType,
     package_name: &str,
+    const_prefix: &str,
     helper_consts: &mut String,
 ) -> String {
     match field_type {
@@ -628,7 +662,7 @@ fn render_field_type_expr(
             // Emit a NestedType helper const, sourcing TYPE_NAME + FIELDS
             // from the nested type's own Message impl so we never duplicate
             // the package/type-name string.
-            let nested_const = format!("NESTED_{}", upper_ident(field_name));
+            let nested_const = format!("{}NESTED_{}", const_prefix, upper_ident(field_name));
             let nested_path = nested_type_path(package.as_deref(), name, package_name);
             helper_consts.push_str(&format!(
                 "#[allow(non_upper_case_globals)]\n\
@@ -639,23 +673,25 @@ fn render_field_type_expr(
             format!("::nros_serdes::FieldType::Nested(&{})", nested_const)
         }
         FieldType::Array { element_type, size } => {
-            let elem_const = format!("FT_{}_ELEM", upper_ident(field_name));
+            let elem_const = format!("{}FT_{}_ELEM", const_prefix, upper_ident(field_name));
             emit_element_const(
                 &elem_const,
                 field_name,
                 element_type,
                 package_name,
+                const_prefix,
                 helper_consts,
             );
             format!("::nros_serdes::FieldType::Array({}, &{})", size, elem_const)
         }
         FieldType::Sequence { element_type } => {
-            let elem_const = format!("FT_{}_ELEM", upper_ident(field_name));
+            let elem_const = format!("{}FT_{}_ELEM", const_prefix, upper_ident(field_name));
             emit_element_const(
                 &elem_const,
                 field_name,
                 element_type,
                 package_name,
+                const_prefix,
                 helper_consts,
             );
             format!("::nros_serdes::FieldType::Sequence(&{})", elem_const)
@@ -664,12 +700,13 @@ fn render_field_type_expr(
             element_type,
             max_size,
         } => {
-            let elem_const = format!("FT_{}_ELEM", upper_ident(field_name));
+            let elem_const = format!("{}FT_{}_ELEM", const_prefix, upper_ident(field_name));
             emit_element_const(
                 &elem_const,
                 field_name,
                 element_type,
                 package_name,
+                const_prefix,
                 helper_consts,
             );
             format!(
@@ -687,11 +724,18 @@ fn emit_element_const(
     field_name: &str,
     element_type: &FieldType,
     package_name: &str,
+    const_prefix: &str,
     helper_consts: &mut String,
 ) {
     // The inner expression is rendered with the *parent* field name so any
     // further-nested helpers stay scoped under the same FT_<FIELD>_ prefix.
-    let inner_expr = render_field_type_expr(field_name, element_type, package_name, helper_consts);
+    let inner_expr = render_field_type_expr(
+        field_name,
+        element_type,
+        package_name,
+        const_prefix,
+        helper_consts,
+    );
     helper_consts.push_str(&format!(
         "#[allow(non_upper_case_globals)]\n\
          pub const {ident}: ::nros_serdes::FieldType = {inner};\n",
@@ -937,5 +981,176 @@ mod schema_tests {
         );
         assert!(schema.fields_block.contains("name: \"type\","));
         assert!(schema.fields_block.contains("offset_of!(Sample, type_)"));
+    }
+
+    // ------------------------------------------------------------------
+    // K.7.1.c — service Request/Response + action Goal/Result/Feedback
+    //
+    // These use `build_nros_schema_for_struct` directly to verify the
+    // (struct_name, type_name, const_prefix) generalization.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn service_request_schema_uses_srv_type_name_and_struct_offset() {
+        let schema = build_nros_schema_for_struct(
+            "example_interfaces",
+            "AddTwoIntsRequest",
+            "example_interfaces/srv/AddTwoInts_Request",
+            "REQ_",
+            &[
+                prim_field("a", PrimitiveType::Int64),
+                prim_field("b", PrimitiveType::Int64),
+            ],
+        );
+        // Primitive-only schema needs no helper consts.
+        assert_eq!(schema.helper_consts, "");
+        assert_eq!(
+            schema.nros_type_name,
+            "example_interfaces/srv/AddTwoInts_Request"
+        );
+        // Offset must reference the Rust struct ident (AddTwoIntsRequest),
+        // not the rosidl wire name.
+        assert!(
+            schema
+                .fields_block
+                .contains("offset: ::core::mem::offset_of!(AddTwoIntsRequest, a)")
+        );
+        assert!(
+            schema
+                .fields_block
+                .contains("offset: ::core::mem::offset_of!(AddTwoIntsRequest, b)")
+        );
+        assert!(
+            schema
+                .fields_block
+                .contains("ty: ::nros_serdes::FieldType::Int64,")
+        );
+    }
+
+    #[test]
+    fn service_response_schema_distinct_helper_const_prefix() {
+        // Same field name on both halves with nested types — the
+        // REQ_/RESP_ const prefix is what keeps the module-scope idents
+        // distinct.
+        let req = build_nros_schema_for_struct(
+            "demo",
+            "MoveRequest",
+            "demo/srv/Move_Request",
+            "REQ_",
+            &[nested_field("header", "std_msgs", "Header")],
+        );
+        let resp = build_nros_schema_for_struct(
+            "demo",
+            "MoveResponse",
+            "demo/srv/Move_Response",
+            "RESP_",
+            &[nested_field("header", "std_msgs", "Header")],
+        );
+        assert!(req.helper_consts.contains("pub const REQ_NESTED_HEADER:"));
+        assert!(resp.helper_consts.contains("pub const RESP_NESTED_HEADER:"));
+        // No collision: REQ_ ident never appears in the RESP_ block and vv.
+        assert!(!req.helper_consts.contains("RESP_NESTED_HEADER"));
+        assert!(!resp.helper_consts.contains("REQ_NESTED_HEADER"));
+        assert!(
+            req.fields_block
+                .contains("ty: ::nros_serdes::FieldType::Nested(&REQ_NESTED_HEADER),")
+        );
+        assert!(
+            resp.fields_block
+                .contains("ty: ::nros_serdes::FieldType::Nested(&RESP_NESTED_HEADER),")
+        );
+    }
+
+    #[test]
+    fn action_goal_result_feedback_type_names_follow_rosidl_convention() {
+        let goal = build_nros_schema_for_struct(
+            "example_interfaces",
+            "FibonacciGoal",
+            "example_interfaces/action/Fibonacci_Goal",
+            "GOAL_",
+            &[prim_field("order", PrimitiveType::Int32)],
+        );
+        let result = build_nros_schema_for_struct(
+            "example_interfaces",
+            "FibonacciResult",
+            "example_interfaces/action/Fibonacci_Result",
+            "RESULT_",
+            &[Field {
+                name: "sequence".to_string(),
+                field_type: FieldType::Sequence {
+                    element_type: Box::new(FieldType::Primitive(PrimitiveType::Int32)),
+                },
+                default_value: None,
+            }],
+        );
+        let feedback = build_nros_schema_for_struct(
+            "example_interfaces",
+            "FibonacciFeedback",
+            "example_interfaces/action/Fibonacci_Feedback",
+            "FEEDBACK_",
+            &[Field {
+                name: "sequence".to_string(),
+                field_type: FieldType::Sequence {
+                    element_type: Box::new(FieldType::Primitive(PrimitiveType::Int32)),
+                },
+                default_value: None,
+            }],
+        );
+        assert_eq!(
+            goal.nros_type_name,
+            "example_interfaces/action/Fibonacci_Goal"
+        );
+        assert_eq!(
+            result.nros_type_name,
+            "example_interfaces/action/Fibonacci_Result"
+        );
+        assert_eq!(
+            feedback.nros_type_name,
+            "example_interfaces/action/Fibonacci_Feedback"
+        );
+        // Result and Feedback share field name `sequence` but the
+        // RESULT_/FEEDBACK_ prefix keeps the FT_*_ELEM idents distinct.
+        assert!(
+            result
+                .helper_consts
+                .contains("pub const RESULT_FT_SEQUENCE_ELEM:")
+        );
+        assert!(
+            feedback
+                .helper_consts
+                .contains("pub const FEEDBACK_FT_SEQUENCE_ELEM:")
+        );
+        assert!(!result.helper_consts.contains("FEEDBACK_FT_SEQUENCE_ELEM"));
+        assert!(!feedback.helper_consts.contains("RESULT_FT_SEQUENCE_ELEM"));
+        // Offsets reference the Rust struct ident.
+        assert!(
+            goal.fields_block
+                .contains("offset: ::core::mem::offset_of!(FibonacciGoal, order)")
+        );
+        assert!(
+            result
+                .fields_block
+                .contains("offset: ::core::mem::offset_of!(FibonacciResult, sequence)")
+        );
+        assert!(
+            feedback
+                .fields_block
+                .contains("offset: ::core::mem::offset_of!(FibonacciFeedback, sequence)")
+        );
+    }
+
+    #[test]
+    fn empty_request_schema_emits_no_fields_no_helpers() {
+        // A trigger-style service has an empty request body.
+        let schema = build_nros_schema_for_struct(
+            "std_srvs",
+            "TriggerRequest",
+            "std_srvs/srv/Trigger_Request",
+            "REQ_",
+            &[],
+        );
+        assert_eq!(schema.helper_consts, "");
+        assert_eq!(schema.fields_block, "");
+        assert_eq!(schema.nros_type_name, "std_srvs/srv/Trigger_Request");
     }
 }
