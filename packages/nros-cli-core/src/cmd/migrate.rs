@@ -1029,4 +1029,101 @@ mod tests {
             "diagnostic should reference nros.toml: {err}"
         );
     }
+
+    /// Phase 212.N.12 (Component → Node rename, 2026-06-03) — `migrate.rs`
+    /// emits the new `node` / `nodes` spelling at the Cargo.toml layer.
+    /// This unit-level check guards the `render_nros_metadata_table` writer
+    /// against a future drift back to `component(s)`. We host the rendered
+    /// table inside a parent `[package.metadata.nros]` `Item::Table` so the
+    /// rendered keys produce inline `[…node]` / `[…nodes.<Name>]` headers
+    /// rather than empty implicit tables.
+    #[test]
+    fn render_nros_metadata_table_emits_node_spelling() {
+        use toml_edit::DocumentMut;
+        fn legacy_with_override(
+            pkg: &str,
+            comp: &str,
+            ns: &str,
+        ) -> PreComponent {
+            PreComponent {
+                src: PathBuf::from("ignored"),
+                cfg: LegacyComponentConfig {
+                    package: pkg.into(),
+                    component: comp.into(),
+                    linkage: None,
+                    overrides: Some(LegacyOverrides {
+                        default_namespace: Some(ns.into()),
+                        ..Default::default()
+                    }),
+                },
+            }
+        }
+
+        // Single-component → `[…nros.node]`.
+        let mut doc: DocumentMut = "[package]\nname = \"x\"\n".parse().unwrap();
+        doc["package"]
+            .as_table_mut()
+            .unwrap()
+            .entry("metadata")
+            .or_insert_with(|| Item::Table(Table::new()));
+        doc["package"]["metadata"]["nros"] =
+            Item::Table(render_nros_metadata_table(&[legacy_with_override(
+                "demo_pkg", "talker", "/demo",
+            )]));
+        let rendered = doc.to_string();
+        assert!(
+            rendered.contains("[package.metadata.nros.node]"),
+            "single-component render must produce `[package.metadata.nros.node]`, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[package.metadata.nros.component]"),
+            "single-component render must NOT emit `[package.metadata.nros.component]`, got:\n{rendered}"
+        );
+
+        // Multi-component → `[…nros.nodes.<Name>]`.
+        let mut doc: DocumentMut = "[package]\nname = \"x\"\n".parse().unwrap();
+        doc["package"]
+            .as_table_mut()
+            .unwrap()
+            .entry("metadata")
+            .or_insert_with(|| Item::Table(Table::new()));
+        doc["package"]["metadata"]["nros"] =
+            Item::Table(render_nros_metadata_table(&[
+                legacy_with_override("demo_container", "Talker", "/talker"),
+                legacy_with_override("demo_container", "Listener", "/listener"),
+            ]));
+        let rendered = doc.to_string();
+        assert!(
+            rendered.contains("[package.metadata.nros.nodes.Talker]"),
+            "multi-component render must produce `[…nros.nodes.<Name>]`, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[package.metadata.nros.components."),
+            "multi-component render must NOT emit `[…nros.components.<Name>]`, got:\n{rendered}"
+        );
+    }
+
+    /// Phase 212.N.12 — `LegacyComponentConfig` parses both the pre-rename
+    /// `component = "..."` field name and the post-rename `node = "..."`
+    /// alias, so a partially hand-edited pre-212 `component_nros.toml` still
+    /// migrates cleanly.
+    #[test]
+    fn legacy_component_config_accepts_node_alias() {
+        let legacy_spelling = r#"
+package = "demo_pkg"
+component = "talker"
+"#;
+        let new_spelling = r#"
+package = "demo_pkg"
+node = "talker"
+"#;
+        let parsed_old: LegacyComponentConfig =
+            toml::from_str(legacy_spelling).expect("parse component-spelled input");
+        let parsed_new: LegacyComponentConfig =
+            toml::from_str(new_spelling).expect("parse node-spelled input");
+        assert_eq!(parsed_old.package, "demo_pkg");
+        assert_eq!(parsed_old.component, "talker");
+        assert_eq!(parsed_new.package, "demo_pkg");
+        assert_eq!(parsed_new.component, "talker");
+    }
 }
