@@ -245,6 +245,13 @@ struct WsPkg {
     is_rust_pkg: bool,
     /// Pkg names declared in `<*depend>` tags (filtered for ROS-meta).
     deps: Vec<String>,
+    /// Phase 212.M-F.21 — `false` for path-dep targets imported into
+    /// `scan` purely so their `<*depend>` rows can be unioned into the
+    /// consumer's dep set. These pkgs are NOT cargo-build entry points
+    /// and must not become `[patch.crates-io]` authorities. `true` for
+    /// the originally-requested single-pkg dir or every workspace-mode
+    /// scan hit.
+    is_patch_consumer: bool,
 }
 
 fn run_sync(args: SyncArgs) -> Result<()> {
@@ -361,7 +368,7 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     // Also generate AMENT deps for every Rust consumer (pkg.xml deps).
     let rust_consumers: Vec<&WsPkg> = scan
         .iter()
-        .filter(|p| p.is_rust_pkg && !p.is_msg_pkg)
+        .filter(|p| p.is_rust_pkg && !p.is_msg_pkg && p.is_patch_consumer)
         .collect();
     for c in &rust_consumers {
         codegen_ament_deps_for(
@@ -528,6 +535,14 @@ fn has_pkg_subdir(dir: &Path) -> bool {
 }
 
 fn scan_one_pkg_dir(pkg_dir: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
+    scan_one_pkg_dir_inner(pkg_dir, out, true)
+}
+
+fn scan_one_pkg_dir_inner(
+    pkg_dir: &Path,
+    out: &mut Vec<WsPkg>,
+    is_patch_consumer: bool,
+) -> Result<()> {
     let manifest = pkg_dir.join("package.xml");
     let body = std::fs::read_to_string(&manifest)?;
     let Some(name) = extract_pkg_name(&body) else {
@@ -548,14 +563,17 @@ fn scan_one_pkg_dir(pkg_dir: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
     // `augment_rust_consumer_deps_via_path_deps` can union their msg
     // `<*depend>` rows. Without this, single-pkg mode's `scan` only
     // contains the Entry pkg itself + the transitive walk has no msg
-    // pkgs to discover.
+    // pkgs to discover. Imports are flagged `is_patch_consumer=false` —
+    // cargo only respects `[patch.crates-io]` from the pkg it invokes,
+    // so writing patches into a path-dep target is dead weight (and the
+    // wrong-direction relative paths corrupt the target's manifest).
     if is_rust_pkg && let Ok(cargo_body) = std::fs::read_to_string(pkg_dir.join("Cargo.toml")) {
         for path in extract_cargo_path_deps(&cargo_body) {
             let target = pkg_dir.join(&path);
             if target.join("package.xml").is_file()
                 && std::fs::canonicalize(&target).ok() != std::fs::canonicalize(pkg_dir).ok()
             {
-                scan_one_pkg_dir(&target, out)?;
+                scan_one_pkg_dir_inner(&target, out, false)?;
             }
         }
     }
@@ -566,6 +584,7 @@ fn scan_one_pkg_dir(pkg_dir: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
         is_msg_pkg,
         is_rust_pkg,
         deps,
+        is_patch_consumer,
     });
     Ok(())
 }
@@ -598,6 +617,7 @@ fn scan_workspace(src_root: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
             is_msg_pkg,
             is_rust_pkg,
             deps,
+            is_patch_consumer: true,
         });
     }
     Ok(())
