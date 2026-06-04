@@ -6,6 +6,7 @@
 
 pub mod ament;
 pub mod board_descriptor;
+pub mod board_metadata;
 pub mod build;
 pub mod cargo_metadata_schema;
 pub mod config;
