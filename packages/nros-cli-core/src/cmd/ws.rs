@@ -292,6 +292,15 @@ fn run_sync(args: SyncArgs) -> Result<()> {
         println!("ws sync: no pkgs under {}", src_root.display());
         return Ok(());
     }
+    // Phase 212.M-F.21 — Rust consumer's transitive msg deps via path-deps.
+    // The pkg.xml `<*depend>` tags drive AMENT codegen + patch table,
+    // but Entry pkgs typically don't list msg deps directly — they
+    // inherit them through a path-dep on a Component pkg. Walk each
+    // Rust consumer's `Cargo.toml [dependencies]`, resolve path-deps
+    // against the scan, and union the dependent pkg's `deps` in. The
+    // patch authority for the Entry pkg then carries every msg patch
+    // the transitive build needs.
+    augment_rust_consumer_deps_via_path_deps(&mut scan)?;
     let msg_pkgs: Vec<&WsPkg> = scan.iter().filter(|p| p.is_msg_pkg).collect();
     let topo = topo_sort_msg_pkgs(&msg_pkgs)?;
 
@@ -387,7 +396,8 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     }
     let nano_ros_path = args
         .nano_ros_path
-        .or_else(|| std::env::var_os("NROS_REPO_DIR").map(PathBuf::from));
+        .or_else(|| std::env::var_os("NROS_REPO_DIR").map(PathBuf::from))
+        .or_else(|| autodetect_nano_ros_path(&ws_root));
     for (authority, pkgs) in authority_to_pkgs {
         let mut unique = pkgs;
         unique.sort();
@@ -532,6 +542,23 @@ fn scan_one_pkg_dir(pkg_dir: &Path, out: &mut Vec<WsPkg>) -> Result<()> {
         || pkg_dir.join("action").is_dir();
     let is_rust_pkg = pkg_dir.join("Cargo.toml").is_file();
     let deps = extract_pkg_deps(&body);
+    // Phase 212.M-F.21 — when single-pkg mode lands on an Entry pkg
+    // (or any Rust consumer that path-deps on a sibling Component pkg),
+    // walk those path-deps + add the targets as siblings in `out` so
+    // `augment_rust_consumer_deps_via_path_deps` can union their msg
+    // `<*depend>` rows. Without this, single-pkg mode's `scan` only
+    // contains the Entry pkg itself + the transitive walk has no msg
+    // pkgs to discover.
+    if is_rust_pkg && let Ok(cargo_body) = std::fs::read_to_string(pkg_dir.join("Cargo.toml")) {
+        for path in extract_cargo_path_deps(&cargo_body) {
+            let target = pkg_dir.join(&path);
+            if target.join("package.xml").is_file()
+                && std::fs::canonicalize(&target).ok() != std::fs::canonicalize(pkg_dir).ok()
+            {
+                scan_one_pkg_dir(&target, out)?;
+            }
+        }
+    }
     out.push(WsPkg {
         name,
         dir: pkg_dir.to_path_buf(),
@@ -580,6 +607,127 @@ fn extract_pkg_name(body: &str) -> Option<String> {
     let start = body.find("<name>")? + "<name>".len();
     let end = body[start..].find("</name>")? + start;
     Some(body[start..end].trim().to_string())
+}
+
+/// Phase 212.M-F.21 — walk each Rust consumer's `Cargo.toml [dependencies]`
+/// + sibling `[dev-dependencies]` / `[build-dependencies]` tables for
+/// `path = "..."` entries that resolve (by directory) to another `WsPkg`
+/// in `scan`. For each such hit, union the target pkg's `deps` into the
+/// consumer's `deps`. Idempotent — re-running deduplicates.
+///
+/// Concretely unblocks the Entry-pkg → Component-pkg path: the Entry
+/// pkg's `package.xml` typically has no `<depend>` rows but its
+/// `Cargo.toml` carries `freertos_rs_talker = { path = "../talker" }`.
+/// The Component pkg's `package.xml` lists `<depend>std_msgs</depend>`
+/// etc. — those msg deps need to land in the Entry pkg's patch table
+/// (the patch authority cargo invokes).
+fn augment_rust_consumer_deps_via_path_deps(scan: &mut Vec<WsPkg>) -> Result<()> {
+    // Index by canonical directory so we can resolve path-dep targets.
+    let dir_to_pkg: std::collections::HashMap<PathBuf, usize> = scan
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| std::fs::canonicalize(&p.dir).ok().map(|d| (d, i)))
+        .collect();
+
+    // Snapshot pre-augmentation deps so transitivity is single-hop per pass.
+    // (Multi-hop chains converge after a small fixed number of passes; we
+    // keep it deterministic + bounded.)
+    for _ in 0..4 {
+        let snapshot: Vec<Vec<String>> = scan.iter().map(|p| p.deps.clone()).collect();
+        let mut changed = false;
+        for i in 0..scan.len() {
+            if !scan[i].is_rust_pkg {
+                continue;
+            }
+            let cargo_toml = scan[i].dir.join("Cargo.toml");
+            let Ok(body) = std::fs::read_to_string(&cargo_toml) else {
+                continue;
+            };
+            for path in extract_cargo_path_deps(&body) {
+                let target = scan[i].dir.join(&path);
+                let Ok(canon) = std::fs::canonicalize(&target) else {
+                    continue;
+                };
+                let Some(&j) = dir_to_pkg.get(&canon) else {
+                    continue;
+                };
+                if i == j {
+                    continue;
+                }
+                let target_deps = &snapshot[j];
+                for d in target_deps {
+                    if !scan[i].deps.contains(d) {
+                        scan[i].deps.push(d.clone());
+                        changed = true;
+                    }
+                }
+            }
+            scan[i].deps.sort();
+            scan[i].deps.dedup();
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Extract `path = "<rel>"` values from `[dependencies]` /
+/// `[dev-dependencies]` / `[build-dependencies]` tables. Loose TOML
+/// scanner — handles single-line `pkg = { path = "..." }` form which
+/// is the convention across nano-ros fixtures. Multi-line tables are
+/// rare in fixture Cargo.tomls and skipped silently.
+fn extract_cargo_path_deps(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_deps = matches!(
+                trimmed,
+                "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+            );
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        // Match `<name> = { path = "<rel>", ... }` form.
+        let Some(eq) = trimmed.find('=') else {
+            continue;
+        };
+        let rhs = trimmed[eq + 1..].trim_start();
+        if !rhs.starts_with('{') {
+            continue;
+        }
+        if let Some(p) = rhs.find("path") {
+            let after = &rhs[p + 4..];
+            let after = after.trim_start().trim_start_matches('=').trim_start();
+            if let Some(rest) = after.strip_prefix('"')
+                && let Some(end) = rest.find('"')
+            {
+                out.push(rest[..end].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Phase 212.M-F.21 — walk up from `ws_root` looking for a nano-ros
+/// source tree (marker: `packages/core/nros-core/Cargo.toml`). Used as
+/// a fallback when neither `--nros-repo` nor `NROS_REPO_DIR` is set.
+/// In-tree fixtures + examples sit several levels below the nano-ros
+/// root, so this turns the most common "I forgot to set NROS_REPO_DIR"
+/// case into a no-op — patches still flow.
+fn autodetect_nano_ros_path(ws_root: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(ws_root);
+    while let Some(p) = cur {
+        if p.join("packages/core/nros-core/Cargo.toml").is_file() {
+            return Some(p.to_path_buf());
+        }
+        cur = p.parent();
+    }
+    None
 }
 
 fn extract_pkg_deps(body: &str) -> Vec<String> {
