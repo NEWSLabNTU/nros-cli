@@ -135,8 +135,9 @@ const FIELD_MAP: &[(&str, &str)] = &[
 /// delimited lists are preserved verbatim; downstream consumers can
 /// `.split(';')` as needed.
 pub fn parse_board_cmake(source: &str) -> BTreeMap<String, String> {
+    let normalised = join_multiline_set_calls(source);
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for raw_line in source.lines() {
+    for raw_line in normalised.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -167,6 +168,57 @@ pub fn parse_board_cmake(source: &str) -> BTreeMap<String, String> {
         if let Some(v) = value {
             out.insert(var, v);
         }
+    }
+    out
+}
+
+/// Collapse multi-line `set(NAME\n  "value"\n)` calls onto a single
+/// line so the per-line parser sees the full call. Tracks paren depth
+/// only outside double-quoted strings; comments (`#…\n`) are stripped
+/// before counting since CMake treats `#` as a line comment.
+fn join_multiline_set_calls(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_string && c == '#' {
+            // Strip to end of line.
+            while let Some(&n) = chars.peek() {
+                if n == '\n' {
+                    break;
+                }
+                chars.next();
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            out.push(c);
+            continue;
+        }
+        if !in_string {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth = depth.saturating_sub(1);
+            }
+            if c == '\n' && depth > 0 {
+                // Inside an open `set(...)` call — collapse the newline
+                // (and any leading whitespace on the next line) to a
+                // single space so the per-line parser sees one statement.
+                out.push(' ');
+                while let Some(&n) = chars.peek() {
+                    if n == ' ' || n == '\t' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
     }
     out
 }
@@ -478,6 +530,39 @@ set(NROS_BOARD_BOARD_OVERLAY "${CMAKE_CURRENT_LIST_DIR}/boards/x.overlay")
         assert_eq!(
             m.get("NROS_BOARD_RUNNER").map(String::as_str),
             Some("armfvp")
+        );
+    }
+
+    #[test]
+    fn parses_board_cmake_multiline_set() {
+        // The real FVP board.cmake at Phase 215.A.2 uses the multi-line
+        // `set(NAME\n    "value")` form. The parser must collapse
+        // multi-line calls onto a single statement before tokenising.
+        // Regression test for Phase 215.A/C verification.
+        let src = r#"
+# multiline form (as in nros-board-fvp-aemv8r-smp/board.cmake)
+set(NROS_BOARD_ZEPHYR_ID
+    "fvp_baser_aemv8r/fvp_aemv8r_aarch64/smp")
+set(NROS_BOARD_TOOLCHAIN
+    "aarch64-zephyr-elf")
+set(NROS_BOARD_PRJ_CONF
+    "${CMAKE_CURRENT_LIST_DIR}/prj.conf")
+"#;
+        let m = parse_board_cmake(src);
+        assert_eq!(
+            m.get("NROS_BOARD_ZEPHYR_ID").map(String::as_str),
+            Some("fvp_baser_aemv8r/fvp_aemv8r_aarch64/smp"),
+            "multi-line ZEPHYR_ID must round-trip",
+        );
+        assert_eq!(
+            m.get("NROS_BOARD_TOOLCHAIN").map(String::as_str),
+            Some("aarch64-zephyr-elf"),
+        );
+        assert!(
+            m.get("NROS_BOARD_PRJ_CONF")
+                .map(|s| s.contains("prj.conf"))
+                .unwrap_or(false),
+            "multi-line PRJ_CONF must round-trip",
         );
     }
 
