@@ -14,7 +14,10 @@
 //! `deny_unknown_fields` so typos surface at parse time instead of being
 //! silently dropped.
 
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +98,192 @@ pub fn parse_board_metadata(cargo_toml: &Path) -> Result<BoardMetadata, eyre::Re
         )
     })?;
     Ok(board)
+}
+
+// ---------------------------------------------------------------------------
+// `board.cmake` sidecar parser + drift compare
+// ---------------------------------------------------------------------------
+
+/// One drift mismatch surfaced by [`compute_drift`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftEntry {
+    /// Cargo-side field name (e.g. `"runner"`).
+    pub field: &'static str,
+    /// Value in `[package.metadata.nros.board]`.
+    pub cargo_metadata: String,
+    /// Value parsed out of `board.cmake`.
+    pub board_cmake: String,
+}
+
+/// Map a `BoardMetadata` field → the `board.cmake` variable name it
+/// mirrors (Phase 215.A.1).
+const FIELD_MAP: &[(&str, &str)] = &[
+    ("zephyr_board", "NROS_BOARD_ZEPHYR_ID"),
+    ("toolchain", "NROS_BOARD_TOOLCHAIN"),
+    ("default_rmw", "NROS_BOARD_DEFAULT_RMW"),
+    ("default_transport", "NROS_BOARD_DEFAULT_TRANSPORT"),
+    ("runner", "NROS_BOARD_RUNNER"),
+    ("prj_conf", "NROS_BOARD_PRJ_CONF"),
+    ("board_conf", "NROS_BOARD_BOARD_CONF"),
+    ("board_overlay", "NROS_BOARD_BOARD_OVERLAY"),
+];
+
+/// Tokenise `board.cmake` and return a `name → value` map for every
+/// `set(NROS_BOARD_<KEY> <value> …)` call. Values are returned with
+/// surrounding quotes stripped. Cache annotations (`CACHE STRING "doc"`)
+/// are tolerated — only the variable's value is captured. Semicolon-
+/// delimited lists are preserved verbatim; downstream consumers can
+/// `.split(';')` as needed.
+pub fn parse_board_cmake(source: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for raw_line in source.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if !lower.starts_with("set(") {
+            continue;
+        }
+        let after_set = &line["set(".len()..];
+        let body = after_set.trim_end_matches(')').trim();
+
+        let mut tokens = tokenise_cmake_args(body);
+        let var = tokens.next().unwrap_or_default();
+        if !var.starts_with("NROS_BOARD_") {
+            continue;
+        }
+        let mut value: Option<String> = None;
+        for tok in tokens.by_ref() {
+            let upper = tok.to_ascii_uppercase();
+            if matches!(upper.as_str(), "CACHE" | "FORCE" | "PARENT_SCOPE") {
+                continue;
+            }
+            if value.is_some() {
+                break;
+            }
+            value = Some(tok);
+        }
+        if let Some(v) = value {
+            out.insert(var, v);
+        }
+    }
+    out
+}
+
+/// Minimal CMake `set()` argument tokeniser. Handles bare words and
+/// double-quoted strings; CMake bracket syntax `[[…]]` is NOT supported
+/// (the board.cmake schema doesn't use it).
+fn tokenise_cmake_args(s: &str) -> impl Iterator<Item = String> + '_ {
+    let mut iter = s.chars().peekable();
+    std::iter::from_fn(move || {
+        while let Some(&c) = iter.peek() {
+            if c.is_whitespace() {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let first = iter.next()?;
+        let mut tok = String::new();
+        if first == '"' {
+            while let Some(c) = iter.next() {
+                if c == '\\' {
+                    if let Some(esc) = iter.next() {
+                        tok.push(esc);
+                    }
+                } else if c == '"' {
+                    return Some(tok);
+                } else {
+                    tok.push(c);
+                }
+            }
+            Some(tok)
+        } else {
+            tok.push(first);
+            while let Some(&c) = iter.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                tok.push(c);
+                iter.next();
+            }
+            Some(tok)
+        }
+    })
+}
+
+/// Compare the typed Cargo.toml view to the parsed board.cmake map.
+///
+/// Path-shaped fields (`prj_conf` / `board_conf` / `board_overlay`)
+/// compare by basename — the Cargo.toml face stores them relative to
+/// `Cargo.toml`, while the cmake face stores absolute paths post-
+/// `${CMAKE_CURRENT_LIST_DIR}` resolution. Basename comparison keeps
+/// the audit meaningful without canonicalising both surfaces.
+///
+/// A board.cmake variable that is not authored is treated as
+/// "no opinion" — not drift.
+pub fn compute_drift(
+    cargo: &BoardMetadata,
+    cmake: &BTreeMap<String, String>,
+) -> Vec<DriftEntry> {
+    let mut out = Vec::new();
+    for &(field, cmake_var) in FIELD_MAP {
+        let cargo_val = cargo_field(cargo, field);
+        let Some(cmake_val) = cmake.get(cmake_var) else {
+            continue;
+        };
+        let (lhs, rhs) = match field {
+            "prj_conf" | "board_conf" | "board_overlay" => (
+                basename(&cargo_val).to_string(),
+                basename(cmake_val).to_string(),
+            ),
+            _ => (cargo_val.clone(), cmake_val.clone()),
+        };
+        if lhs != rhs {
+            out.push(DriftEntry {
+                field,
+                cargo_metadata: cargo_val,
+                board_cmake: cmake_val.clone(),
+            });
+        }
+    }
+    if let Some(cmake_gated) = cmake.get("NROS_BOARD_GATED_PKGS") {
+        let mut cargo_gated = cargo.gated.clone();
+        cargo_gated.sort();
+        let mut cmake_gated_v: Vec<String> = cmake_gated
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        cmake_gated_v.sort();
+        if cargo_gated != cmake_gated_v {
+            out.push(DriftEntry {
+                field: "gated",
+                cargo_metadata: cargo.gated.join(";"),
+                board_cmake: cmake_gated.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn cargo_field(m: &BoardMetadata, field: &str) -> String {
+    match field {
+        "zephyr_board" => m.zephyr_board.clone(),
+        "toolchain" => m.toolchain.clone(),
+        "default_rmw" => m.default_rmw.clone(),
+        "default_transport" => m.default_transport.clone(),
+        "runner" => m.runner.clone(),
+        "prj_conf" => m.prj_conf.clone(),
+        "board_conf" => m.board_conf.clone(),
+        "board_overlay" => m.board_overlay.clone(),
+        other => panic!("cargo_field: unknown field {other}"),
+    }
+}
+
+fn basename(p: &str) -> &str {
+    p.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(p)
 }
 
 #[cfg(test)]
@@ -250,5 +439,106 @@ version = "0.1.0"
             msg.contains("package.metadata.nros.board"),
             "diagnostic should mention the table path: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // board.cmake parser + drift tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parses_board_cmake_basic() {
+        let src = r#"
+# Phase 215.A.2 — FVP board manifest
+set(NROS_BOARD_ZEPHYR_ID "fvp_baser_aemv8r/fvp_aemv8r_aarch64/smp")
+set(NROS_BOARD_TOOLCHAIN "aarch64-zephyr-elf")
+set(NROS_BOARD_GATED_PKGS "arm-fvp")
+set(NROS_BOARD_DEFAULT_RMW "cyclonedds")
+set(NROS_BOARD_DEFAULT_TRANSPORT "ethernet")
+set(NROS_BOARD_RUNNER "armfvp")
+set(NROS_BOARD_PRJ_CONF "${CMAKE_CURRENT_LIST_DIR}/prj.conf")
+set(NROS_BOARD_BOARD_CONF "${CMAKE_CURRENT_LIST_DIR}/boards/x.conf")
+set(NROS_BOARD_BOARD_OVERLAY "${CMAKE_CURRENT_LIST_DIR}/boards/x.overlay")
+"#;
+        let m = parse_board_cmake(src);
+        assert_eq!(
+            m.get("NROS_BOARD_ZEPHYR_ID").map(String::as_str),
+            Some("fvp_baser_aemv8r/fvp_aemv8r_aarch64/smp")
+        );
+        assert_eq!(
+            m.get("NROS_BOARD_RUNNER").map(String::as_str),
+            Some("armfvp")
+        );
+        assert!(m.contains_key("NROS_BOARD_GATED_PKGS"));
+    }
+
+    #[test]
+    fn parses_board_cmake_cache_variant() {
+        let src = r#"set(NROS_BOARD_RUNNER "armfvp" CACHE STRING "runner")"#;
+        let m = parse_board_cmake(src);
+        assert_eq!(
+            m.get("NROS_BOARD_RUNNER").map(String::as_str),
+            Some("armfvp")
+        );
+    }
+
+    #[test]
+    fn drift_compute_agreement() {
+        let cargo = BoardMetadata {
+            zephyr_board: "fvp_baser_aemv8r/fvp_aemv8r_aarch64/smp".into(),
+            toolchain: "aarch64-zephyr-elf".into(),
+            gated: vec!["arm-fvp".into()],
+            default_rmw: "cyclonedds".into(),
+            default_transport: "ethernet".into(),
+            runner: "armfvp".into(),
+            prj_conf: "prj.conf".into(),
+            board_conf: "boards/x.conf".into(),
+            board_overlay: "boards/x.overlay".into(),
+        };
+        let mut cmake: BTreeMap<String, String> = BTreeMap::new();
+        cmake.insert(
+            "NROS_BOARD_ZEPHYR_ID".into(),
+            "fvp_baser_aemv8r/fvp_aemv8r_aarch64/smp".into(),
+        );
+        cmake.insert("NROS_BOARD_TOOLCHAIN".into(), "aarch64-zephyr-elf".into());
+        cmake.insert("NROS_BOARD_GATED_PKGS".into(), "arm-fvp".into());
+        cmake.insert("NROS_BOARD_DEFAULT_RMW".into(), "cyclonedds".into());
+        cmake.insert("NROS_BOARD_DEFAULT_TRANSPORT".into(), "ethernet".into());
+        cmake.insert("NROS_BOARD_RUNNER".into(), "armfvp".into());
+        cmake.insert(
+            "NROS_BOARD_PRJ_CONF".into(),
+            "/abs/path/to/prj.conf".into(),
+        );
+        cmake.insert(
+            "NROS_BOARD_BOARD_CONF".into(),
+            "/abs/path/to/x.conf".into(),
+        );
+        cmake.insert(
+            "NROS_BOARD_BOARD_OVERLAY".into(),
+            "/abs/path/to/x.overlay".into(),
+        );
+        let drift = compute_drift(&cargo, &cmake);
+        assert!(drift.is_empty(), "no drift expected: {drift:?}");
+    }
+
+    #[test]
+    fn drift_compute_runner_mismatch() {
+        let cargo = BoardMetadata {
+            zephyr_board: "x".into(),
+            toolchain: "y".into(),
+            gated: vec![],
+            default_rmw: "zenoh".into(),
+            default_transport: "ethernet".into(),
+            runner: "qemu".into(),
+            prj_conf: "prj.conf".into(),
+            board_conf: "x.conf".into(),
+            board_overlay: "x.overlay".into(),
+        };
+        let mut cmake: BTreeMap<String, String> = BTreeMap::new();
+        cmake.insert("NROS_BOARD_RUNNER".into(), "armfvp".into());
+        let drift = compute_drift(&cargo, &cmake);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].field, "runner");
+        assert_eq!(drift[0].cargo_metadata, "qemu");
+        assert_eq!(drift[0].board_cmake, "armfvp");
     }
 }
