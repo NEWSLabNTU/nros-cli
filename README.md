@@ -1,87 +1,90 @@
-# nros-cli
+# nros-cli — moved into the nano-ros monorepo (Phase 218)
 
-**`nros` — the command-line tool for [nano-ros](https://github.com/NEWSLabNTU/nano-ros), a lightweight ROS 2 client for embedded RTOS.**
+**This repository is now read-only.** As of 2026-06-04 (Phase 218 of
+the nano-ros project), the `nros` CLI ships from inside the
+[NEWSLabNTU/nano-ros](https://github.com/NEWSLabNTU/nano-ros) monorepo
+as the sub-workspace at
+[`packages/cli/`](https://github.com/NEWSLabNTU/nano-ros/tree/main/packages/cli).
+The two-repo split (which began with Phase 195.D) is closed because
+the CLI codegen format and the runtime ABI must move together — the
+`NROS_VERSION=0.3.7` pins that proliferated across the nano-ros
+workflows were the visible scar of that split.
 
-`nros` scaffolds projects, generates message bindings, provisions SDK toolchains,
-and builds/deploys/monitors nano-ros applications on embedded targets (Zephyr,
-FreeRTOS, NuttX, ThreadX, bare-metal, …). This repo builds the `nros` binary;
-nano-ros itself lives at [NEWSLabNTU/nano-ros](https://github.com/NEWSLabNTU/nano-ros).
+The repository is preserved here for history (the original codegen
+carve-out, the `nros ws sync` design discussions, the `nros plan`
+launch-resolver lineage, and the 0.3.x release tag set). Issue / PR
+history stays browseable.
 
-> `nros` is a **generic tool**: it knows no nano-ros directory layout. All
-> workspace/toolchain knowledge lives in nano-ros's committed
-> `nros-sdk-index.toml` (board → package sets, toolchain URLs, source
-> git/ref/dest). `nros` just executes that data — fixes are index edits, not new
-> binaries.
+## Get the CLI today
 
-## Install
-
-**Prebuilt binary (recommended — no Rust toolchain needed):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/NEWSLabNTU/nros-cli/main/install.sh | sh
-# installs to ~/.nros/bin (override NROS_HOME); add it to PATH if prompted
+```sh
+git clone https://github.com/NEWSLabNTU/nano-ros.git
+cd nano-ros
+source ./activate.sh    # or: direnv allow / source ./activate.fish
+just setup-cli          # builds packages/cli/target/release/nros
 ```
 
-The prebuilt `nros` is a portable, libc-only binary (Linux glibc ≥ 2.35, macOS).
-`NROS_VERSION` selects a version.
+After `just setup-cli`, the `nros` binary lands at
+`packages/cli/target/release/nros` and `activate.sh` puts it on PATH
+ahead of the legacy `~/.nros/bin/nros` location. Verify with:
 
-**From source (Rust):**
-
-```bash
-git clone --recursive https://github.com/NEWSLabNTU/nros-cli
-cargo install --path nros-cli/packages/nros-cli   # builds the `nros` binary
+```sh
+nros --version
+# expected output: nros 0.4.0   (Phase 218 monorepo-merge baseline)
 ```
 
-## Setup — one command for toolchains + sources
+### From a tagged release (no Rust toolchain)
 
-`nros setup <board>` provisions everything that board needs, **board-scoped**,
-from nano-ros's SDK index: prebuilt host toolchains (cross-GCC, QEMU, the RMW
-daemon) **and** the target source it builds against (RTOS kernels, lwip, …),
-checked out from the index's pinned git/ref into its declared destination. Run it
-from a nano-ros checkout (it reads `./nros-sdk-index.toml`):
-
-```bash
-nros setup qemu-arm-freertos      # arm-none-eabi-gcc + qemu + FreeRTOS-Kernel + lwip
-nros setup native --rmw cyclonedds
-nros setup --list                 # every package + version
-nros setup --licenses             # license-gated SDKs (NVIDIA SPE, ARM FVP)
+```sh
+# inside a nano-ros checkout at a `nros-v<X.Y.Z>` tag:
+./scripts/install-nros-prebuilt.sh
 ```
 
-Prebuilt where available, source-built fallback otherwise — same install layout
-either way. This unifies what used to be scattered across `just <module> setup`
-recipes.
+Fetches `nros-<triple>.tar.gz` from the matching GitHub release,
+sha256-verifies, installs at `packages/cli/target/release/nros`.
 
-## Build / deploy
+## What changed?
 
-**As a user** — import nano-ros into your project and build/flash:
+- **Source tree:** every former `packages/<crate>/` under this repo is
+  now at `packages/cli/<crate>/` in nano-ros. The lift used
+  `git filter-repo --to-subdirectory-filter packages/cli/` and is
+  squash-merged onto nano-ros `main`.
+- **Versioning:** the CLI and the runtime now share a single bundle
+  version (JetPack-style). See
+  [`docs/development/versioning.md`](https://github.com/NEWSLabNTU/nano-ros/blob/main/docs/development/versioning.md).
+- **ABI guard:** `nros generate-rust` / `nros codegen` now read the
+  consumer's `Cargo.lock`, compare the resolved `nros-core` version
+  to the CLI binary's compile-time version, and reject mismatches.
+  `NROS_SKIP_VERSION_CHECK=1` opts out.
+- **Distribution:** no crate publishes to crates.io. Tagged releases
+  ship the CLI binaries (four target triples: linux+macos × x86_64+
+  aarch64) as GitHub release assets; runtime crates are consumed via
+  path-deps / `[patch.crates-io]` redirects (the `nros ws sync` verb
+  writes those).
 
-```bash
-nros new talker --platform zephyr   # scaffold from a template
-nros build                          # auto-detects cargo / cmake / west
-nros deploy <target>                # build + flash + (optionally) monitor
-nros doctor                         # check SDK paths / toolchains / env
-```
+## File issues / PRs against nano-ros
 
-**As a contributor** — build and test inside the nano-ros checkout (`just ci`,
-`just <plat> test`); `nros` drives codegen + orchestration there.
+All future CLI work happens in
+[NEWSLabNTU/nano-ros](https://github.com/NEWSLabNTU/nano-ros). The
+CLI sub-workspace lives at
+[`packages/cli/`](https://github.com/NEWSLabNTU/nano-ros/tree/main/packages/cli).
+When filing issues there, the `cli` label scopes them to the
+sub-workspace.
 
-## Commands
+## Historical references
 
-| | |
-|---|---|
-| `nros new` | scaffold a project (talker / listener / service / action) |
-| `nros generate` / `generate-rust` | message bindings from `package.xml` |
-| `nros codegen` | build-tool C/C++ binding generation (cmake/build.rs interface) |
-| `nros setup` | provision a board's toolchains + sources (above) |
-| `nros build` / `deploy` / `run` / `monitor` | build, flash, run, attach |
-| `nros doctor` / `board` | health-check; inspect supported boards |
-| `nros plan` / `check` / `explain` | launch-file → plan resolution¹ |
+- [Phase 195.D — original carve-out](https://github.com/NEWSLabNTU/nano-ros/blob/main/docs/roadmap/archived/phase-195-just-to-nros-cli.md)
+  (the move OUT of the monorepo).
+- [Phase 218 — monorepo merge](https://github.com/NEWSLabNTU/nano-ros/blob/main/docs/roadmap/phase-218-merge-cli-into-monorepo.md)
+  (the move BACK).
+- [Phase 218 design spec](https://github.com/NEWSLabNTU/nano-ros/blob/main/docs/superpowers/specs/2026-06-04-cli-monorepo-merge-design.md).
 
-¹ Launch parsing shells out to the separate
-[`play_launch_parser`](https://github.com/jerry73204/play_launch_parser)
-(`pip install play-launch-parser`) so `nros` itself stays python-free; the build
-system runs it internally to produce the plan record.
+The last standalone release tag was
+[`nros-v0.3.7`](https://github.com/NEWSLabNTU/nros-cli/releases/tag/nros-v0.3.7);
+the post-merge release line continues from `nros-v0.4.0` in the
+nano-ros repo.
 
 ## License
 
-See nano-ros. Built from this repo's Rust workspace (`packages/`).
+MIT OR Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE) /
+[LICENSE-MIT](LICENSE-MIT).
